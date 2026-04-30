@@ -972,3 +972,499 @@ test('messages: compact ensures user message exists even when last N are all ass
     restore();
   }
 });
+
+// ──────────── Qwen3 Jinja Exhaustive Edge Cases ────────────
+// These tests cover every known path that can lead to "No user query found in
+// messages" 500 from Qwen3's jinja template. The assertion is simple: every
+// single API call recorded in state.calls MUST contain at least one user role.
+
+function assertAllCallsHaveUser(state: MockState, label: string): void {
+  for (let i = 0; i < state.calls.length; i++) {
+    const msgs = state.calls[i].messages;
+    assertHasUserMessage(msgs);
+    assertSystemFirst(msgs);
+  }
+}
+
+test('qwen3: compact after 5 consecutive tool calls still has user message', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    // Very small context window: 50 tokens ≈ 175 chars total to trigger compact
+    const agent = await createAgent(
+      makeConfig({
+        model: {
+          baseURL: 'http://127.0.0.1:0',
+          model: 'stub-model',
+          apiKey: 'stub-key',
+          contextWindow: 50,
+        },
+      }),
+      makeConnections()
+    );
+
+    // 5 consecutive tool calls: messages grow to [sys, user, asst(tc), tool, asst(tc), tool, ...]
+    // = 12 messages. COMPACT_KEEP_LAST_N=6 means kept tail is last 6 = all asst+tool, no user.
+    const mkToolTurn = (id: string) => ({
+      kind: 'stream' as const,
+      chunks: streamChunks({
+        toolCalls: [
+          {
+            id,
+            name: 'todo_write',
+            arguments: JSON.stringify({ action: 'list' }),
+          },
+        ],
+      }),
+    });
+    state.responses.push(mkToolTurn('c1'));
+    state.responses.push(mkToolTurn('c2'));
+    state.responses.push(mkToolTurn('c3'));
+    state.responses.push(mkToolTurn('c4'));
+    state.responses.push(mkToolTurn('c5'));
+
+    // Compact summarizer call (nonStream):
+    state.responses.push({
+      kind: 'nonStream',
+      content:
+        'Summary: user asked to list todos. Agent called todo_write 5 times consecutively to enumerate items. This is a long enough summary to pass the 50-char guard.',
+    });
+    // Post-compact model call: final answer
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({ content: 'all done listing' }),
+    });
+
+    await drain(agent.chat('list all my todos please'));
+
+    // Critical assertion: every single API call must have user message
+    assertAllCallsHaveUser(state, 'compact after 5 tool calls');
+  } finally {
+    restore();
+  }
+});
+
+test('qwen3: compact triggered twice in same task still has user message', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    const agent = await createAgent(
+      makeConfig({
+        model: {
+          baseURL: 'http://127.0.0.1:0',
+          model: 'stub-model',
+          apiKey: 'stub-key',
+          contextWindow: 30, // Even smaller: triggers compact very aggressively
+        },
+      }),
+      makeConnections()
+    );
+
+    // First batch of tool calls → triggers first compact
+    const mkToolTurn = (id: string) => ({
+      kind: 'stream' as const,
+      chunks: streamChunks({
+        toolCalls: [
+          {
+            id,
+            name: 'todo_write',
+            arguments: JSON.stringify({ action: 'add', text: 'item' }),
+          },
+        ],
+      }),
+    });
+    state.responses.push(mkToolTurn('d1'));
+    state.responses.push(mkToolTurn('d2'));
+    state.responses.push(mkToolTurn('d3'));
+
+    // First compact summarizer
+    state.responses.push({
+      kind: 'nonStream',
+      content:
+        'First compact summary: user adding items. Multiple tool calls processed successfully. Context preserved for continuation of task.',
+    });
+
+    // More tool calls after first compact → triggers second compact
+    state.responses.push(mkToolTurn('d4'));
+    state.responses.push(mkToolTurn('d5'));
+    state.responses.push(mkToolTurn('d6'));
+
+    // Second compact summarizer
+    state.responses.push({
+      kind: 'nonStream',
+      content:
+        'Second compact summary: continued adding items after first compaction. User original request still active. All tools executed successfully.',
+    });
+
+    // Final answer
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({ content: 'finished adding all items' }),
+    });
+
+    await drain(agent.chat('add many items to my todo list'));
+
+    assertAllCallsHaveUser(state, 'double compact');
+  } finally {
+    restore();
+  }
+});
+
+test('qwen3: P0-b pop + immediate compact still has user message', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    const agent = await createAgent(
+      makeConfig({
+        model: {
+          baseURL: 'http://127.0.0.1:0',
+          model: 'stub-model',
+          apiKey: 'stub-key',
+          contextWindow: 50,
+        },
+      }),
+      makeConnections()
+    );
+
+    // First: some tool calls to build up message history
+    const mkToolTurn = (id: string) => ({
+      kind: 'stream' as const,
+      chunks: streamChunks({
+        toolCalls: [
+          {
+            id,
+            name: 'todo_write',
+            arguments: JSON.stringify({ action: 'list' }),
+          },
+        ],
+      }),
+    });
+    state.responses.push(mkToolTurn('p1'));
+    state.responses.push(mkToolTurn('p2'));
+
+    // Now model returns empty args (P0-b triggers pop)
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({
+        toolCalls: [{ id: 'p_empty', name: 'todo_write', arguments: '' }],
+      }),
+    });
+
+    // After pop, the next iteration may trigger compact (messages are big enough).
+    // Compact summarizer:
+    state.responses.push({
+      kind: 'nonStream',
+      content:
+        'Compact after P0-b pop: user asked to list todos. Two successful calls preceded. Model produced empty args once, retrying. Summary long enough for guard.',
+    });
+
+    // Post-compact retry with correct args
+    state.responses.push(mkToolTurn('p3_ok'));
+
+    // Final answer
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({ content: 'here are your todos' }),
+    });
+
+    await drain(agent.chat('show me my todo list'));
+
+    assertAllCallsHaveUser(state, 'P0-b pop + compact');
+  } finally {
+    restore();
+  }
+});
+
+test('qwen3: fold + new task + compact still has user message', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    const agent = await createAgent(
+      makeConfig({
+        model: {
+          baseURL: 'http://127.0.0.1:0',
+          model: 'stub-model',
+          apiKey: 'stub-key',
+          contextWindow: 50,
+        },
+      }),
+      makeConnections()
+    );
+
+    // First task: tool call + answer → fold happens
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({
+        toolCalls: [
+          { id: 'f1', name: 'todo_write', arguments: JSON.stringify({ action: 'add', text: 'task A' }) },
+        ],
+      }),
+    });
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({ content: 'first task done with detailed explanation that takes up token space' }),
+    });
+    await drain(agent.chat('do task A with lots of context'));
+
+    // Second task: After fold, messages = [sys, fold_summary_system].
+    // New chat pushes user. Then tool calls grow messages until compact triggers.
+    const mkToolTurn = (id: string) => ({
+      kind: 'stream' as const,
+      chunks: streamChunks({
+        toolCalls: [
+          {
+            id,
+            name: 'todo_write',
+            arguments: JSON.stringify({ action: 'list' }),
+          },
+        ],
+      }),
+    });
+    state.responses.push(mkToolTurn('f2'));
+    state.responses.push(mkToolTurn('f3'));
+    state.responses.push(mkToolTurn('f4'));
+
+    // Compact triggered in second task
+    state.responses.push({
+      kind: 'nonStream',
+      content:
+        'Summary after fold: prior task completed (task A). Current task is listing todos. Three tool calls made. Context preserved adequately for continuation.',
+    });
+
+    // Final answer for second task
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({ content: 'here is the list after fold and compact' }),
+    });
+
+    await drain(agent.chat('now list everything'));
+
+    // Check ALL calls across both tasks
+    assertAllCallsHaveUser(state, 'fold + new task + compact');
+  } finally {
+    restore();
+  }
+});
+
+test('qwen3: task stack child + many tool calls + compact still has user message', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    const agent = await createAgent(
+      makeConfig({
+        model: {
+          baseURL: 'http://127.0.0.1:0',
+          model: 'stub-model',
+          apiKey: 'stub-key',
+          contextWindow: 50,
+        },
+      }),
+      makeConnections()
+    );
+
+    // Parent task: creates a subtask
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({
+        toolCalls: [
+          {
+            id: 'ct_parent',
+            name: 'create_task',
+            arguments: JSON.stringify({ prompt: 'child: do detailed work with many tool calls' }),
+          },
+        ],
+      }),
+    });
+    // Parent completes after subtask is queued
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({ content: 'delegated to subtask' }),
+    });
+
+    // Child task execution: many tool calls to trigger compact
+    const mkToolTurn = (id: string) => ({
+      kind: 'stream' as const,
+      chunks: streamChunks({
+        toolCalls: [
+          {
+            id,
+            name: 'todo_write',
+            arguments: JSON.stringify({ action: 'add', text: 'sub-item' }),
+          },
+        ],
+      }),
+    });
+    state.responses.push(mkToolTurn('child_1'));
+    state.responses.push(mkToolTurn('child_2'));
+    state.responses.push(mkToolTurn('child_3'));
+    state.responses.push(mkToolTurn('child_4'));
+
+    // Child triggers compact
+    state.responses.push({
+      kind: 'nonStream',
+      content:
+        'Child task compact summary: subtask executing tool calls to add items. Parent delegated work. Four consecutive tool_write calls made. Summary is long enough.',
+    });
+
+    // Child final answer
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({ content: 'child task completed all additions' }),
+    });
+
+    await drain(agent.chat('plan and execute the work'));
+
+    // ALL calls including child task calls must have user message
+    assertAllCallsHaveUser(state, 'task stack child + compact');
+  } finally {
+    restore();
+  }
+});
+
+test('qwen3: compact at maximal aggression (contextWindow=30) still has user message', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    // contextWindow=30 → compactThreshold = floor(30*0.75) = 22 tokens ≈ 77 chars
+    // Even the system prompt alone might be near this threshold.
+    const agent = await createAgent(
+      makeConfig({
+        model: {
+          baseURL: 'http://127.0.0.1:0',
+          model: 'stub-model',
+          apiKey: 'stub-key',
+          contextWindow: 30,
+        },
+        systemPrompt: 'S', // minimal system prompt to control token count
+      }),
+      makeConnections()
+    );
+
+    // Even 2 tool calls may trigger compact at this window size
+    const mkToolTurn = (id: string) => ({
+      kind: 'stream' as const,
+      chunks: streamChunks({
+        toolCalls: [
+          {
+            id,
+            name: 'todo_write',
+            arguments: JSON.stringify({ action: 'list' }),
+          },
+        ],
+      }),
+    });
+    state.responses.push(mkToolTurn('agg1'));
+    state.responses.push(mkToolTurn('agg2'));
+
+    // Compact summarizer
+    state.responses.push({
+      kind: 'nonStream',
+      content:
+        'Aggressive compact summary: user listed todos. Two tool calls. Context window extremely small. This must be long enough to pass the 50-char minimum check.',
+    });
+
+    // More tool calls after compact
+    state.responses.push(mkToolTurn('agg3'));
+
+    // Second compact (if triggered)
+    state.responses.push({
+      kind: 'nonStream',
+      content:
+        'Second aggressive compact: continued from prior compact. One more tool call. Still maintaining context. Long enough for the fifty character guard requirement.',
+    });
+
+    // Final answer
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({ content: 'done' }),
+    });
+
+    await drain(agent.chat('list'));
+
+    assertAllCallsHaveUser(state, 'maximal aggression compact');
+  } finally {
+    restore();
+  }
+});
+
+test('qwen3: every single API call across 10-turn session has user message', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    const agent = await createAgent(
+      makeConfig({
+        model: {
+          baseURL: 'http://127.0.0.1:0',
+          model: 'stub-model',
+          apiKey: 'stub-key',
+          contextWindow: 80, // moderate: compact triggers after several turns
+        },
+      }),
+      makeConnections()
+    );
+
+    // 10 turns: mix of plain answers, tool calls, and empty args
+    for (let turn = 0; turn < 10; turn++) {
+      if (turn % 3 === 0) {
+        // Plain text answer
+        state.responses.push({
+          kind: 'stream',
+          chunks: streamChunks({ content: `answer for turn ${turn}` }),
+        });
+      } else if (turn % 3 === 1) {
+        // Tool call + answer
+        state.responses.push({
+          kind: 'stream',
+          chunks: streamChunks({
+            toolCalls: [
+              {
+                id: `t${turn}`,
+                name: 'todo_write',
+                arguments: JSON.stringify({ action: 'add', text: `item ${turn}` }),
+              },
+            ],
+          }),
+        });
+        state.responses.push({
+          kind: 'stream',
+          chunks: streamChunks({ content: `done turn ${turn}` }),
+        });
+      } else {
+        // Empty args (P0-b) then correct answer
+        state.responses.push({
+          kind: 'stream',
+          chunks: streamChunks({
+            toolCalls: [{ id: `te${turn}`, name: 'todo_write', arguments: '' }],
+          }),
+        });
+        state.responses.push({
+          kind: 'stream',
+          chunks: streamChunks({ content: `recovered turn ${turn}` }),
+        });
+      }
+
+      // If compact might trigger mid-session, provide a summarizer response
+      if (turn === 4 || turn === 7) {
+        state.responses.push({
+          kind: 'nonStream',
+          content:
+            `Mid-session compact summary at turn ${turn}: multiple turns of conversation. Tools used. Context maintained. This is definitely long enough to pass.`,
+        });
+      }
+
+      await drain(agent.chat(`question ${turn}`));
+    }
+
+    // THE critical assertion: every single API call across all 10 turns
+    for (let i = 0; i < state.calls.length; i++) {
+      const msgs = state.calls[i].messages;
+      const hasUser = msgs.some((m: any) => m && m.role === 'user');
+      assert.ok(
+        hasUser,
+        `API call #${i} (of ${state.calls.length}) missing user message — Qwen3 jinja would 500`
+      );
+    }
+  } finally {
+    restore();
+  }
+});
