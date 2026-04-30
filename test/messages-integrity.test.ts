@@ -896,3 +896,79 @@ test('messages: no consecutive system messages without user in between after fol
     restore();
   }
 });
+
+test('messages: compact ensures user message exists even when last N are all assistant+tool', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    // Tiny context window to force compact on 4th iteration.
+    const agent = await createAgent(
+      makeConfig({
+        model: {
+          baseURL: 'http://127.0.0.1:0',
+          model: 'stub-model',
+          apiKey: 'stub-key',
+          contextWindow: 50,
+        },
+      }),
+      makeConnections()
+    );
+
+    // Build a scenario where the last 6 messages are all assistant(tool_call)+tool pairs.
+    // After 4 tool calls: [sys, user, asst(tc), tool, asst(tc), tool, asst(tc), tool, asst(tc), tool]
+    // = 10 messages. With COMPACT_KEEP_LAST_N=6, kept tail = last 6 = [asst(tc), tool, asst(tc), tool, asst(tc), tool]
+    // No user message in the kept tail!
+    const mkToolTurn = (id: string) => ({
+      kind: 'stream' as const,
+      chunks: streamChunks({
+        toolCalls: [
+          {
+            id,
+            name: 'todo_write',
+            arguments: JSON.stringify({ action: 'list' }),
+          },
+        ],
+      }),
+    });
+    state.responses.push(mkToolTurn('call_1'));
+    state.responses.push(mkToolTurn('call_2'));
+    state.responses.push(mkToolTurn('call_3'));
+    state.responses.push(mkToolTurn('call_4'));
+
+    // The 5th iteration triggers compact. The summarizer (non-stream) call:
+    state.responses.push({
+      kind: 'nonStream',
+      content:
+        'Summary of prior conversation including user request and tool interactions that is definitely long enough to pass the 50-char minimum guard check xxxxxxxxx',
+    });
+    // The 5th model call post-compact: final answer
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({ content: 'done with all tools' }),
+    });
+
+    await drain(agent.chat('original user question that should survive compact'));
+
+    // Verify the post-compact model call has at least one user message
+    const lastCall = state.calls[state.calls.length - 1].messages;
+    assertSystemFirst(lastCall);
+
+    const hasUserMsg = lastCall.some((m: any) => m.role === 'user');
+    assert.ok(
+      hasUserMsg,
+      'compact must ensure a user message exists even when last N messages are all assistant+tool'
+    );
+
+    // The user message should contain the task prompt (truncated to 200 chars)
+    const userMsg = lastCall.find((m: any) => m.role === 'user');
+    assert.ok(
+      typeof userMsg.content === 'string' && userMsg.content.length > 0,
+      'fallback user message must have non-empty content'
+    );
+
+    // Tool pairing must still be valid
+    assertToolCallPaired(lastCall);
+  } finally {
+    restore();
+  }
+});

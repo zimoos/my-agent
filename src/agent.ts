@@ -469,7 +469,8 @@ export async function createAgent(
   let compactDisabled = false;
 
   async function maybeCompact(
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    fallbackUserContent?: string
   ): Promise<{ compacted: boolean; freed: number }> {
     if (compactDisabled) return { compacted: false, freed: 0 };
     const before = estimateTokens(messages);
@@ -499,6 +500,16 @@ export async function createAgent(
         role: 'system',
         content: `[compact summary]\n${summary}`,
       });
+
+      // Safety: ensure at least one user message remains after compact.
+      // Without this, Qwen3 jinja templates throw "No user query found in messages".
+      const hasUser = messages.some((m) => m.role === 'user');
+      if (!hasUser && fallbackUserContent) {
+        const userContent = fallbackUserContent.slice(0, 200);
+        // Insert right after the summary (index 2) to maintain message order
+        messages.splice(2, 0, { role: 'user', content: userContent });
+      }
+
       compactFailures = 0;
       const after = estimateTokens(messages);
       return { compacted: true, freed: Math.max(0, before - after) };
@@ -554,7 +565,7 @@ export async function createAgent(
         loopWarning = `\n\n[WARNING] You have only 5 loops remaining (${loop}/${maxLoops} used). If you are stuck in a loop, stop and summarize what you have done so far. If you still need more steps to complete the task, continue working.`;
       }
 
-      const compactResult = await maybeCompact(signal);
+      const compactResult = await maybeCompact(signal, task.prompt);
       if (compactResult.compacted) {
         yield { type: 'compact:done', freed: compactResult.freed };
       }
