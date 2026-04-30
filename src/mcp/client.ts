@@ -29,7 +29,7 @@ interface JsonRpcResponse {
   error?: { code: number; message: string; data?: any };
 }
 
-const REQUEST_TIMEOUT_MS = 10_000;
+const REQUEST_TIMEOUT_MS = 30_000;
 const PROTOCOL_VERSION = '2024-11-05';
 
 interface Pending {
