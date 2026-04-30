@@ -1,0 +1,48 @@
+id: "L3-002"
+title: "Fix TypeScript type errors across files"
+level: "L3"
+category: "bugfix"
+weight: 1.0
+
+fixture:
+  project: "ts-errors"
+  setup:
+    - "npm install --no-audit --no-fund --prefer-offline --silent"
+
+prompt: |
+  这个项目当前无法通过类型检查。跑 `npx tsc --noEmit` 可以看到多处类型错误（分布在 src/utils.ts 和 src/service.ts）。
+  请修复全部类型错误，让 `npx tsc --noEmit` 退出码为 0。
+  要求：
+  - 不允许使用 `any` 或 `@ts-ignore` 蒙混
+  - 不要放宽 tsconfig.json 里的编译选项
+  - 不要改 package.json 的依赖版本
+
+rubric_points:
+  - "npx tsc --noEmit 退出码为 0"
+  - "没有新增 `: any` 类型标注"
+  - "没有新增 `@ts-ignore` / `@ts-expect-error`"
+  - "未修改 tsconfig.json 和 package.json"
+  - "修改是类型层面的修正，不是删除/改写业务逻辑"
+
+no_modify_files:
+  - "tsconfig.json"
+  - "package.json"
+
+objective_checks:
+  - id: "tsc_clean"
+    cmd: "npx tsc --noEmit"
+    expected_exit: 0
+    weight_into: "Correctness"
+  - id: "no_ts_ignore"
+    cmd: "! grep -rE '@ts-(ignore|expect-error)' src/"
+    expected_exit: 0
+    weight_into: "CodeQuality"
+  - id: "no_any_annotation"
+    cmd: "! grep -rE ':[[:space:]]*any([^A-Za-z]|$)' src/"
+    expected_exit: 0
+    weight_into: "CodeQuality"
+
+runtime:
+  timeout_sec: 400
+  runs: 3
+  layer: "L3"

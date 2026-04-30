@@ -1,0 +1,16 @@
+{
+  "name": "buggy-app",
+  "version": "1.0.0",
+  "description": "Calculator module with an off-by-one bug for L3-005",
+  "main": "src/calculator.js",
+  "scripts": {
+    "test": "jest --silent"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": ["<rootDir>/tests/**/*.test.js"]
+  }
+}

@@ -1,0 +1,9 @@
+# Echo mock adapter(测试用)
+# 把 PROMPT 当作 echo 的参数原样输出,验证基本 spawn + stdout 收集链路
+name: echo-mock
+version: 0.0.1
+underlying_model: mock
+command: /bin/echo
+args:
+  - ${PROMPT}
+timeout_sec: 10

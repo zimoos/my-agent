@@ -1,0 +1,57 @@
+id: "L3-005"
+title: "Diagnose off-by-one bug from logs and fix"
+level: "L3"
+category: "diagnose"
+weight: 1.0
+
+fixture:
+  project: "buggy-app"
+  setup:
+    - "npm install --no-audit --no-fund --prefer-offline --silent"
+
+prompt: |
+  用户反馈：调用 `range(1, 5)` 返回的数组少了最后一个元素。日志在 logs/error.log。
+  当前 `npm test` 有 1 个测试失败（tests/calculator.test.js 中关于 range 的用例）。
+  请你：
+  1. 阅读 logs/error.log 定位根因
+  2. 修复 src/calculator.js 中的 bug
+  3. 让 `npm test` 全部通过
+  4. 在最终回复里说清楚根因（例如 off-by-one 的具体位置）
+  要求：不要修改 logs/ 目录，不要删改测试用例。
+
+rubric_points:
+  - "修复了 src/calculator.js 中 range 函数的 off-by-one（循环条件应为 i <= end）"
+  - "npm test 全部通过（包括原先失败的 range 用例）"
+  - "未修改 logs/ 下任何文件"
+  - "未修改 tests/calculator.test.js 让它绕过失败"
+  - "最终回复中提及 off-by-one 或循环条件（根因描述清楚）"
+
+no_modify_files:
+  - "tests/calculator.test.js"
+  - "logs/error.log"
+
+objective_checks:
+  - id: "npm_test_pass"
+    cmd: "npm test"
+    expected_exit: 0
+    weight_into: "Correctness"
+  - id: "calculator_modified"
+    cmd: "git diff --name-only HEAD -- src/calculator.js | grep -q calculator.js"
+    expected_exit: 0
+    weight_into: "TaskCompletion"
+  - id: "logs_unmodified"
+    cmd: "git diff --quiet HEAD -- logs/"
+    expected_exit: 0
+    weight_into: "NoRegression"
+  - id: "tests_unmodified"
+    cmd: "git diff --quiet HEAD -- tests/calculator.test.js"
+    expected_exit: 0
+    weight_into: "NoRegression"
+
+runtime:
+  timeout_sec: 400
+  runs: 3
+  layer: "L3"
+
+judge:
+  enable_communication: true

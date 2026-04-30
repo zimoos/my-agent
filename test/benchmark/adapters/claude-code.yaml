@@ -1,0 +1,14 @@
+# Claude Code CLI adapter
+# 依赖 ANTHROPIC_API_KEY,acceptEdits 避免权限询问卡死
+name: claude-code
+version: 1.2.0
+underlying_model: claude-sonnet-4-6
+command: claude
+args:
+  - "-p"
+  - ${PROMPT}
+  - "--permission-mode=acceptEdits"
+env:
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+timeout_sec: 900
+final_answer_marker: "===FINAL_ANSWER==="

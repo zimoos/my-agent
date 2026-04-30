@@ -1,0 +1,5 @@
+2026-04-28T09:14:22.003Z INFO  user invoked range(1, 5)
+2026-04-28T09:14:22.004Z DEBUG calculator.range start=1 end=5
+2026-04-28T09:14:22.004Z ERROR expected range(1, 5) === [1, 2, 3, 4, 5] but got [1, 2, 3, 4]
+2026-04-28T09:14:22.004Z TRACE at src/calculator.js:17:22 (for loop condition `i < end`)
+2026-04-28T09:14:22.004Z WARN  off-by-one in src/calculator.js range(): loop uses `<` instead of `<=` for an inclusive range

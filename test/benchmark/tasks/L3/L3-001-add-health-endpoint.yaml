@@ -1,0 +1,40 @@
+id: "L3-001"
+title: "Add /health endpoint to Express app"
+level: "L3"
+category: "feature"
+weight: 1.0
+
+fixture:
+  project: "express-app"
+  setup:
+    - "npm install --no-audit --no-fund --prefer-offline --silent"
+
+prompt: |
+  给这个 Express 应用添加一个 GET /health 端点，返回 JSON {"status":"ok"} 和 HTTP 200。
+  确保不破坏现有路由（GET / 和 GET /api/users）和现有测试（npm test 必须全部通过）。
+  建议为新端点补一个测试。
+
+rubric_points:
+  - "GET /health 返回 200 + JSON {status: ok}"
+  - "现有路由 GET / 和 GET /api/users 仍然正常工作"
+  - "现有测试（tests/app.test.js）未被删改且通过"
+  - "新增了针对 /health 的测试"
+  - "代码风格与项目一致（路由注册方式与既有路由统一）"
+
+no_modify_files:
+  - "tests/app.test.js"
+
+objective_checks:
+  - id: "npm_test_pass"
+    cmd: "npm test"
+    expected_exit: 0
+    weight_into: "NoRegression"
+  - id: "app_js_modified"
+    cmd: "test -f src/app.js"
+    expected_exit: 0
+    weight_into: "TaskCompletion"
+
+runtime:
+  timeout_sec: 300
+  runs: 3
+  layer: "L3"
