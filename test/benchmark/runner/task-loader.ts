@@ -67,7 +67,7 @@ export function loadTasks(options: LoadTasksOptions): LoadTasksResult {
   const tasks: TaskDef[] = [];
   const seenIds = new Map<string, string>();
 
-  const yamlPaths = collectYamlPaths(options.tasksDir, errors);
+  const yamlPaths = collectYamlPaths(options.tasksDir, options.filterLevel, errors);
 
   for (const filePath of yamlPaths) {
     let raw: unknown;
@@ -106,14 +106,16 @@ export function loadTasks(options: LoadTasksOptions): LoadTasksResult {
 
 // ─── File discovery ───
 
-function collectYamlPaths(tasksDir: string, errors: string[]): string[] {
+function collectYamlPaths(tasksDir: string, filterLevel: Level | undefined, errors: string[]): string[] {
   if (!fs.existsSync(tasksDir)) {
     errors.push(`tasksDir does not exist: ${tasksDir}`);
     return [];
   }
 
+  const levels = filterLevel ? [filterLevel] : LEVEL_ORDER;
+
   const out: string[] = [];
-  for (const level of LEVEL_ORDER) {
+  for (const level of levels) {
     const levelDir = path.join(tasksDir, level);
     if (!fs.existsSync(levelDir)) continue;
     const entries = fs.readdirSync(levelDir);

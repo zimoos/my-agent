@@ -47,6 +47,26 @@ export async function bootstrap(
     // server unreachable, keep config as-is
   }
 
+  // Auto-detect context window from LM Studio native API
+  if (!config.model.contextWindow) {
+    try {
+      const base = config.model.baseURL.replace(/\/v1\/?$/, '');
+      const res = await fetch(`${base}/api/v0/models`);
+      const data = await res.json() as {
+        data: Array<{ id: string; max_context_length?: number }>;
+      };
+      const found = data.data.find((m) => m.id === config.model.model);
+      if (found?.max_context_length) {
+        config.model.contextWindow = found.max_context_length;
+        process.stderr.write(
+          `\x1b[33m[info] auto-detected context window: ${found.max_context_length}\x1b[0m\n`
+        );
+      }
+    } catch {
+      // native API unavailable, use default
+    }
+  }
+
   const entries = Object.entries(config.mcpServers ?? {}) as Array<[string, McpServerConfig]>;
   const connections: McpConnection[] = [];
   for (const [name, serverConfig] of entries) {
