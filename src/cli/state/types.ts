@@ -12,10 +12,21 @@ export interface BannerData {
 export type Message =
   | { kind: 'user'; id: string; text: string; images?: UiImage[] }
   | { kind: 'assistant'; id: string; markdown: string; elapsedMs: number }
-  | { kind: 'tool'; id: string; name: string; ok: boolean; preview: string }
+  | { kind: 'tool'; id: string; name: string; ok: boolean; preview: string; diff?: DiffData }
   | { kind: 'system'; id: string; text: string }
   | { kind: 'separator'; id: string; elapsed: string }
   | { kind: 'banner'; id: string; data: BannerData };
+
+export interface DiffData {
+  /** 文件路径 */
+  filePath: string;
+  /** 新增行数 */
+  addedLines: number;
+  /** 删除行数 */
+  removedLines: number;
+  /** 完整 diff 文本（带 ANSI 颜色） */
+  diffText: string;
+}
 
 export interface ThinkingState {
   active: boolean;

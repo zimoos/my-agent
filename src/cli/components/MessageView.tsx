@@ -31,6 +31,7 @@ export function MessageView({ message }: MessageViewProps) {
           name={message.name}
           ok={message.ok}
           preview={message.preview}
+          diff={message.diff}
         />
       );
     case 'system':

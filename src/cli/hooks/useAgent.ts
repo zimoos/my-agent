@@ -59,12 +59,38 @@ function applyEvent(
         .trim()
         .split('\n')[0]
         .slice(0, 50);
+      
+      // 解析 diff 信息
+      let diffData: import('../state/types.js').DiffData | undefined;
+      if (event.ok) {
+        const diffMatch = event.content.match(/--- Diff ---\s*\n([\s\S]*)$/);
+        if (diffMatch) {
+          const diffText = diffMatch[1];
+          // 解析文件路径
+          const fileMatch = event.content.match(/(?:已编辑|已覆盖|已写入)\s+(.+?)[（\(]/);
+          const filePath = fileMatch ? fileMatch[1].trim() : '';
+          // 解析统计信息
+          const addedMatch = diffText.match(/\+(\d+)/);
+          const removedMatch = diffText.match(/-(\d+)/);
+          const addedLines = addedMatch ? parseInt(addedMatch[1], 10) : 0;
+          const removedLines = removedMatch ? parseInt(removedMatch[1], 10) : 0;
+          
+          diffData = {
+            filePath,
+            addedLines,
+            removedLines,
+            diffText,
+          };
+        }
+      }
+      
       store.pushMessage({
         kind: 'tool',
         id: nextId(),
         name: store.getState().thinking?.toolName || '',
         ok: event.ok,
         preview: preview || (event.ok ? '完成' : '失败'),
+        diff: diffData,
       });
       store.updateThinking({ event: event.ok ? '分析结果中' : '处理错误中' });
       break;

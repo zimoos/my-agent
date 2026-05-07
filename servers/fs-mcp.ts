@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, lstatSync, readlinkSync, existsSync, openSync, readSync, closeSync } from 'node:fs';
 import { dirname, extname, join, relative } from 'node:path';
 import { createInterface } from 'node:readline';
+import pico from 'picocolors';
 
 type Id = string | number | null;
 interface Req { jsonrpc: '2.0'; id?: Id; method: string; params?: unknown }
@@ -104,10 +105,21 @@ function handleWriteFile(args: Record<string, unknown>) {
     const parent = dirname(path);
     if (parent && parent !== '.' && parent !== '/') mkdirSync(parent, { recursive: true });
     const existed = existsSync(path);
+    let oldContent = '';
+    if (existed) {
+      try { oldContent = readFileSync(path, 'utf-8'); } catch { /* ignore */ }
+    }
     const normalized = content.replace(/\r\n/g, '\n');
     writeFileSync(path, normalized, { encoding: 'utf-8' });
     const bytes = Buffer.byteLength(normalized, 'utf-8');
-    return ok(existed ? `已覆盖 ${path}（${bytes} bytes）` : `已写入 ${path}（${bytes} bytes）`);
+    let result: string;
+    if (existed && oldContent) {
+      const diff = generateWriteFileDiff(oldContent, normalized, path);
+      result = `已覆盖 ${path}（${bytes} bytes）\n\n--- Diff ---\n${diff}`;
+    } else {
+      result = `已写入 ${path}（${bytes} bytes)`;
+    }
+    return ok(result);
   } catch (e) { return ok(`write_file failed: ${errMsg(e)}`, true); }
 }
 
@@ -197,3 +209,63 @@ rl.on('line', (line) => {
   handleRequest(msg);
 });
 rl.on('close', () => process.exit(0));
+
+/**
+ * 生成 write_file 的 diff 摘要
+ */
+function generateWriteFileDiff(oldContent: string, newContent: string, filePath: string): string {
+  const oldLines = oldContent.split('\n');
+  const newLines = newContent.split('\n');
+  const maxLen = Math.max(oldLines.length, newLines.length);
+  const limit = Math.min(maxLen, 60);
+  
+  let diff = '';
+  let added = 0;
+  let removed = 0;
+  
+  for (let i = 0; i < limit; i++) {
+    const oldLine = i < oldLines.length ? oldLines[i] : undefined;
+    const newLine = i < newLines.length ? newLines[i] : undefined;
+    
+    if (oldLine === newLine) {
+      // 上下文行
+      if (i > 0 && i - 1 < limit && oldLines[i - 1] !== newLines[i - 1]) {
+        // 上一行有差异，显示一些上下文
+        if (i > 2) {
+          const ctxStart = Math.max(0, i - 2);
+          for (let j = ctxStart; j < i; j++) {
+            const ln = j + 1;
+            const line = oldLines[j].replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
+            diff += `  ${ln}: ${line}\n`;
+          }
+        }
+      }
+    } else {
+      if (oldLine !== undefined) {
+        const ln = i + 1;
+        const line = oldLine.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
+        diff += pico.red(`- ${ln}: ${line}`);
+        removed++;
+      }
+      if (newLine !== undefined) {
+        const ln = i + 1;
+        const line = newLine.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
+        diff += pico.green(`+ ${ln}: ${line}`);
+        added++;
+      }
+    }
+  }
+  
+  if (oldLines.length > limit) {
+    diff += `\n${pico.dim(`... (${oldLines.length - limit} more old lines)`)}`;
+  }
+  if (newLines.length > limit) {
+    diff += `\n${pico.dim(`... (${newLines.length - limit} more new lines)`)}`;
+  }
+  
+  if (added === 0 && removed === 0) {
+    return '(no visible changes)';
+  }
+  
+  return `${pico.green(`+${added}`)} ${pico.red(`-${removed}`)}\n${diff}`;
+}

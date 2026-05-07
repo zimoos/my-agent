@@ -74,7 +74,11 @@ export function handleFileEdit(args: Record<string, unknown>) {
     const replaced = replaceAll ? count : 1;
     const delta = Buffer.byteLength(after, 'utf-8') - Buffer.byteLength(before, 'utf-8');
     const sign = delta > 0 ? '+' : '';
-    return ok(`已编辑 ${path}：替换 ${replaced} 处，大小变化 ${sign}${delta} bytes`);
+    // 生成 diff 信息供前端展示
+    const diffLinesBefore = before.split('\n');
+    const diffLinesAfter = after.split('\n');
+    const diffSummary = generateUnifiedDiffSummary(diffLinesBefore, diffLinesAfter);
+    return ok(`已编辑 ${path}：替换 ${replaced} 处，大小变化 ${sign}${delta} bytes\n\n--- Diff ---\n${diffSummary}`);
   } catch (e) { return fsErr('file_edit', path, e); }
 }
 
@@ -123,3 +127,63 @@ function main() {
 }
 
 if (process.argv[1] && (process.argv[1].endsWith('fs-edit-mcp.ts') || process.argv[1].endsWith('fs-edit-mcp.js'))) main();
+
+/**
+ * 生成简化的 unified diff 摘要（不依赖 jsdiff，避免循环依赖）
+ */
+function generateUnifiedDiffSummary(oldLines: string[], newLines: string[]): string {
+  const maxLen = Math.max(oldLines.length, newLines.length, 50);
+  const limit = Math.min(maxLen, 60); // 最多显示 60 行
+  
+  let diff = '';
+  let hunks = 0;
+  let lastOld = -2;
+  let lastNew = -2;
+  
+  for (let i = 0; i < limit; i++) {
+    const oldLine = i < oldLines.length ? oldLines[i] : undefined;
+    const newLine = i < newLines.length ? newLines[i] : undefined;
+    
+    if (oldLine === newLine) {
+      // 上下文行
+      if (i - lastOld > 1 || i - lastNew > 1) {
+        const contextStart = Math.max(0, i - 2);
+        const contextEnd = Math.min(oldLines.length - 1, i + 2);
+        if (contextStart < contextEnd) {
+          diff += '\n';
+          for (let j = contextStart; j <= contextEnd && j < oldLines.length; j++) {
+            const lineNum = j + 1;
+            const line = oldLines[j].replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
+            diff += `  ${lineNum}: ${line}\n`;
+          }
+          hunks++;
+        }
+        lastOld = i + 3;
+        lastNew = i + 3;
+      }
+    } else {
+      // 差异行
+      if (oldLine !== undefined) {
+        const lineNum = i + 1;
+        const line = oldLine.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
+        diff += `- ${lineNum}: ${line}\n`;
+      }
+      if (newLine !== undefined) {
+        const lineNum = i + 1;
+        const line = newLine.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
+        diff += `+ ${lineNum}: ${line}\n`;
+      }
+      lastOld = i;
+      lastNew = i;
+    }
+  }
+  
+  if (oldLines.length > limit) {
+    diff += `\n... (${oldLines.length - limit} more old lines)\n`;
+  }
+  if (newLines.length > limit) {
+    diff += `\n... (${newLines.length - limit} more new lines)\n`;
+  }
+  
+  return diff || '(no visible changes)';
+}
