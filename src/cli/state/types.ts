@@ -26,6 +26,8 @@ export interface DiffData {
   removedLines: number;
   /** 完整 diff 文本（带 ANSI 颜色） */
   diffText: string;
+  /** 是否被截断 */
+  truncated: boolean;
 }
 
 export interface ThinkingState {

@@ -21,6 +21,8 @@ export interface DiffResult {
   removedLines: number;
   /** 总行数变化 */
   totalLines: number;
+  /** 是否被截断 */
+  truncated: boolean;
 }
 
 /**
@@ -67,6 +69,7 @@ export function generateDiff(
       addedLines: 0,
       removedLines: 0,
       totalLines: 0,
+      truncated: false,
     };
   }
 
@@ -77,6 +80,7 @@ export function generateDiff(
       addedLines: 0,
       removedLines: 0,
       totalLines: 0,
+      truncated: false,
     };
   }
 
@@ -89,13 +93,13 @@ export function generateDiff(
     if (line.startsWith('-') && !line.startsWith('---')) removedLines++;
   }
 
-  // 截断过长的 diff
+  // 智能截断过长的 diff
   let truncated = false;
   if (lines.length > maxLines) {
-    const header = lines.slice(0, 10).join('\n');
-    const tail = lines.slice(-20).join('\n');
-    const count = lines.length - 10 - 20;
-    rawDiff = `${header}\n... (${count} lines truncated) ...\n${tail}`;
+    const head = lines.slice(0, 15).join('\n');
+    const tail = lines.slice(-15).join('\n');
+    const count = lines.length - 15 - 15;
+    rawDiff = `${head}\n${pico.yellow('  … … …')} (${count} lines collapsed) ${pico.yellow('… … …')}\n${tail}`;
     truncated = true;
   }
 
@@ -116,6 +120,7 @@ export function generateDiff(
     addedLines,
     removedLines,
     totalLines: addedLines + removedLines,
+    truncated,
   };
 }
 

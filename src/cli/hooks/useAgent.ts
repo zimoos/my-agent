@@ -80,6 +80,7 @@ function applyEvent(
             addedLines,
             removedLines,
             diffText,
+            truncated: diffText.includes('collapsed') || diffText.includes('truncated'),
           };
         }
       }
