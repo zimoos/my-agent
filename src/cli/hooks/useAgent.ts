@@ -49,6 +49,11 @@ function applyEvent(
       });
       break;
     case 'tool:result': {
+      // Flush accumulated text BEFORE tool message to maintain chronological order
+      const pending = store.flushInFlight();
+      if (pending.trim()) {
+        store.pushMessage({ kind: 'assistant', id: nextId(), markdown: pending, elapsedMs: 0 });
+      }
       const preview = event.content
         .replace(/<[^>]*>/g, '')
         .trim()

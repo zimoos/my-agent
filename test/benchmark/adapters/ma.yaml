@@ -1,0 +1,13 @@
+# MA agent (本项目自家 CLI) adapter
+# underlying_model 决定裁判路由(非 claude- 系 → Sonnet 主裁判)
+name: ma-agent
+version: 0.3.1
+underlying_model: qwen3-30b
+command: node
+args:
+  - dist/src/cli/index.js
+  - run
+  - --prompt
+  - ${PROMPT}
+timeout_sec: 900
+final_answer_marker: "===FINAL_ANSWER==="

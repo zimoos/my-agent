@@ -1,0 +1,58 @@
+id: "L3-004"
+title: "Write ARCHITECTURE.md for undocumented CLI"
+level: "L3"
+category: "docs"
+weight: 1.0
+
+fixture:
+  project: "undocumented"
+  setup: []
+
+prompt: |
+  我刚接手这个项目，src/ 下是一个小型 todo CLI，但没有文档。请你阅读源码后在项目根目录新建 ARCHITECTURE.md，讲清楚：
+  1. 项目分几层（CLI 入口 / 命令 / 存储 / 渲染等）
+  2. 核心数据流是什么（例如 add 命令从参数解析到落盘的流转）
+  3. 关键模块在哪里（给出具体文件路径）
+  长度 300-600 字。不要修改 src/ 下的任何文件。
+  所有提到的文件路径必须真实存在。
+
+rubric_points:
+  - "新增 ARCHITECTURE.md 在项目根目录"
+  - "至少描述 2 层结构（例如 CLI / 业务 / IO）"
+  - "至少引用 3 个具体文件路径（src/cli.js、src/commands.js、src/store.js 等）"
+  - "所有提到的文件路径都真实存在（无幻觉）"
+  - "字数在 300-600 字之间"
+  - "未修改 src/ 下任何文件"
+
+no_modify_files:
+  - "src/cli.js"
+  - "src/args.js"
+  - "src/store.js"
+  - "src/commands.js"
+  - "src/render.js"
+
+objective_checks:
+  - id: "architecture_md_exists"
+    cmd: "test -f ARCHITECTURE.md"
+    expected_exit: 0
+    weight_into: "TaskCompletion"
+  - id: "mentions_cli_js"
+    cmd: "grep -q 'src/cli.js' ARCHITECTURE.md"
+    expected_exit: 0
+    weight_into: "Correctness"
+  - id: "mentions_commands_js"
+    cmd: "grep -q 'src/commands.js' ARCHITECTURE.md"
+    expected_exit: 0
+    weight_into: "Correctness"
+  - id: "src_unmodified"
+    cmd: "git diff --quiet HEAD -- src/"
+    expected_exit: 0
+    weight_into: "NoRegression"
+
+runtime:
+  timeout_sec: 300
+  runs: 3
+  layer: "L3"
+
+judge:
+  enable_communication: true

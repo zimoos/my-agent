@@ -1,0 +1,16 @@
+{
+  "name": "god-class",
+  "version": "1.0.0",
+  "description": "Fixture containing a god class to refactor for L3-003",
+  "main": "src/manager.js",
+  "scripts": {
+    "test": "jest --silent"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": ["<rootDir>/tests/**/*.test.js"]
+  }
+}

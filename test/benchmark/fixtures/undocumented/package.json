@@ -1,0 +1,11 @@
+{
+  "name": "undocumented",
+  "version": "1.0.0",
+  "description": "Small undocumented CLI fixture for L3-004",
+  "bin": {
+    "todo": "src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/cli.js"
+  }
+}

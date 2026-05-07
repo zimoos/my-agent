@@ -120,12 +120,21 @@ export class MessageStore {
   }
 
   /** Replace middle messages with a compact summary. */
-  compact(cutIndex: number, summary: string): void {
+  compact(cutIndex: number, summary: string, fallbackUserContent?: string): void {
     if (cutIndex <= 1 || cutIndex >= this.messages.length) return;
     this.messages.splice(1, cutIndex - 1, {
       role: 'system',
       content: `[compact summary]\n${summary}`,
     });
+
+    // Safety: ensure at least one user message remains after compact.
+    // Without this, Qwen3 jinja templates throw "No user query found in messages".
+    const hasUser = this.messages.some((m) => m.role === 'user');
+    if (!hasUser && fallbackUserContent) {
+      const userContent = fallbackUserContent.slice(0, 200);
+      // Insert right after the summary (index 2) to maintain message order
+      this.messages.splice(2, 0, { role: 'user', content: userContent });
+    }
   }
 
   /**

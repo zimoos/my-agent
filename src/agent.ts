@@ -411,7 +411,8 @@ export async function createAgent(
   let compactDisabled = false;
 
   async function maybeCompact(
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    fallbackUserContent?: string
   ): Promise<{ compacted: boolean; freed: number }> {
     if (compactDisabled) return { compacted: false, freed: 0 };
     const before = estimateTokens(store.snapshot());
@@ -437,7 +438,7 @@ export async function createAgent(
         if (compactFailures >= COMPACT_MAX_FAILURES) compactDisabled = true;
         return { compacted: false, freed: 0 };
       }
-      store.compact(cut, summary);
+      store.compact(cut, summary, fallbackUserContent);
       compactFailures = 0;
       const after = estimateTokens(store.snapshot());
       return { compacted: true, freed: Math.max(0, before - after) };
@@ -493,7 +494,7 @@ export async function createAgent(
         loopWarning = `\n\n[WARNING] You have only 5 loops remaining (${loop}/${maxLoops} used). If you are stuck in a loop, stop and summarize what you have done so far. If you still need more steps to complete the task, continue working.`;
       }
 
-      const compactResult = await maybeCompact(signal);
+      const compactResult = await maybeCompact(signal, task.prompt);
       if (compactResult.compacted) {
         yield { type: 'compact:done', freed: compactResult.freed };
       }

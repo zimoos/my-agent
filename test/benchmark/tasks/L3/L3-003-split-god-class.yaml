@@ -1,0 +1,45 @@
+id: "L3-003"
+title: "Split Manager god class into cohesive modules"
+level: "L3"
+category: "refactor"
+weight: 1.0
+
+fixture:
+  project: "god-class"
+  setup:
+    - "npm install --no-audit --no-fund --prefer-offline --silent"
+
+prompt: |
+  src/manager.js 是一个过大的 "god class"，同时承担了 IO（文件读写）、业务逻辑（增删改查/折扣/小计）和输出格式化（receipt/CSV）三类职责。
+  请把它拆成若干职责清晰的模块，保持对外 API（Manager 类）向后兼容，tests/manager.test.js 必须全部通过且不能修改。
+  要求：
+  - 至少拆出 2 个新模块文件（比如 io / pricing / formatting 维度任选）
+  - src/manager.js 保留为入口，重构后行数应显著下降
+  - 所有既有测试通过
+  - 不引入新依赖
+
+rubric_points:
+  - "至少新增 2 个拆分出的模块文件"
+  - "src/manager.js 文件行数 < 80（原 ~130 行）"
+  - "npm test 全部通过（6 个 test case）"
+  - "Manager 的外部 API 未破坏（require('./src/manager') 仍返回 Manager 类）"
+  - "package.json dependencies 未新增条目"
+
+no_modify_files:
+  - "tests/manager.test.js"
+  - "package.json"
+
+objective_checks:
+  - id: "npm_test_pass"
+    cmd: "npm test"
+    expected_exit: 0
+    weight_into: "NoRegression"
+  - id: "manager_require_works"
+    cmd: "node -e \"const M=require('./src/manager');const m=new M();m.addItem({id:'1',name:'X',price:1,quantity:1});if(m.total()!==1.1)process.exit(1)\""
+    expected_exit: 0
+    weight_into: "Correctness"
+
+runtime:
+  timeout_sec: 500
+  runs: 3
+  layer: "L3"

@@ -1,0 +1,11 @@
+{
+  "name": "ts-errors",
+  "version": "1.0.0",
+  "description": "Fixture with TypeScript type errors for L3-002",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  }
+}

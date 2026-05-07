@@ -195,7 +195,7 @@ export function App({ config, connections, agent, debug }: AppProps) {
 
       {inFlightText ? (
         <Box marginTop={1}>
-          <Text>{inFlightText}</Text>
+          <Text>{inFlightText.replace(/\n{3,}/g, '\n\n').trimStart()}</Text>
         </Box>
       ) : null}
 
