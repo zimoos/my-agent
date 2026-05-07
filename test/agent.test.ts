@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { __internal__ } from '../src/agent.js';
+import { routeToolCall } from '../src/agent/tool-router.js';
 import type { McpConnection } from '../src/mcp/types.js';
 
 const {
   mcpToolsToOpenAI,
-  routeToolCall,
   normalizeArguments,
   ensureToolCallId,
   normalizeToolCalls,

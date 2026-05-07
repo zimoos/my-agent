@@ -23,8 +23,12 @@ import { classifyCommand, isWhitelisted } from './agent/dangerGuard.js';
 import {
   STACK_STATE_PREFIX,
   renderStackState,
-  removeLastStackStateMessage,
 } from './agent/stack-render.js';
+import { MessageStore } from './agent/message-store.js';
+import { ErrorTracker } from './agent/error-tracker.js';
+import { StreamParser } from './agent/stream-parser.js';
+import { ToolExecutor } from './agent/tool-executor.js';
+import { findToolSchema, routeToolCall } from './agent/tool-router.js';
 import { loadAgentMd } from './agent/memdir.js';
 import { estimateTokens } from './agent/tokenCount.js';
 import { summarizeRange } from './agent/summarize.js';
@@ -60,17 +64,6 @@ const COMPACT_TRIGGER_RATIO = 0.75;
 const COMPACT_KEEP_LAST_N = 6;
 const COMPACT_MAX_FAILURES = 2;
 const COMPACT_MIN_SUMMARY_CHARS = 50;
-
-function findSafeCutIndex(
-  messages: ChatCompletionMessageParam[],
-  desiredCut: number
-): number {
-  let cut = Math.max(1, Math.min(desiredCut, messages.length));
-  while (cut < messages.length && messages[cut].role === 'tool') {
-    cut += 1;
-  }
-  return cut;
-}
 
 async function withRetry<T>(
   fn: () => Promise<T>,
@@ -302,47 +295,6 @@ function mcpToolsToOpenAI(connections: McpConnection[]): ChatCompletionTool[] {
   return out;
 }
 
-function findToolSchema(
-  connections: McpConnection[],
-  fullName: string
-): Record<string, any> | null {
-  const sepIdx = fullName.indexOf(TOOL_NAME_SEP);
-  if (sepIdx > 0) {
-    const serverName = fullName.slice(0, sepIdx);
-    const toolName = fullName.slice(sepIdx + TOOL_NAME_SEP.length);
-    const conn = connections.find((c) => c.name === serverName);
-    const tool = conn?.tools.find((t) => t.name === toolName);
-    if (tool?.inputSchema) return tool.inputSchema as Record<string, any>;
-  }
-  for (const conn of connections) {
-    const tool = conn.tools.find((t) => t.name === fullName);
-    if (tool?.inputSchema) return tool.inputSchema as Record<string, any>;
-  }
-  return null;
-}
-
-function routeToolCall(
-  connections: McpConnection[],
-  fullName: string
-): { conn: McpConnection; toolName: string } | null {
-  // Try exact match with prefix (e.g. fs__list_directory)
-  const sepIdx = fullName.indexOf(TOOL_NAME_SEP);
-  if (sepIdx > 0) {
-    const serverName = fullName.slice(0, sepIdx);
-    const toolName = fullName.slice(sepIdx + TOOL_NAME_SEP.length);
-    const conn = connections.find((c) => c.name === serverName);
-    if (conn && conn.tools.some((t) => t.name === toolName)) {
-      return { conn, toolName };
-    }
-  }
-  // Fallback: model called tool without prefix (e.g. list_directory)
-  for (const conn of connections) {
-    const tool = conn.tools.find((t) => t.name === fullName);
-    if (tool) return { conn, toolName: fullName };
-  }
-  return null;
-}
-
 export async function createAgent(
   config: AgentConfig,
   connections: McpConnection[],
@@ -404,34 +356,24 @@ export async function createAgent(
     ? `${baseSystemPrompt}${envInfo}\n\n# Project Context\n${agentMd}`
     : `${baseSystemPrompt}${envInfo}`;
 
-  const messages: ChatCompletionMessageParam[] = [
-    { role: 'system', content: systemPrompt },
-  ];
-  if (options.resumeMessages && options.resumeMessages.length > 0) {
-    for (const m of options.resumeMessages) {
-      if (m.role === 'system') continue;
-      messages.push(m);
-    }
-  }
+  const store = new MessageStore();
+  store.init(systemPrompt, options.resumeMessages);
   const sessionStore = options.sessionStore;
   const sessionId = options.sessionId;
-  let persistedCount = messages.length;
 
   function persistPending(): void {
     if (!sessionStore || !sessionId) {
-      persistedCount = messages.length;
+      store.markPersisted();
       return;
     }
-    for (let i = persistedCount; i < messages.length; i++) {
-      const m = messages[i];
-      if (m.role === 'system') continue;
+    for (const m of store.getPendingForPersist()) {
       try {
         sessionStore.append(sessionId, m);
       } catch {
         /* ignore persist failures */
       }
     }
-    persistedCount = messages.length;
+    store.markPersisted();
   }
 
   const stack = createTaskStack();
@@ -472,15 +414,15 @@ export async function createAgent(
     signal?: AbortSignal
   ): Promise<{ compacted: boolean; freed: number }> {
     if (compactDisabled) return { compacted: false, freed: 0 };
-    const before = estimateTokens(messages);
+    const before = estimateTokens(store.snapshot());
     if (before <= compactThreshold) return { compacted: false, freed: 0 };
 
-    const keepLastN = Math.min(COMPACT_KEEP_LAST_N, messages.length - 1);
-    const desiredCut = messages.length - keepLastN;
-    const cut = findSafeCutIndex(messages, desiredCut);
-    if (cut <= 1 || cut >= messages.length) return { compacted: false, freed: 0 };
+    const keepLastN = Math.min(COMPACT_KEEP_LAST_N, store.length - 1);
+    const desiredCut = store.length - keepLastN;
+    const cut = store.findSafeCutIndex(desiredCut);
+    if (cut <= 1 || cut >= store.length) return { compacted: false, freed: 0 };
 
-    const middle = messages.slice(1, cut);
+    const middle = store.snapshot().slice(1, cut);
     if (middle.length === 0) return { compacted: false, freed: 0 };
 
     try {
@@ -495,12 +437,9 @@ export async function createAgent(
         if (compactFailures >= COMPACT_MAX_FAILURES) compactDisabled = true;
         return { compacted: false, freed: 0 };
       }
-      messages.splice(1, cut - 1, {
-        role: 'system',
-        content: `[compact summary]\n${summary}`,
-      });
+      store.compact(cut, summary);
       compactFailures = 0;
-      const after = estimateTokens(messages);
+      const after = estimateTokens(store.snapshot());
       return { compacted: true, freed: Math.max(0, before - after) };
     } catch {
       compactFailures += 1;
@@ -510,17 +449,11 @@ export async function createAgent(
   }
 
   function foldMessages(anchor: number, taskId: string, summary: string): void {
-    if (anchor < 0 || anchor > messages.length) return;
-    const folded = messages.splice(anchor);
-    taskArchive.set(taskId, folded);
-    // Preserve user question in summary for context continuity
-    const userMsg = folded.find(m => m.role === 'user');
-    const userQ = userMsg && typeof userMsg.content === 'string' ? userMsg.content : '';
-    const foldSummary = userQ
-      ? `[conversation] User asked: "${userQ.slice(0, 100)}" → ${summary || '(no answer)'}`
-      : `[stack:completed ${taskId}] Summary: ${summary}`;
-    messages.push({ role: 'system', content: foldSummary });
-    persistedCount = messages.length;
+    const folded = store.fold(anchor, summary);
+    if (folded) {
+      taskArchive.set(taskId, folded);
+      store.markPersisted();
+    }
   }
 
   async function* runTask(
@@ -528,8 +461,14 @@ export async function createAgent(
     rootUserMessage: ChatContent,
     signal?: AbortSignal
   ): AsyncGenerator<AgentEvent, { text: string; hitMaxLoops: boolean }, unknown> {
-    const errorHistory = new Map<string, number>();
-    const MAX_SAME_ERROR = 2;
+    const errorTracker = new ErrorTracker();
+    const streamParser = new StreamParser();
+    const toolExecutor = new ToolExecutor(
+      config,
+      connections,
+      builtinTools,
+      { nextId: nextConfirmId, awaitApproval: awaitConfirm }
+    );
 
     let openingContent: ChatCompletionUserMessageParam['content'];
     if (task.parentId) {
@@ -539,7 +478,7 @@ export async function createAgent(
     } else {
       openingContent = rootUserMessage as unknown as ChatCompletionUserMessageParam['content'];
     }
-    messages.push({ role: 'user', content: openingContent });
+    store.appendUser(openingContent as any);
     persistPending();
 
     let finalText = '';
@@ -561,9 +500,7 @@ export async function createAgent(
 
       const stateStr = renderStackState(stack);
       const suffix = (stateStr || '') + loopWarning;
-      const requestMessages = suffix
-        ? [{ ...messages[0], content: (messages[0] as any).content + '\n' + suffix }, ...messages.slice(1)]
-        : [...messages];
+      const requestMessages = store.buildRequestMessages(suffix);
 
       const request: Parameters<typeof client.chat.completions.create>[0] = {
         model: config.model.model,
@@ -598,37 +535,20 @@ export async function createAgent(
         );
       } catch (retryErr) {
         const status = (retryErr as any)?.status;
-        if (status === 500 && messages.length > 4) {
+        if (status === 500 && store.length > 4) {
           // 500 after retries — truncate preserving system(0) + first user + last N
-          const keep = Math.max(4, Math.floor(messages.length / 2));
-          const firstUserIdx = messages.findIndex(
+          const keep = Math.max(4, Math.floor(store.length / 2));
+          const firstUserIdx = store.findIndex(
             (m, i) => i > 0 && m.role === 'user'
           );
           const tailStart = Math.max(
             firstUserIdx > 0 ? firstUserIdx + 1 : 1,
-            messages.length - keep
+            store.length - keep
           );
-          const originalLen = messages.length;
-          const newMessages: ChatCompletionMessageParam[] = [messages[0]];
-          if (firstUserIdx > 1) {
-            newMessages.push({
-              role: 'system',
-              content: '[context truncated due to server error]',
-            });
-          }
-          if (firstUserIdx > 0) {
-            newMessages.push(messages[firstUserIdx]);
-          }
-          for (let i = tailStart; i < originalLen; i++) {
-            newMessages.push(messages[i]);
-          }
-          messages.length = 0;
-          messages.push(...newMessages);
+          store.truncateForRecovery(firstUserIdx, tailStart);
 
           const stateStr2 = renderStackState(stack);
-          request.messages = stateStr2
-            ? [{ ...messages[0], content: (messages[0] as any).content + '\n' + stateStr2 }, ...messages.slice(1)]
-            : messages;
+          request.messages = store.buildRequestMessages(stateStr2);
           stream = await client.chat.completions.create(
             { ...request, stream: true },
             { signal }
@@ -638,117 +558,24 @@ export async function createAgent(
         }
       }
 
-      let contentBuf = '';
-      const toolAcc = new Map<
-        number,
-        { id: string; name: string; argsBuf: string }
-      >();
-
-      let isThinking = false;
-      let thinkingViaReasoning = false;
-      let thinkingStartTime = 0;
-
-      for await (const chunk of stream as any) {
-        const delta = chunk?.choices?.[0]?.delta;
-        if (!delta) continue;
-
-        // Handle reasoning_content field (Qwen/Gemma thinking mode)
-        if (typeof (delta as any).reasoning_content === 'string' && (delta as any).reasoning_content.length > 0) {
-          if (!isThinking) {
-            isThinking = true;
-            thinkingViaReasoning = true;
-            thinkingStartTime = Date.now();
-            yield { type: 'thinking:start' };
-          }
-          continue;
-        }
-
-        if (typeof delta.content === 'string' && delta.content.length > 0) {
-          // If thinking was started via reasoning_content, content appearing means thinking ended
-          if (isThinking && thinkingViaReasoning) {
-            isThinking = false;
-            thinkingViaReasoning = false;
-            yield { type: 'thinking:end', durationMs: Date.now() - thinkingStartTime };
-          }
-
-          let text = delta.content;
-
-          // Simple thinking token filter (strip inline markers for Gemma)
-          if (text.includes('<|channel>thought') || text.includes('<think>')) {
-            if (!isThinking) {
-              isThinking = true;
-              thinkingStartTime = Date.now();
-              yield { type: 'thinking:start' };
-            }
-            text = text.replace(/<\|channel>thought/g, '').replace(/<think>/g, '');
-          }
-          if (text.includes('<channel|>') || text.includes('</think>')) {
-            text = text.replace(/<channel\|>/g, '').replace(/<\/think>/g, '');
-            if (isThinking) {
-              isThinking = false;
-              yield { type: 'thinking:end', durationMs: Date.now() - thinkingStartTime };
-            }
-          }
-
-          // If currently thinking, skip content
-          if (isThinking) continue;
-
-          // Emit non-empty content
-          if (text.length > 0) {
-            contentBuf += text;
-            yield { type: 'token', text };
-          }
-        }
-
-        if (Array.isArray(delta.tool_calls)) {
-          for (const tc of delta.tool_calls) {
-            const idx = typeof tc.index === 'number' ? tc.index : 0;
-            let cur = toolAcc.get(idx);
-            if (!cur) {
-              cur = { id: '', name: '', argsBuf: '' };
-              toolAcc.set(idx, cur);
-            }
-            if (tc.id) cur.id = tc.id;
-            if (tc.function?.name) cur.name += tc.function.name;
-            if (tc.function?.arguments) cur.argsBuf += tc.function.arguments;
-          }
-        }
-      }
-
-      // Close unclosed thinking state
-      if (isThinking) {
-        isThinking = false;
-        yield { type: 'thinking:end', durationMs: Date.now() - thinkingStartTime };
-      }
-
-      const assembled = [...toolAcc.entries()]
-        .sort(([a], [b]) => a - b)
-        .map(([, v]) => ({
-          id: v.id,
-          type: 'function' as const,
-          function: { name: v.name, arguments: v.argsBuf },
-        }));
-      const toolCalls = normalizeToolCalls(assembled);
+      const { content: contentBuf, toolCalls } = yield* streamParser.parse(
+        stream
+      );
 
       if (!toolCalls) {
         // If content is empty/whitespace after tool use, nudge model to answer
         if (contentBuf.trim().length === 0 && loop > 0) {
-          messages.push({ role: 'assistant', content: contentBuf });
-          messages.push({ role: 'user', content: 'Please provide your answer based on the tool results above.' });
+          store.appendNudge();
           persistPending();
           continue; // one more loop to get actual answer
         }
-        messages.push({ role: 'assistant', content: contentBuf });
+        store.appendAssistant(contentBuf);
         persistPending();
         finalText = contentBuf;
         return { text: finalText, hitMaxLoops: false };
       }
 
-      messages.push({
-        role: 'assistant',
-        content: contentBuf.trim() || '',
-        tool_calls: toolCalls,
-      });
+      store.appendAssistant(contentBuf.trim() || '', toolCalls);
 
       // P0-b: If ALL tool_calls have empty args, pop the assistant message and retry
       // with lower temperature. Don't let model see its own empty-args history.
@@ -758,153 +585,40 @@ export async function createAgent(
       });
       if (allEmpty && emptyArgsRetries < 2) {
         emptyArgsRetries += 1;
-        messages.pop(); // remove the assistant message with empty tool_calls
+        store.popAssistant(); // remove the assistant message with empty tool_calls
         tempOverride = 0.1; // force low temperature for next request
         continue; // re-enter loop without incrementing any error state
       }
       emptyArgsRetries = 0;
       tempOverride = undefined;
 
+      const toolCtx = { stack, currentTask: task, todoList };
+
       for (const tc of toolCalls) {
         const fullName = tc.function.name;
         const args = normalizeArguments(tc.function.arguments);
 
-        // Intercept empty args when tool schema has required fields
-        if (Object.keys(args).length === 0) {
-          const schema = findToolSchema(connections, fullName);
-          const required = schema?.required;
-          if (Array.isArray(required) && required.length > 0) {
-            const emptyResult = `Error: tool "${fullName}" requires [${required.join(', ')}] but received empty arguments. Please provide the required parameters.`;
-            yield { type: 'tool:call', name: fullName, args };
-            yield { type: 'tool:result', ok: false, content: emptyResult };
-            messages.push({
-              role: 'tool',
-              tool_call_id: tc.id,
-              content: emptyResult,
-            });
-            continue;
-          }
-        }
-
-        const callKey = `${fullName}:${JSON.stringify(args)}`;
-        const prevErrors = errorHistory.get(callKey) || 0;
-        if (prevErrors >= MAX_SAME_ERROR) {
-          const blockedResult = `已尝试 ${prevErrors} 次均失败，请换个路径或方式。`;
+        const blockCheck = errorTracker.isBlocked(fullName, args);
+        if (blockCheck.blocked) {
           yield { type: 'tool:call', name: fullName, args };
-          yield { type: 'tool:result', ok: false, content: blockedResult };
-          messages.push({
-            role: 'tool',
-            tool_call_id: tc.id,
-            content: blockedResult,
-          });
+          yield { type: 'tool:result', ok: false, content: blockCheck.message! };
+          store.appendToolResult(tc.id, blockCheck.message!);
           continue;
         }
 
-        yield { type: 'tool:call', name: fullName, args };
-
-        let toolResult = '';
-        let isError = false;
-        let skipExecute = false;
-
-        if (DANGER_EXEC_TOOLS.has(fullName)) {
-          const cmd = extractCommand(args);
-          const mode = config.danger?.mode ?? 'confirm';
-          if (cmd && mode !== 'off') {
-            const allow = config.danger?.allow;
-            const result = classifyCommand(cmd);
-            if (result.dangerous && !isWhitelisted(cmd, allow)) {
-              const reason = result.reason ?? 'dangerous command';
-              if (mode === 'deny' || !isTtyInteractive()) {
-                toolResult = `[blocked] ${reason}`;
-                isError = true;
-                skipExecute = true;
-              } else {
-                const requestId = nextConfirmId();
-                yield {
-                  type: 'tool:confirm',
-                  requestId,
-                  cmd,
-                  reason,
-                };
-                const approved = await awaitConfirm(requestId, signal);
-                if (!approved) {
-                  toolResult = `[user denied] ${reason}`;
-                  isError = true;
-                  skipExecute = true;
-                }
-              }
-            }
-          }
-        }
-
-        if (!skipExecute) {
-          const builtin = builtinTools.get(fullName);
-          if (builtin) {
-            const r = builtin.handler(args, {
-              stack,
-              currentTask: task,
-              todoList,
-            });
-            toolResult = r.content;
-            isError = r.isError;
-            if (!isError && fullName === 'ask_user') {
-              yield {
-                type: 'ask_user',
-                question: toolResult.slice(ASK_USER_PREFIX.length),
-              };
-            } else if (!isError && fullName === 'enter_plan_mode') {
-              const planArg =
-                typeof args.plan === 'string' ? args.plan.trim() : '';
-              yield { type: 'plan', content: planArg };
-            }
-          } else {
-            const route = routeToolCall(connections, fullName);
-            if (!route) {
-              toolResult = `Error: unknown tool '${fullName}'`;
-              isError = true;
-            } else {
-              try {
-                const r = await route.conn.call(route.toolName, args, signal);
-                toolResult = r.content;
-                isError = r.isError;
-              } catch (err) {
-                toolResult = `Error: ${(err as Error).message}`;
-                isError = true;
-              }
-            }
-          }
-        }
-
-        const short =
-          toolResult.length > 400 ? toolResult.slice(0, 400) + '...' : toolResult;
-        yield { type: 'tool:result', ok: !isError, content: short };
-        const compacted = compactToolResult(toolResult);
-        if (compacted.startsWith('data:image/')) {
-          messages.push({
-            role: 'tool',
-            tool_call_id: tc.id,
-            content: [{ type: 'image_url', image_url: { url: compacted } }] as any,
-          });
-        } else {
-          messages.push({
-            role: 'tool',
-            tool_call_id: tc.id,
-            content: compacted,
-          });
-        }
-
-        if (isError) {
-          const newCount = prevErrors + 1;
-          errorHistory.set(callKey, newCount);
-        } else {
-          errorHistory.delete(callKey);
-        }
+        const { result, isError } = yield* toolExecutor.execute(
+          tc,
+          toolCtx,
+          signal
+        );
+        store.appendToolResult(tc.id, result);
+        errorTracker.record(fullName, args, isError);
       }
       persistPending();
     }
 
     const stop = `[agent] task [${task.id}] reached max loop count (${maxLoops}), aborting`;
-    messages.push({ role: 'assistant', content: stop });
+    store.appendAssistant(stop);
     persistPending();
     yield { type: 'text', content: stop };
     finalText = stop;
@@ -940,7 +654,7 @@ export async function createAgent(
       const task = stack.pop();
       if (!task) break;
 
-      task.messageAnchor = messages.length;
+      task.messageAnchor = store.length;
 
       yield { type: 'task:start', taskId: task.id, prompt: task.prompt };
 
@@ -1006,13 +720,10 @@ export async function createAgent(
       }
     }
 
-    removeLastStackStateMessage(messages);
   }
 
   function reset(): void {
-    messages.length = 0;
-    messages.push({ role: 'system', content: systemPrompt });
-    persistedCount = messages.length;
+    store.reset(systemPrompt);
     stack.clear();
     taskArchive.clear();
   }
@@ -1033,7 +744,7 @@ export async function createAgent(
 
   function getContextUsage(): { used: number; total: number } {
     return {
-      used: estimateTokens(messages),
+      used: estimateTokens(store.snapshot()),
       total: config.model.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
     };
   }
@@ -1043,12 +754,10 @@ export async function createAgent(
 
 export const __internal__ = {
   mcpToolsToOpenAI,
-  routeToolCall,
   normalizeArguments,
   ensureToolCallId,
   normalizeToolCalls,
   renderStackState,
-  removeLastStackStateMessage,
   compactToolResult,
   CREATE_TASK_TOOL,
   STACK_STATE_PREFIX,
