@@ -116,8 +116,14 @@ function handleWriteFile(args: Record<string, unknown>) {
     if (existed && oldContent) {
       const diff = generateWriteFileDiff(oldContent, normalized, path);
       result = `已覆盖 ${path}（${bytes} bytes）\n\n--- Diff ---\n${diff}`;
+    } else if (existed) {
+      // 文件存在但读取失败，仍然生成 diff
+      const diff = generateWriteFileDiff('', normalized, path);
+      result = `已覆盖 ${path}（${bytes} bytes）\n\n--- Diff ---\n${diff}`;
     } else {
-      result = `已写入 ${path}（${bytes} bytes)`;
+      // 新文件也生成 diff，让所有行显示为新增
+      const diff = generateWriteFileDiff('', normalized, path);
+      result = `已写入 ${path}（${bytes} bytes）\n\n--- Diff ---\n${diff}`;
     }
     return ok(result);
   } catch (e) { return ok(`write_file failed: ${errMsg(e)}`, true); }

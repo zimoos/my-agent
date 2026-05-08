@@ -2,9 +2,9 @@
  * DiffBlock 组件 — 智能折叠 diff 显示
  *
  * 根据变更行数自动选择显示策略：
- * - ≤ 10 行：完整显示
- * - 11-50 行：摘要 + 前5行 + 折叠标记 + 后5行
- * - > 50 行：仅摘要框
+ * - ≤ 50 行：完整显示
+ * - 51-200 行：摘要 + 前10行 + 折叠标记 + 后10行
+ * - > 200 行：仅摘要框
  */
 
 import React from 'react';
@@ -26,7 +26,7 @@ export function DiffBlock({ diff }: DiffBlockProps) {
   const totalChanges = diff.addedLines + diff.removedLines;
 
   // === 策略 1: 大文件 → 仅摘要 ===
-  if (totalChanges > 50) {
+  if (totalChanges > 200) {
     return (
       <Box flexDirection="column" marginTop={1} marginBottom={1}>
         <Box>
@@ -49,7 +49,7 @@ export function DiffBlock({ diff }: DiffBlockProps) {
   }
 
   // === 策略 2: 中等文件 → 摘要 + 前N/后N行 ===
-  if (totalChanges > 10) {
+  if (totalChanges > 50) {
     const lines = diff.diffText.split('\n');
     // 跳过 header（前4行）和 closing border（最后一行）
     const contentLines = lines.slice(4, -1);
