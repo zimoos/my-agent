@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MA - Local-first multi-model terminal coding agent</title>
+    <meta
+      name="description"
+      content="MA is a local-first, multi-model terminal coding agent with LM Studio, DeepSeek, secure credentials, MCP tools, and a keyboard-first TUI."
+    />
+    <meta property="og:title" content="MA - terminal coding agent" />
+    <meta property="og:description" content="Local-first multi-model coding agent for real repositories." />
+    <meta property="og:image" content="./assets/logo.svg" />
+    <link rel="icon" href="./assets/logo.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="MA home">
+        <img src="./assets/logo.svg" alt="" />
+        <span>MA</span>
+      </a>
+      <nav class="nav" aria-label="Primary navigation">
+        <a href="#features">Features</a>
+        <a href="#benchmark">Benchmark</a>
+        <a href="#install">Install</a>
+        <a href="#zh">中文</a>
+        <a class="nav-button" href="https://github.com/zhuqingyv/my-agent">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero">
+        <div class="hero-grid" aria-hidden="true"></div>
+        <div class="hero-copy">
+          <p class="eyebrow">v0.1.0-alpha</p>
+          <h1>MA</h1>
+          <p class="lede">A local-first, multi-model coding agent for your terminal.</p>
+          <p class="sublede">
+            Switch between LM Studio and DeepSeek, keep API keys out of plain config, and work inside real repositories with MCP tools.
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="https://github.com/zhuqingyv/my-agent/releases/tag/v0.1.0-alpha">Download alpha</a>
+            <a class="button secondary" href="https://github.com/zhuqingyv/my-agent">View source</a>
+          </div>
+        </div>
+        <div class="hero-logo">
+          <img src="./assets/logo.svg" alt="MA pixel logo" />
+        </div>
+      </section>
+
+      <section class="terminal-band" aria-label="Quick start terminal">
+        <div class="terminal">
+          <div class="terminal-bar"><span></span><span></span><span></span></div>
+          <pre><code>$ ma init
+? Model source
+  LM Studio local
+› DeepSeek official
+
+$ ma
+/model  switch provider and model with arrow keys</code></pre>
+        </div>
+      </section>
+
+      <section id="features" class="section">
+        <div class="section-heading">
+          <p class="eyebrow">Built For Daily Work</p>
+          <h2>Terminal UX that respects real projects.</h2>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3>Multi-model by default</h3>
+            <p>Use LM Studio local models and DeepSeek today. Provider/model profiles keep names clear: <code>DeepSeek/deepseek-v4-pro</code>.</p>
+          </article>
+          <article>
+            <h3>Fast model switching</h3>
+            <p><code>/model</code> opens a keyboard picker, aggregates discovered models, and remembers the last selected profile.</p>
+          </article>
+          <article>
+            <h3>Secure remote keys</h3>
+            <p>Remote API keys are stored in macOS Keychain. Config files keep only references, not plaintext secrets.</p>
+          </article>
+          <article>
+            <h3>Built-in MCP tools</h3>
+            <p>Shell, file read/write, structured edits, grep, and web search are ready after <code>ma init</code>.</p>
+          </article>
+          <article>
+            <h3>Slash commands</h3>
+            <p>Type <code>/</code> for suggestions, use arrow keys to choose, and press Tab to complete.</p>
+          </article>
+          <article>
+            <h3>Local instructions and skills</h3>
+            <p>MA reads <code>AGENT.md</code> and project-local <code>.ma/skills/*.md</code> so teams can encode workflow knowledge.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="benchmark" class="section split">
+        <div>
+          <p class="eyebrow">Alpha Benchmark</p>
+          <h2>Qwen3-30B local passes the L0-L2 release gate.</h2>
+          <p>
+            MA's alpha benchmark covers connectivity, stable tool use, and multi-turn local project work. It is a product release gate, not a universal leaderboard.
+          </p>
+          <a class="inline-link" href="https://github.com/zhuqingyv/my-agent/blob/main/docs/benchmark-results.md">Read benchmark details</a>
+        </div>
+        <div class="metric-table" role="table" aria-label="Benchmark results">
+          <div role="row"><span role="columnheader">Runtime</span><strong role="cell">LM Studio</strong></div>
+          <div role="row"><span role="columnheader">Model</span><strong role="cell">Qwen3-30B local</strong></div>
+          <div role="row"><span role="columnheader">Tasks</span><strong role="cell">70</strong></div>
+          <div role="row"><span role="columnheader">L0</span><strong role="cell">100%</strong></div>
+          <div role="row"><span role="columnheader">L1</span><strong role="cell">98.7%</strong></div>
+          <div role="row"><span role="columnheader">L2</span><strong role="cell">95.3%</strong></div>
+        </div>
+      </section>
+
+      <section id="install" class="section install">
+        <div class="section-heading">
+          <p class="eyebrow">Install</p>
+          <h2>Download, extract, run.</h2>
+        </div>
+        <div class="install-grid">
+          <div>
+            <h3>macOS / Linux</h3>
+            <pre><code>tar -xzf ma-*.tar.gz
+cd ma-*
+./ma init
+./ma</code></pre>
+          </div>
+          <div>
+            <h3>Windows</h3>
+            <pre><code>Expand-Archive ma-*.zip
+cd ma-*
+.\ma.cmd init
+.\ma.cmd</code></pre>
+          </div>
+        </div>
+      </section>
+
+      <section id="zh" class="section zh">
+        <div class="section-heading">
+          <p class="eyebrow">中文</p>
+          <h2>MA 是一个本地优先、多模型的终端编程 Agent。</h2>
+          <p>
+            当前 alpha 支持 LM Studio 本地模型和 DeepSeek 官方 API，内置模型切换、Keychain 密钥存储、MCP 工具、斜杠指令和项目技能。
+          </p>
+        </div>
+        <div class="feature-grid">
+          <article>
+            <h3>配置体验</h3>
+            <p><code>ma init</code> 通过交互式流程选择 provider、发现模型、保存 profile。</p>
+          </article>
+          <article>
+            <h3>模型切换</h3>
+            <p><code>/model</code> 直接上下选择所有模型，并记住上一次使用的模型。</p>
+          </article>
+          <article>
+            <h3>安全边界</h3>
+            <p>远程 API Key 不写入明文配置，删除和查看走系统认证。</p>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>MA v0.1.0-alpha</span>
+      <a href="https://github.com/zhuqingyv/my-agent/releases/tag/v0.1.0-alpha">Release</a>
+      <a href="https://github.com/zhuqingyv/my-agent">GitHub</a>
+    </footer>
+  </body>
+</html>
