@@ -15,8 +15,7 @@ import { runInit } from '../init.js';
 import type { BootstrapResult } from '../index.js';
 import type { McpConnection } from '../mcp/types.js';
 import { App } from './App.js';
-
-const VERSION = '0.1.0-alpha.0';
+import { VERSION } from './version.js';
 
 let activeConnections: McpConnection[] = [];
 
