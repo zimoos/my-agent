@@ -1,4 +1,6 @@
 import parseDiff from 'parse-diff';
+import cliTruncate from 'cli-truncate';
+import stringWidth from 'string-width';
 
 export type DiffLineKind = 'add' | 'del' | 'context' | 'hunk' | 'file' | 'meta';
 
@@ -10,12 +12,18 @@ export interface RenderDiffLine {
   content: string;
 }
 
-export const MAX_DIFF_LINE_CONTENT = 110;
+export const DEFAULT_DIFF_LINE_COLUMNS = 110;
 
-export function truncateDiffContent(content: string, maxLength = MAX_DIFF_LINE_CONTENT): string {
-  if (content.length <= maxLength) return content;
-  if (maxLength <= 3) return '.'.repeat(Math.max(0, maxLength));
-  return `${content.slice(0, maxLength - 3)}...`;
+export function truncateDiffContent(content: string, columns = DEFAULT_DIFF_LINE_COLUMNS): string {
+  if (columns <= 0) return '';
+  return cliTruncate(content, columns, {
+    position: 'end',
+    truncationCharacter: '…',
+  });
+}
+
+export function diffDisplayWidth(content: string): number {
+  return stringWidth(content);
 }
 
 export function buildDiffLines(diffText: string): RenderDiffLine[] {

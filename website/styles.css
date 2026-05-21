@@ -215,7 +215,8 @@ h3 {
   filter: drop-shadow(0 24px 60px rgba(255, 107, 231, 0.22));
 }
 
-.terminal-band {
+.terminal-band,
+.init-band {
   padding: 0 7vw 88px;
 }
 
@@ -452,6 +453,7 @@ h3 {
   }
 
   .terminal-band,
+  .init-band,
   .section,
   .proof-strip {
     padding-left: 22px;

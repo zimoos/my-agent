@@ -8,10 +8,10 @@
  */
 
 import React from 'react';
-import { Box, Text } from 'ink';
+import { Box, Text, useStdout } from 'ink';
 import pico from 'picocolors';
 import type { DiffData } from '../state/types.js';
-import { buildDiffLines, truncateDiffContent, type RenderDiffLine } from '../utils/diff-lines.js';
+import { buildDiffLines, diffDisplayWidth, truncateDiffContent, type RenderDiffLine } from '../utils/diff-lines.js';
 
 interface DiffBlockProps {
   diff: DiffData;
@@ -22,29 +22,24 @@ const COLLAPSE_MARKER = pico.yellow('  · · ·');
 
 /** 最大显示行数（含上下文） */
 const MAX_VISIBLE = 10;
+const MIN_BOX_COLUMNS = 48;
+const MAX_BOX_COLUMNS = 120;
+const TERMINAL_MARGIN_COLUMNS = 4;
+const DIFF_GUTTER_COLUMNS = 10;
 
 export function DiffBlock({ diff }: DiffBlockProps) {
   const totalChanges = diff.addedLines + diff.removedLines;
+  const { stdout } = useStdout();
+  const terminalColumns = stdout.columns || process.stdout.columns || 80;
+  const layout = getDiffLayout(terminalColumns);
 
   // === 策略 1: 大文件 → 仅摘要 ===
   if (totalChanges > 200) {
     return (
       <Box flexDirection="column" marginTop={1} marginBottom={1}>
-        <Box>
-          <Text color="blue">{pico.blue('┌─')} {pico.blue('─'.repeat(58))} {pico.blue('┐')}</Text>
-        </Box>
-        <Box>
-          <Text color="blue">{pico.blue('│')} {pico.dim('📝 ')} {pico.cyan(pico.bold(diff.filePath))} {pico.blue('│')}</Text>
-        </Box>
-        <Box>
-          <Text color="blue">{pico.blue('│')} {pico.dim('   ')} {pico.green(`+${diff.addedLines}`)} {pico.dim('/')} {pico.red(`-${diff.removedLines}`)} {pico.dim('lines changed')} {pico.blue('│')}</Text>
-        </Box>
-        <Box>
-          <Text color="blue">{pico.blue('│')} {pico.yellow('  ⚠ Full diff hidden (too large)')} {pico.blue('│')}</Text>
-        </Box>
-        <Box>
-          <Text color="blue">{pico.blue('└─')} {pico.blue('─'.repeat(58))} {pico.blue('┘')}</Text>
-        </Box>
+        <DiffFrameHeader diff={diff} layout={layout} />
+        <FrameRow layout={layout} color="yellow" text="  ! Full diff hidden (too large)" />
+        <FrameBorder layout={layout} edge="bottom" />
       </Box>
     );
   }
@@ -59,31 +54,23 @@ export function DiffBlock({ diff }: DiffBlockProps) {
 
     return (
       <Box flexDirection="column" marginTop={1} marginBottom={1}>
-        <Box>
-          <Text color="blue">{pico.blue('┌─')} {pico.blue('─'.repeat(58))} {pico.blue('┐')}</Text>
-        </Box>
-        <Box>
-          <Text color="blue">{pico.blue('│')} {pico.dim('📝 ')} {pico.cyan(pico.bold(diff.filePath))} {pico.blue('│')}</Text>
-        </Box>
-        <Box>
-          <Text color="blue">{pico.blue('│')} {pico.dim('   ')} {pico.green(`+${diff.addedLines}`)} {pico.dim('/')} {pico.red(`-${diff.removedLines}`)} {pico.dim('lines changed')} {pico.blue('│')}</Text>
-        </Box>
+        <DiffFrameHeader diff={diff} layout={layout} />
         <Box flexDirection="column">
           {head.map((line, i) => (
-            <DiffLine key={`h-${i}`} line={line} />
+            <DiffLine key={`h-${i}`} line={line} layout={layout} />
           ))}
           {collapsed > 0 && (
             <Box>
-              <Text dimColor wrap="truncate-end">{COLLAPSE_MARKER} ({collapsed} lines collapsed) {COLLAPSE_MARKER}</Text>
+              <Text dimColor wrap="truncate-end">
+                {truncateDiffContent(`${COLLAPSE_MARKER} (${collapsed} lines collapsed) ${COLLAPSE_MARKER}`, layout.boxColumns)}
+              </Text>
             </Box>
           )}
           {tail.map((line, i) => (
-            <DiffLine key={`t-${i}`} line={line} />
+            <DiffLine key={`t-${i}`} line={line} layout={layout} />
           ))}
         </Box>
-        <Box>
-          <Text color="blue">{pico.blue('└─')} {pico.blue('─'.repeat(58))} {pico.blue('┘')}</Text>
-        </Box>
+        <FrameBorder layout={layout} edge="bottom" />
       </Box>
     );
   }
@@ -93,33 +80,80 @@ export function DiffBlock({ diff }: DiffBlockProps) {
 
   return (
     <Box flexDirection="column" marginTop={1} marginBottom={1}>
-      <Box>
-        <Text color="blue">{pico.blue('┌─')} {pico.blue('─'.repeat(58))} {pico.blue('┐')}</Text>
-      </Box>
-      <Box>
-        <Text color="blue">{pico.blue('│')} {pico.dim('📝 ')} {pico.cyan(pico.bold(diff.filePath))} {pico.blue('│')}</Text>
-      </Box>
-      <Box>
-        <Text color="blue">{pico.blue('│')} {pico.dim('   ')} {pico.green(`+${diff.addedLines}`)} {pico.dim('/')} {pico.red(`-${diff.removedLines}`)} {pico.dim('lines changed')} {pico.blue('│')}</Text>
-      </Box>
+      <DiffFrameHeader diff={diff} layout={layout} />
       <Box flexDirection="column">
         {contentLines.map((line, i) => (
-          <DiffLine key={i} line={line} />
+          <DiffLine key={i} line={line} layout={layout} />
         ))}
       </Box>
-      <Box>
-        <Text color="blue">{pico.blue('└─')} {pico.blue('─'.repeat(58))} {pico.blue('┘')}</Text>
-      </Box>
+      <FrameBorder layout={layout} edge="bottom" />
     </Box>
   );
 }
 
-function DiffLine({ line }: { line: RenderDiffLine }) {
+export interface DiffLayout {
+  boxColumns: number;
+  frameContentColumns: number;
+  diffContentColumns: number;
+}
+
+export function getDiffLayout(terminalColumns: number): DiffLayout {
+  const available = Math.max(MIN_BOX_COLUMNS, terminalColumns - TERMINAL_MARGIN_COLUMNS);
+  const boxColumns = clamp(available, MIN_BOX_COLUMNS, MAX_BOX_COLUMNS);
+  return {
+    boxColumns,
+    frameContentColumns: Math.max(16, boxColumns - 4),
+    diffContentColumns: Math.max(16, boxColumns - DIFF_GUTTER_COLUMNS),
+  };
+}
+
+function DiffFrameHeader({ diff, layout }: { diff: DiffData; layout: DiffLayout }) {
+  return (
+    <>
+      <FrameBorder layout={layout} edge="top" />
+      <FrameRow layout={layout} color="cyan" text={`[file] ${diff.filePath}`} bold />
+      <FrameRow layout={layout} text={`   +${diff.addedLines} / -${diff.removedLines} lines changed`} />
+    </>
+  );
+}
+
+function FrameBorder({ layout, edge }: { layout: DiffLayout; edge: 'top' | 'bottom' }) {
+  const left = edge === 'top' ? '┌' : '└';
+  const right = edge === 'top' ? '┐' : '┘';
+  return (
+    <Box>
+      <Text color="blue">{left}{'─'.repeat(layout.boxColumns - 2)}{right}</Text>
+    </Box>
+  );
+}
+
+function FrameRow({
+  layout,
+  text,
+  color,
+  bold = false,
+}: {
+  layout: DiffLayout;
+  text: string;
+  color?: 'cyan' | 'yellow';
+  bold?: boolean;
+}) {
+  const content = padRight(truncateDiffContent(text, layout.frameContentColumns), layout.frameContentColumns);
+  return (
+    <Box>
+      <Text color="blue">│ </Text>
+      <Text color={color} bold={bold} wrap="truncate-end">{content}</Text>
+      <Text color="blue"> │</Text>
+    </Box>
+  );
+}
+
+function DiffLine({ line, layout }: { line: RenderDiffLine; layout: DiffLayout }) {
   const oldLine = formatLineNo(line.oldLine);
   const newLine = formatLineNo(line.newLine);
-  const content = truncateDiffContent(line.content);
 
   if (line.kind === 'file') {
+    const content = truncateDiffContent(line.content, layout.boxColumns - 5);
     return (
       <Box>
         <Text color="cyan" dimColor wrap="truncate-end">{'     '}{content}</Text>
@@ -127,6 +161,7 @@ function DiffLine({ line }: { line: RenderDiffLine }) {
     );
   }
   if (line.kind === 'hunk') {
+    const content = truncateDiffContent(line.content, layout.boxColumns - 5);
     return (
       <Box>
         <Text color="yellow" wrap="truncate-end">{'     '}{content}</Text>
@@ -134,6 +169,7 @@ function DiffLine({ line }: { line: RenderDiffLine }) {
     );
   }
   if (line.kind === 'meta') {
+    const content = truncateDiffContent(line.content, layout.boxColumns - 5);
     return (
       <Box>
         <Text color="yellow" dimColor wrap="truncate-end">{'     '}{content}</Text>
@@ -143,20 +179,23 @@ function DiffLine({ line }: { line: RenderDiffLine }) {
 
   const color = line.kind === 'add' ? 'green' : line.kind === 'del' ? 'red' : undefined;
   const dim = line.kind === 'context';
+  const content = truncateDiffContent(line.content, layout.diffContentColumns);
 
   return (
     <Box>
-      <Text dimColor>{oldLine}</Text>
-      <Text dimColor>{' '}</Text>
-      <Text dimColor>{newLine}</Text>
-      <Text>{' '}</Text>
-      <Text color={color} dimColor={dim}>{line.sign}</Text>
-      <Text>{' '}</Text>
-      <Text color={color} dimColor={dim} wrap="truncate-end">{content}</Text>
+      <Text color={color} dimColor={dim} wrap="truncate-end">{`${oldLine} ${newLine} ${line.sign} ${content}`}</Text>
     </Box>
   );
 }
 
 function formatLineNo(value: number | undefined): string {
   return value === undefined ? '   ' : String(value).padStart(3, ' ');
+}
+
+function padRight(value: string, columns: number): string {
+  return `${value}${' '.repeat(Math.max(0, columns - diffDisplayWidth(value)))}`;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }

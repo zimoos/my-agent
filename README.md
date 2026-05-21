@@ -6,17 +6,19 @@ DeepSeek in minutes. Local small models turned into real productivity.
 
 MA is a terminal coding agent built around two practical promises: remote setup should be brainless, and local small models should become useful production tools. DeepSeek config is interactive and direct. LM Studio/Qwen gets long-context handling, tool hardening, model switching, and benchmark-driven fixes so small models can do real repo work.
 
-`v0.1.0-alpha` supports LM Studio local models and DeepSeek official API today. More OpenAI-compatible providers are next.
+`v0.1.1-alpha` supports LM Studio local models and DeepSeek official API today. More OpenAI-compatible providers are next.
 
 Website: https://zhuqingyv.github.io/my-agent/  
-Release: https://github.com/zhuqingyv/my-agent/releases/tag/v0.1.0-alpha
+Release: https://github.com/zhuqingyv/my-agent/releases/tag/v0.1.1-alpha
 
 ![MA terminal UI preview](website/assets/tui-preview.svg)
+
+![MA init flow preview](website/assets/init-preview.svg)
 
 ## The Hook
 
 - **Local small models become productive**: MA's alpha gate runs 70 L0-L2 tasks through a local Qwen3-30B model via LM Studio.
-- **DeepSeek is the zero-friction fallback**: `ma init` discovers models, stores keys safely, and leaves you with a working profile instead of a config chore.
+- **DeepSeek is the zero-friction fallback**: `ma init` gives LM Studio and DeepSeek the same arrow-key setup flow, stores remote keys safely, and leaves you with a working profile instead of a config chore.
 - **Near-infinite working room**: MA auto-detects context windows, tracks usage, compresses output, and is designed for long local-agent loops.
 - **Small-model hardening is the product**: Qwen/LM Studio-specific sampling, image payload compatibility, tool-call recovery, and prompt/message integrity are treated as release gates.
 - **Agent tools are built in**: shell, file read/write, structured edits, grep, and web are available immediately after init.
@@ -100,6 +102,13 @@ During init:
 2. Enter base URL if needed.
 3. Enter API key for remote providers.
 4. Pick a discovered model with arrow keys.
+
+That means both first-run paths stay obvious:
+
+```text
+LM Studio local  -> Base URL -> credential name -> discovered local model
+DeepSeek official -> Base URL -> credential name -> Keychain API key -> discovered DeepSeek model
+```
 
 Inside MA:
 

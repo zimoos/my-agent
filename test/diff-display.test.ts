@@ -4,6 +4,8 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import React from 'react';
+import { renderToString } from 'ink';
 
 import { formatToolResultForUi } from '../src/agent/tool-executor.js';
 import { parseToolResultDiff } from '../src/agent/diff-artifact.js';
@@ -11,7 +13,8 @@ import {
   collectWorkspaceSnapshot,
   diffWorkspaceSnapshots,
 } from '../src/agent/workspace-diff.js';
-import { buildDiffLines, truncateDiffContent } from '../src/cli/utils/diff-lines.js';
+import { DiffBlock, getDiffLayout } from '../src/cli/components/DiffBlock.js';
+import { buildDiffLines, diffDisplayWidth, truncateDiffContent } from '../src/cli/utils/diff-lines.js';
 
 test('parseToolResultDiff: parses fs-edit result with Chinese colon path separator', () => {
   const content = [
@@ -145,9 +148,68 @@ test('truncateDiffContent: keeps diff rows single-line friendly', () => {
 
   const truncated = truncateDiffContent(longMarkdown, 40);
 
-  assert.equal(truncated.length, 40);
-  assert.equal(truncated.endsWith('...'), true);
+  assert.ok(diffDisplayWidth(truncated) <= 40);
+  assert.equal(truncated.endsWith('…'), true);
   assert.match(truncated, /^> > > /);
+});
+
+test('truncateDiffContent: respects fullwidth Chinese display columns', () => {
+  const longMarkdown = 'Local-first AI 应用平台，连接任意 OpenAI 兼容端点，DeepSeek 无脑配置，本地小模型生产力。';
+
+  const truncated = truncateDiffContent(longMarkdown, 32);
+
+  assert.ok(diffDisplayWidth(truncated) <= 32);
+  assert.equal(truncated.endsWith('…'), true);
+});
+
+test('getDiffLayout: leaves terminal margin and stable content columns', () => {
+  assert.deepEqual(getDiffLayout(80), {
+    boxColumns: 76,
+    frameContentColumns: 72,
+    diffContentColumns: 66,
+  });
+  assert.equal(getDiffLayout(200).boxColumns, 120);
+});
+
+test('DiffBlock: rendered rows fit an 80-column terminal with wide README text', () => {
+  const previousColumns = process.stdout.columns;
+  Object.defineProperty(process.stdout, 'columns', {
+    value: 80,
+    configurable: true,
+  });
+
+  try {
+    const output = renderToString(React.createElement(DiffBlock, {
+      diff: {
+        type: 'diff',
+        filePath: './README.md',
+        addedLines: 79,
+        removedLines: 79,
+        diffText: [
+          '--- a/README.md',
+          '+++ b/README.md',
+          '@@ -1,3 +1,3 @@',
+          '-# Supercell 🚀',
+          '+# MA',
+          '+> Local-first AI 应用平台，连接任意 OpenAI 兼容端点（LM Studio / Ollama / OpenAI 等），提供多轮对话、Agent 团队协作、数据分析三大核心能力。',
+          '-| `VITE_OPENAI_BASE_URL` | OpenAI 兼容 API 地址 | `http://localhost:1234/v1` |',
+          '+| `VITE_OPENAI_BASE_URL` | OpenAI 兼容 API 地址 | `http://localhost:1234/v1` |',
+          '... (151 lines collapsed) ...',
+        ].join('\n'),
+      },
+    }));
+
+    for (const line of output.split('\n')) {
+      assert.ok(diffDisplayWidth(stripAnsi(line)) <= 80, line);
+    }
+    assert.match(output, /Local-first AI 应用平台/);
+    assert.match(output, /…/);
+  } finally {
+    Object.defineProperty(process.stdout, 'columns', {
+      value: previousColumns,
+      configurable: true,
+    });
+  }
 });
 
 function git(cwd: string, args: string[]): string {
@@ -156,4 +218,8 @@ function git(cwd: string, args: string[]): string {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
   });
+}
+
+function stripAnsi(value: string): string {
+  return value.replace(/\x1b\[[0-9;]*m/g, '');
 }

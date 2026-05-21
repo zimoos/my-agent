@@ -1,13 +1,13 @@
 <svg width="1440" height="760" viewBox="0 0 1440 760" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
   <title id="title">MA terminal UI preview</title>
-  <desc id="desc">A screenshot-style preview of MA running in a terminal with model info, tools, and an active task.</desc>
+  <desc id="desc">A screenshot-style preview of MA running in a terminal with model info, tools, an input prompt, shortcuts, and context usage.</desc>
   <rect width="1440" height="760" rx="10" fill="#050505"/>
   <rect x="1" y="1" width="1438" height="758" rx="10" stroke="#1f2230" stroke-width="2"/>
 
   <text x="28" y="36" fill="#8d8d96" font-family="SFMono-Regular, Consolas, monospace" font-size="23">v20.19.4 ~/project/supercell git:(main)</text>
   <text x="28" y="76" fill="#f4f4f7" font-family="SFMono-Regular, Consolas, monospace" font-size="24" font-weight="700">ma</text>
   <text x="28" y="124" fill="#fff9b8" font-family="SFMono-Regular, Consolas, monospace" font-size="28">[info] auto-detected context window: 262144</text>
-  <text x="28" y="158" fill="#a3a0aa" font-family="SFMono-Regular, Consolas, monospace" font-size="25">session s_1779389302724_pw2t</text>
+  <text x="28" y="158" fill="#a3a0aa" font-family="SFMono-Regular, Consolas, monospace" font-size="25">session s_1779390051975_zpsc</text>
 
   <g transform="translate(58 180) scale(.34)">
     <image href="logo.png" width="1536" height="1024"/>
@@ -17,15 +17,8 @@
   <text x="346" y="390" fill="#aaa6b0" font-family="SFMono-Regular, Consolas, monospace" font-size="28">· http://192.168.21.5:1234/v1</text>
   <text x="60" y="426" fill="#9ddd64" font-family="SFMono-Regular, Consolas, monospace" font-size="28">exec(1), fs(4), fs-edit(1), grep(1), web(2)</text>
 
-  <text x="28" y="514" fill="#cfd2ff" font-family="SFMono-Regular, Consolas, monospace" font-size="30">›</text>
-  <text x="60" y="514" fill="#ffffff" font-family="SFMono-Regular, Consolas, monospace" font-size="30" font-weight="700">优化 readme 可读性</text>
-  <text x="60" y="554" fill="#a8ff72" font-family="SFMono-Regular, Consolas, monospace" font-size="28">✓ fs → list_directory</text>
-  <text x="60" y="594" fill="#a8ff72" font-family="SFMono-Regular, Consolas, monospace" font-size="28">✓ grep → grep</text>
-  <text x="60" y="634" fill="#8f8c96" font-family="SFMono-Regular, Consolas, monospace" font-size="27">⠋ 分析结果中 · 19s · </text>
-  <text x="444" y="634" fill="#b75ccc" font-family="SFMono-Regular, Consolas, monospace" font-size="27">thought for 1s</text>
-  <text x="744" y="634" fill="#8f8c96" font-family="SFMono-Regular, Consolas, monospace" font-size="27"> · ESC 中断</text>
-
-  <rect x="34" y="652" width="1372" height="64" fill="#120b18" stroke="#f06df3" stroke-width="2"/>
-  <text x="60" y="694" fill="#f3d7ff" font-family="SFMono-Regular, Consolas, monospace" font-size="27">› thinking...</text>
-  <text x="60" y="744" fill="#b8b4bd" font-family="SFMono-Regular, Consolas, monospace" font-size="22">Ctrl+V 图片 · ESC 中断 · 双击 ESC 切会话 · /quit 退出 · tasks: 1 · ctx: 1k/262k (0%)</text>
+  <rect x="40" y="454" width="1204" height="64" fill="#120b18" stroke="#f06df3" stroke-width="2"/>
+  <text x="68" y="496" fill="#f3d7ff" font-family="SFMono-Regular, Consolas, monospace" font-size="28">›</text>
+  <text x="96" y="496" fill="#b8b4bd" font-family="SFMono-Regular, Consolas, monospace" font-size="28">输入消息或 /help 查看命令</text>
+  <text x="68" y="558" fill="#b8b4bd" font-family="SFMono-Regular, Consolas, monospace" font-size="25">Ctrl+V 图片 · ESC 中断 · 双击 ESC 切会话 · /quit 退出 · ctx: 1k/262k (0%)</text>
 </svg>
