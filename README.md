@@ -8,7 +8,7 @@ MA is built for developers who switch between local models and remote APIs, work
 
 `v0.1.0-alpha` supports LM Studio local models and DeepSeek official API today. More OpenAI-compatible providers are next.
 
-Website: [website/index.html](website/index.html)  
+Website: https://zhuqingyv.github.io/my-agent/  
 Release: https://github.com/zhuqingyv/my-agent/releases/tag/v0.1.0-alpha
 
 ## Why MA
@@ -231,7 +231,7 @@ MA 是一个本地优先、多模型的终端编程 Agent。
 
 `v0.1.0-alpha` 当前支持 LM Studio 本地模型和 DeepSeek 官方 API。后续会继续扩展 GLM、Qwen、Kimi、MiniMax 等 OpenAI-compatible provider。
 
-官网静态页：[website/index.html](website/index.html)  
+官网：https://zhuqingyv.github.io/my-agent/  
 发布页：https://github.com/zhuqingyv/my-agent/releases/tag/v0.1.0-alpha
 
 ## 为什么是 MA
