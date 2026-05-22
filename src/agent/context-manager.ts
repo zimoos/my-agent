@@ -63,6 +63,7 @@ export interface TranscriptIndexEntry {
   createdAt: number;
   turnId?: string;
   pairId?: string;
+  pairIds?: string[];
   immutable: boolean;
 }
 
@@ -300,6 +301,65 @@ export function createContextManager(
     return loadIndex().find((entry) => entry.i === i) ?? null;
   }
 
+  function pairIdsFor(entry: TranscriptIndexEntry): string[] {
+    if (Array.isArray(entry.pairIds) && entry.pairIds.length > 0) {
+      return entry.pairIds;
+    }
+    return entry.pairId ? [entry.pairId] : [];
+  }
+
+  function toolGroupFor(
+    entry: TranscriptIndexEntry,
+    index: TranscriptIndexEntry[]
+  ): TranscriptIndexEntry[] {
+    const ids = pairIdsFor(entry);
+    if (ids.length === 0) return [entry];
+    const idSet = new Set(ids);
+    const group = index.filter((candidate) =>
+      pairIdsFor(candidate).some((id) => idSet.has(id))
+    );
+    if (group.some((candidate) => candidate.role === 'assistant')) {
+      const allIds = new Set<string>();
+      for (const candidate of group) {
+        for (const id of pairIdsFor(candidate)) allIds.add(id);
+      }
+      return index.filter((candidate) =>
+        pairIdsFor(candidate).some((id) => allIds.has(id))
+      );
+    }
+    const assistant = index.find(
+      (candidate) =>
+        candidate.role === 'assistant' &&
+        pairIdsFor(candidate).some((id) => idSet.has(id))
+    );
+    if (!assistant) return group;
+    const assistantIds = new Set(pairIdsFor(assistant));
+    return index.filter((candidate) =>
+      pairIdsFor(candidate).some((id) => assistantIds.has(id))
+    );
+  }
+
+  function isHalfToolGroupOp(
+    op: Extract<ContextOp, { i?: number }>,
+    source: TranscriptIndexEntry,
+    patch: ContextPatch,
+    index: TranscriptIndexEntry[]
+  ): boolean {
+    if (op.act !== 'rm' && op.act !== 'edit') return false;
+    const group = toolGroupFor(source, index);
+    if (group.length <= 1) return false;
+    const groupIds = new Set(group.map((entry) => entry.i));
+    const matchingOps = new Set<number>();
+    for (const candidate of patch.ops ?? []) {
+      if (candidate.act !== op.act) continue;
+      const candidateI = (candidate as { i?: number }).i;
+      if (Number.isInteger(candidateI) && groupIds.has(candidateI as number)) {
+        matchingOps.add(candidateI as number);
+      }
+    }
+    return matchingOps.size !== groupIds.size;
+  }
+
   function upsertActiveItem(item: ActiveContextItem): void {
     current.activeItems = [
       item,
@@ -314,18 +374,22 @@ export function createContextManager(
       const role = normalizeRole(msg?.role);
       if (role === 'system') continue;
       const text = messageText(msg).slice(0, 8000);
+      const pairIds =
+        typeof msg?.tool_call_id === 'string'
+          ? [msg.tool_call_id]
+          : Array.isArray(msg?.tool_calls)
+            ? msg.tool_calls
+                .map((toolCall: any) => toolCall?.id)
+                .filter((value: unknown): value is string => typeof value === 'string')
+            : [];
       const entry: TranscriptIndexEntry = {
         i: next++,
         sessionId: id,
         role,
         text,
         createdAt: Date.now(),
-        pairId:
-          typeof msg?.tool_call_id === 'string'
-            ? msg.tool_call_id
-            : Array.isArray(msg?.tool_calls) && msg.tool_calls[0]?.id
-              ? String(msg.tool_calls[0].id)
-              : undefined,
+        pairId: pairIds[0],
+        pairIds: pairIds.length > 0 ? pairIds : undefined,
         immutable: role === 'user',
       };
       appendIndex(entry);
@@ -467,6 +531,7 @@ export function createContextManager(
     for (const op of patch.ops ?? []) {
       const act = op.act;
       if (!act) continue;
+      const index = loadIndex();
       if (act === 'search') {
         const query = safeText((op as Extract<ContextOp, { act?: 'search' }>).q, 300);
         if (!query) continue;
@@ -484,7 +549,7 @@ export function createContextManager(
       const i = (op as { i?: number }).i;
       if (!Number.isInteger(i)) continue;
       const targetI = i as number;
-      const source = findIndexEntry(targetI);
+      const source = index.find((entry) => entry.i === targetI) ?? null;
       if (!source) continue;
       const reason = safeText(op.reason, 500);
 
@@ -511,6 +576,10 @@ export function createContextManager(
       }
 
       if (source.immutable) continue;
+
+      if (isHalfToolGroupOp(op as Extract<ContextOp, { i?: number }>, source, patch, index)) {
+        continue;
+      }
 
       if (act === 'rm') {
         current.activeItems = current.activeItems.filter((item) => item.i !== targetI);

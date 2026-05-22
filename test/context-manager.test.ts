@@ -110,6 +110,83 @@ test('context manager: records monotonic transcript ids and applies id-based ops
   assert.equal(ctx.state().activeItems.find((item) => item.i === 2)?.i, 2);
 });
 
+test('context manager: rejects half tool-group rm ops', () => {
+  const dir = mktmp('ma-context-');
+  const ctx = createContextManager('s_tool_group_0000', dir);
+
+  ctx.recordMessages([
+    {
+      role: 'assistant',
+      content: '',
+      tool_calls: [
+        { id: 'tc_1', type: 'function', function: { name: 'read', arguments: '{}' } },
+      ],
+    },
+    { role: 'tool', tool_call_id: 'tc_1', content: 'tool result should stay paired' },
+  ]);
+
+  ctx.applyPatch(JSON.stringify({
+    ops: [
+      { i: 0, act: 'rm', reason: 'half group should be rejected' },
+    ],
+  }));
+
+  assert.ok(ctx.state().activeItems.some((item) => item.i === 0));
+  assert.ok(ctx.state().activeItems.some((item) => item.i === 1));
+  assert.equal(ctx.search('tool result').length, 0);
+
+  ctx.applyPatch(JSON.stringify({
+    ops: [
+      { i: 0, act: 'rm', reason: 'explicit whole group removal' },
+      { i: 1, act: 'rm', reason: 'explicit whole group removal' },
+    ],
+  }));
+
+  assert.equal(ctx.state().activeItems.some((item) => item.i === 0), false);
+  assert.equal(ctx.state().activeItems.some((item) => item.i === 1), false);
+  assert.ok(ctx.search('tool result').some((entry) => entry.i === 1));
+});
+
+test('context manager: rejects half rm for multi-tool assistant groups', () => {
+  const dir = mktmp('ma-context-');
+  const ctx = createContextManager('s_multi_tool_group_0000', dir);
+
+  ctx.recordMessages([
+    {
+      role: 'assistant',
+      content: '',
+      tool_calls: [
+        { id: 'tc_a', type: 'function', function: { name: 'a', arguments: '{}' } },
+        { id: 'tc_b', type: 'function', function: { name: 'b', arguments: '{}' } },
+      ],
+    },
+    { role: 'tool', tool_call_id: 'tc_a', content: 'result a' },
+    { role: 'tool', tool_call_id: 'tc_b', content: 'result b' },
+  ]);
+
+  ctx.applyPatch(JSON.stringify({
+    ops: [
+      { i: 0, act: 'rm', reason: 'assistant only should be rejected' },
+      { i: 1, act: 'rm', reason: 'one result only should still be rejected' },
+    ],
+  }));
+
+  assert.deepEqual(
+    ctx.state().activeItems.map((item) => item.i).sort((a, b) => a - b),
+    [0, 1, 2]
+  );
+
+  ctx.applyPatch(JSON.stringify({
+    ops: [
+      { i: 0, act: 'rm', reason: 'whole multi-tool group' },
+      { i: 1, act: 'rm', reason: 'whole multi-tool group' },
+      { i: 2, act: 'rm', reason: 'whole multi-tool group' },
+    ],
+  }));
+
+  assert.equal(ctx.state().activeItems.length, 0);
+});
+
 test('context manager: ensureIndexed backfills old sessions once', () => {
   const dir = mktmp('ma-context-');
   const ctx = createContextManager('s_resume_0000', dir);

@@ -240,6 +240,115 @@ export class MessageStore {
     return [patchedSystem, ...this.messages.slice(1)];
   }
 
+  /**
+   * Build a bounded request from the current working context instead of
+   * replaying the whole transcript. The suffix is expected to carry the
+   * indexed Active Context View; raw messages here are only the recent tail.
+   */
+  buildActiveRequestMessages(
+    suffix: string,
+    opts: { tailMessages?: number } = {}
+  ): ChatCompletionMessageParam[] {
+    const tailMessages = Math.max(4, opts.tailMessages ?? 12);
+    const system = this.messages[0];
+    const patchedSystem: ChatCompletionMessageParam = {
+      role: 'system',
+      content: (system.content as string) + (suffix ? '\n' + suffix : ''),
+    } as any;
+
+    if (this.messages.length <= tailMessages + 1) {
+      return [
+        patchedSystem,
+        ...this.dropIncompleteToolPairs(this.messages.slice(1)),
+      ];
+    }
+
+    let start = Math.max(1, this.messages.length - tailMessages);
+    start = this.expandStartForToolPair(start);
+    const tail = this.messages.slice(start);
+    const latestUser = this.findLatestUserBefore(start);
+    const body = latestUser && !tail.some((m) => m.role === 'user')
+      ? [latestUser, ...tail]
+      : tail;
+
+    return [patchedSystem, ...this.dropIncompleteToolPairs(body)];
+  }
+
+  private expandStartForToolPair(start: number): number {
+    let nextStart = start;
+    while (nextStart > 1 && this.messages[nextStart]?.role === 'tool') {
+      const toolCallId = (this.messages[nextStart] as any).tool_call_id;
+      const assistantIdx = this.findAssistantForToolCall(toolCallId, nextStart - 1);
+      if (assistantIdx < 1) break;
+      nextStart = assistantIdx;
+    }
+    return nextStart;
+  }
+
+  private findAssistantForToolCall(
+    toolCallId: unknown,
+    before: number
+  ): number {
+    if (typeof toolCallId !== 'string') return -1;
+    for (let i = before; i >= 1; i--) {
+      const msg = this.messages[i] as any;
+      if (msg?.role !== 'assistant' || !Array.isArray(msg.tool_calls)) continue;
+      if (msg.tool_calls.some((tc: any) => tc?.id === toolCallId)) return i;
+    }
+    return -1;
+  }
+
+  private findLatestUserBefore(start: number): ChatCompletionMessageParam | null {
+    for (let i = start - 1; i >= 1; i--) {
+      if (this.messages[i]?.role === 'user') return this.messages[i];
+    }
+    return null;
+  }
+
+  private dropIncompleteToolPairs(
+    messages: ChatCompletionMessageParam[]
+  ): ChatCompletionMessageParam[] {
+    const providedToolIds = new Set<string>();
+    for (const msg of messages) {
+      if (msg.role === 'tool') {
+        const id = (msg as any).tool_call_id;
+        if (typeof id === 'string') providedToolIds.add(id);
+      }
+    }
+
+    const allowedToolCalls = new Set<string>();
+    const droppedToolCalls = new Set<string>();
+    for (const msg of messages) {
+      const toolCalls = (msg as any).tool_calls;
+      if (msg.role !== 'assistant' || !Array.isArray(toolCalls) || toolCalls.length === 0) {
+        continue;
+      }
+      const ids = toolCalls
+        .map((tc: any) => tc?.id)
+        .filter((id: unknown): id is string => typeof id === 'string');
+      if (ids.length > 0 && ids.every((id) => providedToolIds.has(id))) {
+        for (const id of ids) allowedToolCalls.add(id);
+      } else {
+        for (const id of ids) droppedToolCalls.add(id);
+      }
+    }
+
+    return messages.filter((msg) => {
+      const toolCalls = (msg as any).tool_calls;
+      if (msg.role === 'assistant' && Array.isArray(toolCalls) && toolCalls.length > 0) {
+        const ids = toolCalls
+          .map((tc: any) => tc?.id)
+          .filter((id: unknown): id is string => typeof id === 'string');
+        return ids.length > 0 && ids.every((id) => allowedToolCalls.has(id));
+      }
+      if (msg.role === 'tool') {
+        const id = (msg as any).tool_call_id;
+        return typeof id === 'string' && allowedToolCalls.has(id) && !droppedToolCalls.has(id);
+      }
+      return true;
+    });
+  }
+
   /** Get messages that have not yet been persisted (system excluded). */
   getPendingForPersist(): ChatCompletionMessageParam[] {
     return this.messages
