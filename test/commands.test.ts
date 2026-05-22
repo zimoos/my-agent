@@ -67,6 +67,46 @@ test('/model opens the model picker when no args are provided', async () => {
   });
 });
 
+test('/context routes inspection, search, recall, and pin commands to the agent', async () => {
+  await withTempCwd(async () => {
+    const calls: string[] = [];
+    const agent = {
+      inspectContext: () => {
+        calls.push('inspect');
+        return 'context state';
+      },
+      searchContext: (query: string) => {
+        calls.push(`search:${query}`);
+        return [
+          {
+            id: 'p_1',
+            role: 'summary',
+            summary: 'Relevant session summary',
+            text: 'longer relevant text',
+          },
+        ];
+      },
+      recallContext: (id: string) => {
+        calls.push(`recall:${id}`);
+        return `Recalled ${id}`;
+      },
+      pinContext: (text: string) => {
+        calls.push(`pin:${text}`);
+        return `Pinned: ${text}`;
+      },
+    };
+
+    assert.equal(await executeCommand('/context', baseContext({ agent })), 'context state');
+    assert.match(
+      String(await executeCommand('/context search session', baseContext({ agent }))),
+      /p_1 \[summary\] Relevant session summary/
+    );
+    assert.equal(await executeCommand('/context recall p_1', baseContext({ agent })), 'Recalled p_1');
+    assert.equal(await executeCommand('/context pin keep this', baseContext({ agent })), 'Pinned: keep this');
+    assert.deepEqual(calls, ['inspect', 'search:session', 'recall:p_1', 'pin:keep this']);
+  });
+});
+
 test('/help is available for slash command suggestions', async () => {
   await withTempCwd(async () => {
     const commands = await getAllCommands();

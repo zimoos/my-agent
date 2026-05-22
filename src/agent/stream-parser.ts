@@ -4,6 +4,12 @@ import type {
 import type { AgentEvent } from './events.js';
 import { normalizeToolCalls } from './normalize.js';
 import type { ParsedAssistantTurn } from '../provider/types.js';
+import {
+  CONTEXT_PATCH_CLOSE,
+  CONTEXT_PATCH_OPEN,
+} from './context-manager.js';
+
+const MAX_CONTEXT_PATCH_CHARS = 16_000;
 
 export interface StreamParserOptions {
   maxContentChars?: number;
@@ -49,6 +55,9 @@ export class StreamParser {
     unknown
   > {
     let contentBuf = '';
+    let visiblePending = '';
+    let patchBuf = '';
+    let inContextPatch = false;
     let reasoningBuf = '';
     const toolAcc = new Map<
       number,
@@ -115,9 +124,46 @@ export class StreamParser {
         // If currently thinking, skip content
         if (isThinking) continue;
 
-        // Emit non-empty content
         if (text.length > 0) {
-          contentBuf += text;
+          if (inContextPatch) {
+            patchBuf += text;
+            if (patchBuf.length > MAX_CONTEXT_PATCH_CHARS) {
+              throw new Error('model context patch exceeded max size; aborted likely runaway generation');
+            }
+            const closeIdx = patchBuf.indexOf(CONTEXT_PATCH_CLOSE);
+            if (closeIdx >= 0) {
+              patchBuf = patchBuf.slice(0, closeIdx);
+              inContextPatch = false;
+            }
+            continue;
+          }
+
+          visiblePending += text;
+          const openIdx = visiblePending.indexOf(CONTEXT_PATCH_OPEN);
+          let emitText = '';
+          if (openIdx >= 0) {
+            emitText = visiblePending.slice(0, openIdx);
+            patchBuf += visiblePending.slice(openIdx + CONTEXT_PATCH_OPEN.length);
+            if (patchBuf.length > MAX_CONTEXT_PATCH_CHARS) {
+              throw new Error('model context patch exceeded max size; aborted likely runaway generation');
+            }
+            visiblePending = '';
+            inContextPatch = true;
+            const closeIdx = patchBuf.indexOf(CONTEXT_PATCH_CLOSE);
+            if (closeIdx >= 0) {
+              patchBuf = patchBuf.slice(0, closeIdx);
+              inContextPatch = false;
+            }
+          } else {
+            const keep = CONTEXT_PATCH_OPEN.length - 1;
+            if (visiblePending.length > keep) {
+              emitText = visiblePending.slice(0, visiblePending.length - keep);
+              visiblePending = visiblePending.slice(-keep);
+            }
+          }
+
+          if (!emitText) continue;
+          contentBuf += emitText;
           const maxContentChars = this.options.maxContentChars;
           if (
             typeof maxContentChars === 'number' &&
@@ -141,7 +187,7 @@ export class StreamParser {
               `model output repeated the last ${repeatWindowChars} characters ${repeatWindowRepeats} times; aborted likely runaway generation`
             );
           }
-          yield { type: 'token', text };
+          yield { type: 'token', text: emitText };
         }
       }
 
@@ -168,6 +214,11 @@ export class StreamParser {
         durationMs: Date.now() - thinkingStartTime,
       };
     }
+    if (!inContextPatch && visiblePending.length > 0) {
+      contentBuf += visiblePending;
+      yield { type: 'token', text: visiblePending };
+      visiblePending = '';
+    }
 
     const assembled = [...toolAcc.entries()]
       .sort(([a], [b]) => a - b)
@@ -181,6 +232,7 @@ export class StreamParser {
       content: contentBuf,
       toolCalls,
       reasoningContent: reasoningBuf || undefined,
+      contextPatch: patchBuf.trim() || undefined,
     };
   }
 }

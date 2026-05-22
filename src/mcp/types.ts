@@ -1,6 +1,7 @@
 import type { ChildProcess } from 'node:child_process';
 import type { TaskStack } from '../task-stack.js';
 import type { AgentEvent } from '../agent/events.js';
+import type { SessionPoolEntry } from '../agent/context-manager.js';
 
 export type { AgentEvent } from '../agent/events.js';
 
@@ -114,4 +115,8 @@ export interface Agent {
   revertLastTurnContextOnly(): number;
   respondConfirm(requestId: string, approved: boolean): void;
   getContextUsage(): { used: number; total: number };
+  inspectContext(): string;
+  searchContext(query: string): SessionPoolEntry[];
+  recallContext(entryId: string): string;
+  pinContext(text: string): string;
 }

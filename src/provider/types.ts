@@ -9,6 +9,7 @@ export interface ParsedAssistantTurn {
   content: string;
   toolCalls: ChatCompletionMessageToolCall[] | null;
   reasoningContent?: string;
+  contextPatch?: string;
 }
 
 export interface RequestBuildInput {

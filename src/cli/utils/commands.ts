@@ -97,6 +97,39 @@ commands.set('/archive', {
   },
 });
 
+commands.set('/context', {
+  description: 'Inspect/search/recall active context',
+  handler: (args, ctx) => {
+    const trimmed = args.trim();
+    if (!trimmed) return ctx.agent.inspectContext();
+
+    const searchMatch = trimmed.match(/^search\s+(.+)$/);
+    if (searchMatch) {
+      const query = searchMatch[1].trim();
+      const results = ctx.agent.searchContext(query);
+      if (results.length === 0) return `No context results for: ${query}`;
+      return results
+        .map((entry, idx) => {
+          const text = (entry.summary || entry.text).replace(/\s+/g, ' ').slice(0, 240);
+          return `${idx + 1}. ${entry.id} [${entry.role}] ${text}`;
+        })
+        .join('\n');
+    }
+
+    const recallMatch = trimmed.match(/^recall\s+(\S+)/);
+    if (recallMatch) {
+      return ctx.agent.recallContext(recallMatch[1]);
+    }
+
+    const pinMatch = trimmed.match(/^pin\s+(.+)$/);
+    if (pinMatch) {
+      return ctx.agent.pinContext(pinMatch[1]);
+    }
+
+    return 'usage: /context | /context search <q> | /context recall <id> | /context pin <text>';
+  },
+});
+
 commands.set('/clear', {
   description: 'Clear conversation',
   suggest: true,
@@ -188,7 +221,7 @@ commands.set('/skills', {
   handler: async (_, ctx) => {
     await loadSkills();
     const skillCommands = Array.from(commands.entries())
-      .filter(([name, cmd]) => name.startsWith('/') && !['/quit', '/exit', '/tools', '/stack', '/abort', '/archive', '/clear', '/help', '/revert', '/undo', '/models', '/model', '/skills'].includes(name));
+      .filter(([name, cmd]) => name.startsWith('/') && !['/quit', '/exit', '/tools', '/stack', '/abort', '/archive', '/context', '/clear', '/help', '/revert', '/undo', '/models', '/model', '/skills'].includes(name));
 
     if (skillCommands.length === 0) {
       return 'No custom skills found. Create skills in .ma/skills/ directory.';

@@ -39,6 +39,7 @@ import {
   diffWorkspaceSnapshots,
 } from './agent/workspace-diff.js';
 import type { SessionStore } from './session/store.js';
+import { createContextManager } from './agent/context-manager.js';
 
 export interface CreateAgentOptions {
   resumeMessages?: ChatCompletionMessageParam[];
@@ -393,6 +394,10 @@ export async function createAgent(
   store.init(systemPrompt, options.resumeMessages);
   const sessionStore = options.sessionStore;
   const sessionId = options.sessionId;
+  const contextManager = createContextManager(
+    sessionId,
+    sessionStore?.getSessionDir()
+  );
 
   function persistPending(): void {
     if (!sessionStore || !sessionId) {
@@ -548,7 +553,11 @@ export async function createAgent(
       }
 
       const stateStr = renderStackState(stack);
-      const suffix = (stateStr || '') + loopWarning;
+      const suffix = [
+        contextManager.formatForPrompt(),
+        stateStr || '',
+        loopWarning,
+      ].filter(Boolean).join('\n\n');
       const requestMessages = providerCodec.encodeMessages(
         store.buildRequestMessages(suffix)
       );
@@ -623,7 +632,10 @@ export async function createAgent(
           );
           store.truncateForRecovery(firstUserIdx, tailStart);
 
-          const stateStr2 = renderStackState(stack);
+          const stateStr2 = [
+            contextManager.formatForPrompt(),
+            renderStackState(stack),
+          ].filter(Boolean).join('\n\n');
           request.messages = providerCodec.encodeMessages(
             store.buildRequestMessages(stateStr2)
           );
@@ -652,6 +664,7 @@ export async function createAgent(
           continue; // one more loop to get actual answer
         }
         store.appendAssistant(contentBuf, undefined, { reasoningContent });
+        contextManager.applyPatch(parsedTurn.contextPatch);
         persistPending();
         finalText = contentBuf;
         return { text: finalText, hitMaxLoops: false };
@@ -886,7 +899,36 @@ export async function createAgent(
     };
   }
 
-  return { chat, reset, getTaskStack, getArchive, abortAll, revertLastTurnContextOnly, respondConfirm, getContextUsage };
+  function inspectContext(): string {
+    return contextManager.inspect();
+  }
+
+  function searchContext(query: string) {
+    return contextManager.search(query, 8);
+  }
+
+  function recallContext(entryId: string): string {
+    return contextManager.recall(entryId);
+  }
+
+  function pinContext(text: string): string {
+    return contextManager.pin(text);
+  }
+
+  return {
+    chat,
+    reset,
+    getTaskStack,
+    getArchive,
+    abortAll,
+    revertLastTurnContextOnly,
+    respondConfirm,
+    getContextUsage,
+    inspectContext,
+    searchContext,
+    recallContext,
+    pinContext,
+  };
 }
 
 export const __internal__ = {

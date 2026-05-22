@@ -17,6 +17,7 @@ export interface SessionStore {
   list(limit?: number): SessionMeta[];
   latest(): string | null;
   prune(keep?: number): number;
+  getSessionDir(): string;
 }
 
 function defaultSessionDir(): string {
@@ -130,5 +131,9 @@ export function createSessionStore(sessionDir?: string): SessionStore {
     return removed;
   }
 
-  return { create, append, load, list, latest, prune };
+  function getSessionDir(): string {
+    return dir;
+  }
+
+  return { create, append, load, list, latest, prune, getSessionDir };
 }
