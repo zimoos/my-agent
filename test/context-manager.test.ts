@@ -36,39 +36,51 @@ test('context manager: applies hidden next-context patch safely', () => {
   const dir = mktmp('ma-context-');
   const ctx = createContextManager('s_test_0001', dir);
 
+  ctx.recordMessages([
+    { role: 'user', content: 'Keep user message' },
+    { role: 'assistant', content: 'Old active detail' },
+  ]);
   ctx.applyPatch(JSON.stringify({
-    activeTask: {
-      id: 'task-1',
-      title: 'Implement context hygiene',
-      state: 'coding',
-    },
-    pin: ['Do not show hidden patches to users'],
-    hygiene: [
-      {
-        target: 'Old assumption: recall is a second LLM pass',
-        action: 'supersede',
-        reason: 'User clarified patch is same-turn output',
-      },
-      {
-        target: 'Tool-call pairing rules',
-        action: 'protect',
-        reason: 'Safety invariant',
-      },
-    ],
-    archiveToPool: [
-      {
-        reason: 'completed',
-        summary: 'Issue #19 scope was corrected to exclude Mnemo for MVP.',
-      },
+    ops: [
+      { i: 1, act: 'edit', res: 'Old detail summarized', reason: 'reduce noise' },
     ],
   }));
 
   const inspect = ctx.inspect();
-  assert.match(inspect, /Implement context hygiene/);
-  assert.match(inspect, /Do not show hidden patches/);
-  assert.match(inspect, /supersede/);
-  assert.match(inspect, /protected/);
+  assert.match(inspect, /Old detail summarized/);
   assert.match(inspect, /Session pool entries: 1/);
+});
+
+test('context manager: rejects legacy patch fields and writes patch audit', () => {
+  const dir = mktmp('ma-context-');
+  const sessionId = 's_patch_audit_0000';
+  const ctx = createContextManager(sessionId, dir);
+
+  ctx.recordMessages([
+    { role: 'user', content: 'Keep user message' },
+    { role: 'assistant', content: 'Removable assistant context' },
+  ]);
+  ctx.applyPatch(JSON.stringify({
+    hygiene: [{ target: 'legacy', action: 'demote' }],
+    archiveToPool: [{ summary: 'legacy archive path' }],
+    recallFromPool: [{ query: 'legacy recall path' }],
+    ops: [
+      { i: 1, act: 'rm', reason: 'not needed now' },
+    ],
+  }));
+
+  assert.equal(ctx.state().activeItems.some((item) => item.i === 1), false);
+  assert.equal(ctx.pool().length, 1);
+
+  const auditFile = path.join(dir, `${sessionId}.patch.jsonl`);
+  const audit = fs.readFileSync(auditFile, 'utf-8').trim().split('\n').map(JSON.parse);
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].parseOk, true);
+  assert.deepEqual(audit[0].poolEntryIds, [ctx.pool()[0].id]);
+  assert.ok(audit[0].rejected.includes('unsupported-field:hygiene'));
+  assert.ok(audit[0].rejected.includes('unsupported-field:archiveToPool'));
+  assert.ok(audit[0].rejected.includes('unsupported-field:recallFromPool'));
+  assert.equal(audit[0].appliedOps[0].act, 'rm');
 });
 
 test('context manager: records monotonic transcript ids and applies id-based ops', () => {

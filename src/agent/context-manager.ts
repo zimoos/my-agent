@@ -6,46 +6,7 @@ import type { ChatCompletionMessageParam } from 'openai/resources/chat/completio
 export const CONTEXT_PATCH_OPEN = '<ma_context_patch>';
 export const CONTEXT_PATCH_CLOSE = '</ma_context_patch>';
 
-export type HygieneAction =
-  | 'keep'
-  | 'demote'
-  | 'supersede'
-  | 'invalidate'
-  | 'protect';
-
 export interface ContextPatch {
-  activeTask?: {
-    id?: string;
-    title?: string;
-    goal?: string;
-    state?: string;
-  };
-  keep?: string[];
-  hygiene?: Array<{
-    target?: string;
-    action?: HygieneAction;
-    reason?: string;
-  }>;
-  archiveToPool?: Array<{
-    reason?: string;
-    messageIds?: string[];
-    summary?: string;
-    text?: string;
-  }>;
-  recallFromPool?: Array<{
-    query?: string;
-    reason?: string;
-  }>;
-  pin?: string[];
-  admitRecall?: Array<{
-    entryId?: string;
-    mode?: 'snippet' | 'summary' | 'full';
-    reason?: string;
-  }>;
-  rejectRecall?: Array<{
-    entryId?: string;
-    reason?: string;
-  }>;
   ops?: ContextOp[];
 }
 
@@ -112,9 +73,21 @@ export interface ActiveContextState {
   };
   pins: string[];
   recalled: RecalledContext[];
-  activeSummaries: string[];
   activeItems: ActiveContextItem[];
   updatedAt: number;
+}
+
+export interface ContextPatchAuditEntry {
+  id: string;
+  sessionId: string;
+  createdAt: number;
+  rawPatch: string;
+  parseOk: boolean;
+  rejected: string[];
+  appliedOps: Array<Record<string, unknown>>;
+  activeBefore: number[];
+  activeAfter: number[];
+  poolEntryIds: string[];
 }
 
 export interface ContextManager {
@@ -141,14 +114,6 @@ const MAX_PIN = 1000;
 const MAX_SUMMARY = 1200;
 const MAX_RECALLS = 6;
 const MAX_RECALL_CHARS = 900;
-const MAX_ACTIVE_SUMMARIES = 8;
-const VALID_HYGIENE = new Set<HygieneAction>([
-  'keep',
-  'demote',
-  'supersede',
-  'invalidate',
-  'protect',
-]);
 
 function defaultSessionDir(): string {
   return path.join(os.homedir(), '.my-agent', 'sessions');
@@ -177,7 +142,6 @@ function initialState(sessionId: string): ActiveContextState {
     sessionId,
     pins: [],
     recalled: [],
-    activeSummaries: [],
     activeItems: [],
     updatedAt: now,
   };
@@ -230,6 +194,7 @@ export function createContextManager(
   const statePath = path.join(dir, `${id}.context.json`);
   const poolPath = path.join(dir, `${id}.pool.jsonl`);
   const indexPath = path.join(dir, `${id}.index.jsonl`);
+  const patchPath = path.join(dir, `${id}.patch.jsonl`);
   let current = readJson<ActiveContextState>(statePath) ?? initialState(id);
   current.sessionId = id;
   current.activeItems ??= [];
@@ -280,6 +245,12 @@ export function createContextManager(
     if (!sessionId) return;
     fs.mkdirSync(dir, { recursive: true });
     fs.appendFileSync(indexPath, JSON.stringify(entry) + '\n', 'utf-8');
+  }
+
+  function appendPatchAudit(entry: ContextPatchAuditEntry): void {
+    if (!sessionId) return;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(patchPath, JSON.stringify(entry) + '\n', 'utf-8');
   }
 
   function nextTranscriptIndex(): number {
@@ -541,7 +512,6 @@ export function createContextManager(
   function clearActive(): string {
     current.currentTask = undefined;
     current.recalled = [];
-    current.activeSummaries = [];
     current.activeItems = [];
     save();
     return 'Cleared active context';
@@ -630,49 +600,71 @@ export function createContextManager(
 
   function applyPatch(rawPatch?: string | null): void {
     if (!rawPatch) return;
-    const patch = parsePatch(rawPatch);
-    if (!patch) return;
+    const raw = rawPatch.trim();
     const now = Date.now();
-
-    const title = safeText(patch.activeTask?.title, 200);
-    if (title) {
-      current.currentTask = {
-        id: safeText(patch.activeTask?.id, 80) || current.currentTask?.id || `t_${now}`,
-        title,
-        goal: safeText(patch.activeTask?.goal, 500) || undefined,
-        state: safeText(patch.activeTask?.state, 500) || undefined,
-        updatedAt: now,
-      };
+    const activeBefore = current.activeItems.map((item) => item.i);
+    const rejected: string[] = [];
+    const appliedOps: Array<Record<string, unknown>> = [];
+    const poolEntryIds: string[] = [];
+    const patch = parsePatch(rawPatch);
+    if (!patch) {
+      appendPatchAudit({
+        id: makeEntryId(now),
+        sessionId: id,
+        createdAt: now,
+        rawPatch: raw,
+        parseOk: false,
+        rejected: ['invalid-json'],
+        appliedOps: [],
+        activeBefore,
+        activeAfter: activeBefore,
+        poolEntryIds: [],
+      });
+      return;
     }
 
-    for (const item of patch.pin ?? []) {
-      const value = safeText(item, MAX_PIN);
-      if (value && !current.pins.includes(value)) current.pins.push(value);
+    for (const key of Object.keys(patch as Record<string, unknown>)) {
+      if (key !== 'ops') rejected.push(`unsupported-field:${key}`);
     }
 
     for (const op of patch.ops ?? []) {
       const act = op.act;
-      if (!act) continue;
+      if (!act) {
+        rejected.push('missing-act');
+        continue;
+      }
       const index = loadIndex();
       if (act === 'search') {
         const query = safeText((op as Extract<ContextOp, { act?: 'search' }>).q, 300);
-        if (!query) continue;
+        if (!query) {
+          rejected.push('search-missing-query');
+          continue;
+        }
         const reason = safeText(op.reason, 300) || 'model requested search';
+        const recalledIds: string[] = [];
         for (const entry of search(query, 3)) {
           const snippet = (entry.summary || entry.text).slice(0, MAX_RECALL_CHARS);
+          recalledIds.push(entry.id);
           current.recalled = [
             { entryId: entry.id, i: entry.i, query, reason, snippet, updatedAt: now },
             ...current.recalled.filter((old) => old.entryId !== entry.id),
           ].slice(0, MAX_RECALLS);
         }
+        appliedOps.push({ act, query, recalledIds });
         continue;
       }
 
       const i = (op as { i?: number }).i;
-      if (!Number.isInteger(i)) continue;
+      if (!Number.isInteger(i)) {
+        rejected.push(`${act}:missing-i`);
+        continue;
+      }
       const targetI = i as number;
       const source = index.find((entry) => entry.i === targetI) ?? null;
-      if (!source) continue;
+      if (!source) {
+        rejected.push(`${act}:unknown-i:${targetI}`);
+        continue;
+      }
       const reason = safeText(op.reason, 500);
 
       if (act === 'keep') {
@@ -683,6 +675,7 @@ export function createContextManager(
           reason,
           updatedAt: now,
         });
+        appliedOps.push({ act, i: targetI });
         continue;
       }
 
@@ -694,30 +687,40 @@ export function createContextManager(
           reason,
           updatedAt: now,
         });
+        appliedOps.push({ act, i: targetI });
         continue;
       }
 
-      if (source.immutable) continue;
+      if (source.immutable) {
+        rejected.push(`${act}:immutable-user:${targetI}`);
+        continue;
+      }
 
       if (isHalfToolGroupOp(op as Extract<ContextOp, { i?: number }>, source, patch, index)) {
+        rejected.push(`${act}:half-tool-group:${targetI}`);
         continue;
       }
 
       if (act === 'rm') {
         current.activeItems = current.activeItems.filter((item) => item.i !== targetI);
-        archive({
+        const entry = archive({
           i: targetI,
           role: source.role,
           text: source.text,
           summary: reason ? `[removed from active] ${reason}` : undefined,
           archivedReason: 'demoted',
         });
+        if (entry) poolEntryIds.push(entry.id);
+        appliedOps.push({ act, i: targetI, poolEntryId: entry?.id });
         continue;
       }
 
       if (act === 'edit') {
         const res = safeText((op as Extract<ContextOp, { act?: 'edit' }>).res, MAX_SUMMARY);
-        if (!res) continue;
+        if (!res) {
+          rejected.push(`edit:missing-res:${targetI}`);
+          continue;
+        }
         upsertActiveItem({
           i: targetI,
           role: source.role,
@@ -726,68 +729,33 @@ export function createContextManager(
           reason,
           updatedAt: now,
         });
-        archive({
+        const entry = archive({
           i: targetI,
           role: source.role,
           text: source.text,
           summary: res,
           archivedReason: 'superseded',
         });
+        if (entry) poolEntryIds.push(entry.id);
+        appliedOps.push({ act, i: targetI, poolEntryId: entry?.id });
+        continue;
       }
-    }
-
-    const summaries: string[] = [];
-    for (const item of patch.hygiene ?? []) {
-      const action = item.action;
-      const target = safeText(item.target, 300);
-      const reason = safeText(item.reason, 500);
-      if (!action || !VALID_HYGIENE.has(action) || !target) continue;
-      if (action === 'protect') {
-        const protectedPin = `[protected] ${target}${reason ? ` — ${reason}` : ''}`.slice(0, MAX_PIN);
-        if (!current.pins.includes(protectedPin)) current.pins.push(protectedPin);
-      } else if (action !== 'keep') {
-        summaries.push(`[${action}] ${target}${reason ? ` — ${reason}` : ''}`.slice(0, MAX_SUMMARY));
-      }
-    }
-    if (summaries.length > 0) {
-      current.activeSummaries = [...summaries, ...current.activeSummaries].slice(0, MAX_ACTIVE_SUMMARIES);
-    }
-
-    for (const item of patch.archiveToPool ?? []) {
-      const text = safeText(item.text, 8000);
-      const summary = safeText(item.summary, MAX_SUMMARY);
-      archive({
-        role: 'summary',
-        text: text || summary,
-        summary,
-        sourceMessageIds: Array.isArray(item.messageIds)
-          ? item.messageIds.filter((x): x is string => typeof x === 'string')
-          : undefined,
-        archivedReason: safeText(item.reason, 80) || 'other',
-      });
-    }
-
-    for (const item of patch.recallFromPool ?? []) {
-      const query = safeText(item.query, 300);
-      if (!query) continue;
-      const reason = safeText(item.reason, 300) || 'model requested recall';
-      for (const entry of search(query, 3)) {
-        const snippet = (entry.summary || entry.text).slice(0, MAX_RECALL_CHARS);
-        current.recalled = [
-          { entryId: entry.id, query, reason, snippet, updatedAt: now },
-          ...current.recalled.filter((old) => old.entryId !== entry.id),
-        ].slice(0, MAX_RECALLS);
-      }
-    }
-
-    for (const item of patch.rejectRecall ?? []) {
-      const entryId = safeText(item.entryId, 100);
-      if (entryId) {
-        current.recalled = current.recalled.filter((old) => old.entryId !== entryId);
-      }
+      rejected.push(`unsupported-act:${String(act)}`);
     }
 
     save();
+    appendPatchAudit({
+      id: makeEntryId(now),
+      sessionId: id,
+      createdAt: now,
+      rawPatch: raw,
+      parseOk: true,
+      rejected,
+      appliedOps,
+      activeBefore,
+      activeAfter: current.activeItems.map((item) => item.i),
+      poolEntryIds,
+    });
   }
 
   function formatForPrompt(): string {
@@ -800,10 +768,6 @@ export function createContextManager(
     if (current.pins.length > 0) {
       lines.push('Pins:');
       for (const pin of current.pins.slice(0, 8)) lines.push(`- ${pin}`);
-    }
-    if (current.activeSummaries.length > 0) {
-      lines.push('Context hygiene notes:');
-      for (const note of current.activeSummaries.slice(0, 6)) lines.push(`- ${note}`);
     }
     if (current.activeItems.length > 0) {
       lines.push('Indexed Active Context View:');
@@ -822,7 +786,7 @@ export function createContextManager(
       }
     }
     lines.push(
-      'At the end of your final visible response, emit a hidden JSON patch between <ma_context_patch> and </ma_context_patch>. The patch should describe the next-turn context only. Do not mention the patch to the user. Prefer indexed ops: {"ops":[{"i":102,"act":"rm|edit|protect|keep","res":"only for edit","reason":"..."},{"act":"search","q":"...","reason":"..."}]}. Message i values are stable original transcript IDs. Do not edit user messages or system prompts. If no context change is needed, emit {"ops":[]}.'
+      'At the end of your final visible response, emit a hidden JSON patch between <ma_context_patch> and </ma_context_patch>. The patch must use the single ops protocol: {"ops":[{"i":102,"act":"rm|edit|protect|keep","res":"only for edit","reason":"..."},{"act":"search","q":"...","reason":"..."}]}. Message i values are stable original transcript IDs. Do not edit user messages or system prompts. If no context change is needed, emit {"ops":[]}.'
     );
     return lines.join('\n');
   }
@@ -838,12 +802,8 @@ export function createContextManager(
       lines.push('Pins:');
       for (const pin of current.pins.slice(0, 8)) lines.push(`- ${pin}`);
     }
-    if (current.activeSummaries.length > 0) {
-      lines.push('Context hygiene notes:');
-      for (const note of current.activeSummaries.slice(0, 6)) lines.push(`- ${note}`);
-    }
     lines.push(
-      'Your visible answer should solve the user task. At the end of your final visible response, emit a hidden JSON patch between <ma_context_patch> and </ma_context_patch>. The patch should describe the next-turn context only. Do not mention the patch to the user. Prefer indexed ops: {"ops":[{"i":102,"act":"rm|edit|protect|keep","res":"only for edit","reason":"..."},{"act":"search","q":"...","reason":"..."}]}. Message i values are stable original transcript IDs. Do not edit user messages or system prompts. If no context change is needed, emit {"ops":[]}.'
+      'Your visible answer should solve the user task. At the end of your final visible response, emit a hidden JSON patch between <ma_context_patch> and </ma_context_patch>. The patch must use this exact single protocol: {"ops":[{"i":102,"act":"rm|edit|protect|keep","res":"only for edit","reason":"..."},{"act":"search","q":"...","reason":"..."}]}. Do not emit activeTask, hygiene, archiveToPool, recallFromPool, admitRecall, rejectRecall, or pin in the patch. Message i values are stable original transcript IDs. Do not edit user messages or system prompts. If no context change is needed, emit {"ops":[]}.'
     );
     return lines.join('\n');
   }

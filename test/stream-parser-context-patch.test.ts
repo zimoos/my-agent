@@ -15,7 +15,7 @@ test('stream parser: streams visible text and hides tail context patch', async (
   const gen = parser.parse(chunks([
     'Visible answer',
     ' continues.',
-    '\n<ma_context_patch>\n{"pin":["keep this"]}',
+    '\n<ma_context_patch>\n{"ops":[]}',
     '\n</ma_context_patch>',
   ]));
 
@@ -37,7 +37,7 @@ test('stream parser: streams visible text and hides tail context patch', async (
     'Visible answer continues.\n'
   );
   assert.equal(result.content, 'Visible answer continues.\n');
-  assert.equal(result.contextPatch, '{"pin":["keep this"]}');
+  assert.equal(result.contextPatch, '{"ops":[]}');
 });
 
 test('stream parser: detects split context patch delimiter without leaking it', async () => {
@@ -46,7 +46,7 @@ test('stream parser: detects split context patch delimiter without leaking it', 
   const gen = parser.parse(chunks([
     'Answer',
     '\n<ma_context',
-    '_patch>{"hygiene":[]}</ma_context_patch>',
+    '_patch>{"ops":[]}</ma_context_patch>',
   ]));
 
   let result;
@@ -65,6 +65,5 @@ test('stream parser: detects split context patch delimiter without leaking it', 
     .join('');
   assert.equal(visible, 'Answer\n');
   assert.equal(result.content, 'Answer\n');
-  assert.equal(result.contextPatch, '{"hygiene":[]}');
+  assert.equal(result.contextPatch, '{"ops":[]}');
 });
-

@@ -66,6 +66,7 @@ export function createSessionStore(sessionDir?: string): SessionStore {
     path.join(dir, `${id}.context.json`),
     path.join(dir, `${id}.pool.jsonl`),
     path.join(dir, `${id}.index.jsonl`),
+    path.join(dir, `${id}.patch.jsonl`),
   ];
 
   function create(partial: Omit<SessionMeta, 'id' | 'messageCount'>): string {
