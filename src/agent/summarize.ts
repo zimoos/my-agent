@@ -1,91 +1,61 @@
 import type OpenAI from 'openai';
-import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 
-const COMPACT_INSTRUCTION = `你是对话压缩器。把下面的对话压成 ≤300 字的中文摘要，必须覆盖 4 点：
-1) 用户关键需求（做什么、边界是什么）
-2) 已完成结论（已确认的事实、决定）
-3) 悬挂问题（未完成、待决、有争议的点）
-4) 工具调用重要产出（路径、关键数据、错误）
-不要客套、不要解释、只输出摘要正文。`;
-
-const SNIPPET_LIMIT = 500;
-
-function roleLabel(role: string): string {
-  switch (role) {
-    case 'system':
-      return 'SYS';
-    case 'user':
-      return 'USER';
-    case 'assistant':
-      return 'ASSISTANT';
-    case 'tool':
-      return 'TOOL';
-    default:
-      return role.toUpperCase();
-  }
+export interface ContextSummaryInput {
+  i: number;
+  role: string;
+  content: string;
 }
 
-function stringifyContent(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    const parts: string[] = [];
-    for (const p of content) {
-      if (!p || typeof p !== 'object') continue;
-      const part = p as any;
-      if (part.type === 'text' && typeof part.text === 'string') {
-        parts.push(part.text);
-      } else if (part.type === 'image_url') {
-        parts.push('[image]');
-      }
-    }
-    return parts.join('\n');
-  }
-  return '';
+export interface ContextSummaryOutput {
+  i: number;
+  summary: string;
 }
 
-function renderMessage(msg: ChatCompletionMessageParam): string {
-  const role = roleLabel((msg as any).role);
-  let body = stringifyContent((msg as any).content);
-  const toolCalls = (msg as any).tool_calls;
-  if (Array.isArray(toolCalls) && toolCalls.length > 0) {
-    const calls = toolCalls
-      .map((tc: any) => {
-        const name = tc?.function?.name ?? '?';
-        const args = tc?.function?.arguments ?? '';
-        return `${name}(${String(args).slice(0, 120)})`;
-      })
-      .join('; ');
-    body = body ? `${body}\n[tool_calls] ${calls}` : `[tool_calls] ${calls}`;
-  }
-  const snippet = body.slice(0, SNIPPET_LIMIT);
-  return `${role}: ${snippet}`;
-}
-
-export async function summarizeRange(
+export async function summarizeContextItems(
   client: OpenAI,
   model: string,
-  msgs: ChatCompletionMessageParam[],
+  items: ContextSummaryInput[],
   signal?: AbortSignal
-): Promise<string> {
-  if (msgs.length === 0) return '';
+): Promise<ContextSummaryOutput[]> {
+  if (items.length === 0) return [];
 
-  const joined = msgs.map(renderMessage).join('\n\n');
-  const payload: ChatCompletionMessageParam[] = [
-    { role: 'system', content: COMPACT_INSTRUCTION },
-    { role: 'user', content: joined },
-  ];
-
+  const payload = items.map((item) => ({
+    i: item.i,
+    role: item.role,
+    content: item.content.slice(0, 6000),
+  }));
   const resp = await client.chat.completions.create(
     {
       model,
-      messages: payload,
+      messages: [
+        {
+          role: 'system',
+          content:
+            '你是上下文压缩器。按输入数组逐项压缩，必须返回严格 JSON：{"items":[{"i":数字,"summary":"压缩后的完整语义"}]}。不要丢失路径、结论、错误、工具结果。不要输出解释。',
+        },
+        { role: 'user', content: JSON.stringify({ items: payload }) },
+      ],
       temperature: 0.2,
       stream: false,
     },
     signal ? { signal } : undefined
   );
 
-  const choice = (resp as any)?.choices?.[0]?.message?.content;
-  if (typeof choice !== 'string') return '';
-  return choice.trim();
+  const raw = (resp as any)?.choices?.[0]?.message?.content;
+  if (typeof raw !== 'string') return [];
+  const jsonText = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+  try {
+    const parsed = JSON.parse(jsonText);
+    if (!Array.isArray(parsed?.items)) return [];
+    return parsed.items
+      .map((item: any) => ({
+        i: Number(item?.i),
+        summary: typeof item?.summary === 'string' ? item.summary.trim() : '',
+      }))
+      .filter((item: ContextSummaryOutput) =>
+        Number.isInteger(item.i) && item.summary.length > 0
+      );
+  } catch {
+    return [];
+  }
 }

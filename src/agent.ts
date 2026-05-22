@@ -32,7 +32,7 @@ import { findToolSchema, routeToolCall } from './agent/tool-router.js';
 import { resolveProviderCodec } from './provider/detect.js';
 import { loadAgentMd } from './agent/memdir.js';
 import { estimateTokens } from './agent/tokenCount.js';
-import { summarizeRange } from './agent/summarize.js';
+import { summarizeContextItems } from './agent/summarize.js';
 import { createTodoList } from './agent/todo.js';
 import {
   collectWorkspaceSnapshot,
@@ -68,9 +68,9 @@ function isTtyInteractive(): boolean {
 const DEFAULT_CONTEXT_WINDOW = 32768;
 const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
 const COMPACT_TRIGGER_RATIO = 0.75;
-const COMPACT_KEEP_LAST_N = 6;
 const COMPACT_MAX_FAILURES = 2;
 const COMPACT_MIN_SUMMARY_CHARS = 50;
+const COMPACT_BATCH_SIZE = 4;
 
 async function withRetry<T>(
   fn: () => Promise<T>,
@@ -459,45 +459,107 @@ export async function createAgent(
   const contextWindow = config.model.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
   const compactThreshold = Math.floor(contextWindow * COMPACT_TRIGGER_RATIO);
   let compactFailures = 0;
-  let compactDisabled = false;
 
-  async function maybeCompact(
+  function buildRequestSuffix(loopWarning = ''): string {
+    const stateStr = renderStackState(stack);
+    return [
+      contextManager.formatRequestInstructions(),
+      stateStr || '',
+      loopWarning,
+    ].filter(Boolean).join('\n\n');
+  }
+
+  function activeContextTokens(suffix: string): number {
+    return estimateTokens(
+      store.buildContextRequestMessages(suffix, contextManager.buildLlmContext())
+    );
+  }
+
+  function oldestCompressibleActiveItems(): Array<{ i: number; role: string; content: string }> {
+    return contextManager.active()
+      .filter((item) =>
+        item.role !== 'user' &&
+        item.mode !== 'protected' &&
+        typeof item.i === 'number' &&
+        (item.content ?? '').trim().length > 0
+      )
+      .sort((a, b) => a.i - b.i)
+      .slice(0, COMPACT_BATCH_SIZE)
+      .map((item) => ({
+        i: item.i,
+        role: item.role,
+        content: item.content ?? '',
+      }));
+  }
+
+  async function compactActiveContext(
+    suffix: string,
     signal?: AbortSignal,
-    fallbackUserContent?: string
   ): Promise<{ compacted: boolean; freed: number }> {
-    if (compactDisabled) return { compacted: false, freed: 0 };
-    const before = estimateTokens(store.snapshot());
+    const before = activeContextTokens(suffix);
     if (before <= compactThreshold) return { compacted: false, freed: 0 };
 
-    const keepLastN = Math.min(COMPACT_KEEP_LAST_N, store.length - 1);
-    const desiredCut = store.length - keepLastN;
-    const cut = store.findSafeCutIndex(desiredCut);
-    if (cut <= 1 || cut >= store.length) return { compacted: false, freed: 0 };
-
-    const middle = store.snapshot().slice(1, cut);
-    if (middle.length === 0) return { compacted: false, freed: 0 };
-
-    try {
-      const summary = await summarizeRange(
-        client,
-        config.model.model,
-        providerCodec.encodeMessages(middle),
-        signal
-      );
-      if (!summary || summary.length < COMPACT_MIN_SUMMARY_CHARS) {
-        compactFailures += 1;
-        if (compactFailures >= COMPACT_MAX_FAILURES) compactDisabled = true;
-        return { compacted: false, freed: 0 };
+    let anyCompacted = false;
+    let lastTokens = before;
+    for (let attempt = 0; attempt < 20 && lastTokens > compactThreshold; attempt++) {
+      const candidates = oldestCompressibleActiveItems();
+      if (candidates.length === 0) {
+        throw new Error('active context is too large and has no compressible non-user items');
       }
-      store.compact(cut, summary, fallbackUserContent);
-      compactFailures = 0;
-      const after = estimateTokens(store.snapshot());
-      return { compacted: true, freed: Math.max(0, before - after) };
-    } catch {
-      compactFailures += 1;
-      if (compactFailures >= COMPACT_MAX_FAILURES) compactDisabled = true;
-      return { compacted: false, freed: 0 };
+
+      let summaries: Awaited<ReturnType<typeof summarizeContextItems>> = [];
+      try {
+        summaries = await summarizeContextItems(
+          client,
+          config.model.model,
+          candidates,
+          signal
+        );
+      } catch {
+        summaries = [];
+      }
+
+      const byId = new Map(summaries.map((item) => [item.i, item.summary]));
+      const ops = candidates.map((item) => {
+        const summary = byId.get(item.i);
+        if (summary && summary.length >= COMPACT_MIN_SUMMARY_CHARS) {
+          return {
+            i: item.i,
+            act: 'edit',
+            res: summary,
+            reason: 'active context overflow compact',
+          };
+        }
+        return {
+          i: item.i,
+          act: 'rm',
+          reason: 'active context overflow compact fallback',
+        };
+      });
+
+      contextManager.applyPatch(JSON.stringify({ ops }));
+      anyCompacted = true;
+      compactFailures = summaries.length === 0 ? compactFailures + 1 : 0;
+      lastTokens = activeContextTokens(suffix);
+
+      if (compactFailures >= COMPACT_MAX_FAILURES && lastTokens > compactThreshold) {
+        const fallback = oldestCompressibleActiveItems();
+        if (fallback.length === 0) break;
+        contextManager.applyPatch(JSON.stringify({
+          ops: fallback.map((item) => ({
+            i: item.i,
+            act: 'rm',
+            reason: 'active context overflow after compact failures',
+          })),
+        }));
+        lastTokens = activeContextTokens(suffix);
+      }
     }
+
+    if (lastTokens > compactThreshold) {
+      throw new Error(`active context still too large after compaction (${lastTokens}/${compactThreshold} tokens)`);
+    }
+    return { compacted: anyCompacted, freed: Math.max(0, before - lastTokens) };
   }
 
   function foldMessages(anchor: number, taskId: string, summary: string): void {
@@ -564,17 +626,13 @@ export async function createAgent(
         loopWarning = `\n\n[WARNING] You have only 5 loops remaining (${loop}/${maxLoops} used). If you are stuck in a loop, stop and summarize what you have done so far. If you still need more steps to complete the task, continue working.`;
       }
 
-      const compactResult = await maybeCompact(signal, task.prompt);
+      const preCompactSuffix = buildRequestSuffix(loopWarning);
+      const compactResult = await compactActiveContext(preCompactSuffix, signal);
       if (compactResult.compacted) {
         yield { type: 'compact:done', freed: compactResult.freed };
       }
 
-      const stateStr = renderStackState(stack);
-      const suffix = [
-        contextManager.formatRequestInstructions(),
-        stateStr || '',
-        loopWarning,
-      ].filter(Boolean).join('\n\n');
+      const suffix = buildRequestSuffix(loopWarning);
       const requestMessages = providerCodec.encodeMessages(
         store.buildContextRequestMessages(suffix, contextManager.buildLlmContext())
       );
@@ -636,33 +694,7 @@ export async function createAgent(
           )
         );
       } catch (retryErr) {
-        const status = (retryErr as any)?.status;
-        if (status === 500 && store.length > 4) {
-          // 500 after retries — truncate preserving system(0) + first user + last N
-          const keep = Math.max(4, Math.floor(store.length / 2));
-          const firstUserIdx = store.findIndex(
-            (m, i) => i > 0 && m.role === 'user'
-          );
-          const tailStart = Math.max(
-            firstUserIdx > 0 ? firstUserIdx + 1 : 1,
-            store.length - keep
-          );
-          store.truncateForRecovery(firstUserIdx, tailStart);
-
-          const stateStr2 = [
-            contextManager.formatRequestInstructions(),
-            renderStackState(stack),
-          ].filter(Boolean).join('\n\n');
-          request.messages = providerCodec.encodeMessages(
-            store.buildContextRequestMessages(stateStr2, contextManager.buildLlmContext())
-          );
-          stream = await client.chat.completions.create(
-            { ...request, stream: true },
-            { signal }
-          );
-        } else {
-          throw retryErr;
-        }
+        throw retryErr;
       }
 
       const parsedTurn = yield* streamParser.parse(

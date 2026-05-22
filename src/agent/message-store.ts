@@ -149,37 +149,6 @@ export class MessageStore {
     return removed;
   }
 
-  /** Find a safe cut index that does not land inside a tool-result block. */
-  findSafeCutIndex(desiredCut: number): number {
-    let cut = Math.max(1, Math.min(desiredCut, this.messages.length));
-    while (cut < this.messages.length && this.messages[cut].role === 'tool') {
-      cut += 1;
-    }
-    return cut;
-  }
-
-  /** Replace middle messages with a compact summary. */
-  compact(cutIndex: number, summary: string, fallbackUserContent?: string): void {
-    if (cutIndex <= 1 || cutIndex >= this.messages.length) return;
-    this.messages.splice(1, cutIndex - 1, {
-      role: 'system',
-      content: `[compact summary]\n${summary}`,
-    });
-    const shift = cutIndex - 2;
-    this.rootTurnAnchors = this.rootTurnAnchors
-      .filter((idx) => idx >= cutIndex)
-      .map((idx) => idx - shift);
-
-    // Safety: ensure at least one user message remains after compact.
-    // Without this, Qwen3 jinja templates throw "No user query found in messages".
-    const hasUser = this.messages.some((m) => m.role === 'user');
-    if (!hasUser && fallbackUserContent) {
-      const userContent = fallbackUserContent.slice(0, 200);
-      // Insert right after the summary (index 2) to maintain message order
-      this.messages.splice(2, 0, { role: 'user', content: userContent });
-    }
-  }
-
   /**
    * Fold messages from anchor onward into a single summary message.
    * Returns the folded slice so the caller can archive it.
@@ -201,29 +170,6 @@ export class MessageStore {
       : `[stack:completed] Summary: ${summary}`;
     this.messages.push({ role: 'system', content: foldSummary });
     return folded;
-  }
-
-  /** Truncate messages for 500-error recovery. */
-  truncateForRecovery(firstUserIdx: number, tailStart: number): void {
-    const newMessages: ChatCompletionMessageParam[] = [this.messages[0]];
-    const truncatedMiddle =
-      firstUserIdx > 0
-        ? tailStart > firstUserIdx + 1
-        : tailStart > 1;
-    if (truncatedMiddle) {
-      newMessages.push({
-        role: 'system',
-        content: '[context truncated due to server error]',
-      });
-    }
-    if (firstUserIdx > 0) {
-      newMessages.push(this.messages[firstUserIdx]);
-    }
-    for (let i = tailStart; i < this.messages.length; i++) {
-      newMessages.push(this.messages[i]);
-    }
-    this.messages = newMessages;
-    this.rootTurnAnchors = [];
   }
 
   /**

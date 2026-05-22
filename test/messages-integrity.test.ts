@@ -335,28 +335,17 @@ test('messages: tool results are textualized in active context', async () => {
   }
 });
 
-test('messages: compact path still sends active context with user', async () => {
+test('messages: tool-heavy active context still sends user message', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);
   try {
-    // Tiny context window forces compact. Need messages.length >= 8 at start
-    // of a loop iteration so findSafeCutIndex returns cut >= 2 and compact
-    // actually triggers.
     const agent = await createAgent(
-      makeConfig({
-        model: {
-          baseURL: 'http://127.0.0.1:0',
-          model: 'stub-model',
-          apiKey: 'stub-key',
-          contextWindow: 50,
-        },
-      }),
+      makeConfig(),
       makeConnections()
     );
 
     // Chain 3 tool calls then a final answer in a single task.
     // This grows messages to [sys, user, asst(tc), tool, asst(tc), tool, asst(tc), tool]
-    // = 8 messages at the start of the 4th loop → compact triggers.
     const mkToolTurn = (id: string) => ({
       kind: 'stream' as const,
       chunks: streamChunks({
@@ -373,22 +362,13 @@ test('messages: compact path still sends active context with user', async () => 
     state.responses.push(mkToolTurn('call_b'));
     state.responses.push(mkToolTurn('call_c'));
 
-    // Before the 4th model call, agent runs maybeCompact which will
-    // issue a non-stream summarize call:
-    state.responses.push({
-      kind: 'nonStream',
-      content:
-        '【compact】summary covering prior tool usage context that is long enough to pass the 50-char guard xxxxxxxxxxxxxxxxxxxxx',
-    });
-    // Then the 4th model call itself (post-compact):
     state.responses.push({
       kind: 'stream',
-      chunks: streamChunks({ content: 'final after compact' }),
+      chunks: streamChunks({ content: 'final after tools' }),
     });
 
     await drain(agent.chat('user-round-1-preserved'));
 
-    // Find the last model call that carries the compact summary.
     const last = state.calls[state.calls.length - 1].messages;
     assertSystemFirst(last);
 
@@ -459,13 +439,14 @@ test('messages: follow-up context preserves root user and textualized tool resul
   }
 });
 
-test('messages: 500 retry+truncate keeps system and preserves user message', async () => {
+test('messages: 500 retry does not hidden-truncate transcript', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);
   try {
     const agent = await createAgent(makeConfig(), makeConnections());
 
-    // First, build up enough history (need >4 messages for truncate path).
+    // First, build up enough history. A 500 must not trigger hidden MessageStore
+    // truncation as a recovery mechanism.
     state.responses.push({
       kind: 'stream',
       chunks: streamChunks({ content: 'r1' }),
@@ -484,27 +465,27 @@ test('messages: 500 retry+truncate keeps system and preserves user message', asy
     });
     await drain(agent.chat('round-3'));
 
-    // Now round-4: server returns 500 for withRetry attempts (retries=2 → 3 tries),
-    // then agent does a truncate+retry (one more attempt). Finally success.
+    // Now round-4: server returns 500 for withRetry attempts (retries=2 -> 3 tries).
+    // The agent should surface the error after retries, with no hidden recovery.
     state.responses.push({ kind: 'error', status: 500 });
     state.responses.push({ kind: 'error', status: 500 });
     state.responses.push({ kind: 'error', status: 500 });
-    // truncate+retry path:
-    state.responses.push({
-      kind: 'stream',
-      chunks: streamChunks({ content: 'recovered' }),
-    });
 
-    await drain(agent.chat('round-4-truncate-preserved'));
+    const events = await drain(agent.chat('round-4-no-hidden-truncate'));
+    assert.ok(
+      events.some((ev) => ev.type === 'task:failed'),
+      '500 after retries must be surfaced as a task failure'
+    );
 
     const last = state.calls[state.calls.length - 1].messages;
     assertSystemFirst(last);
     assertQwen3Safe(last);
     const userMsgs = last.filter((m: any) => m.role === 'user');
     const thisRoundUser = userMsgs.find(
-      (m: any) => m.content === 'round-4-truncate-preserved'
+      (m: any) => m.content === 'round-4-no-hidden-truncate'
     );
-    assert.ok(thisRoundUser, 'current-round user message must survive truncate');
+    assert.ok(thisRoundUser, 'current-round user message must be present on retry calls');
+    assert.equal(state.calls.length, 6, 'must only make the normal 3 retry calls for round 4');
   } finally {
     restore();
   }
@@ -1050,7 +1031,7 @@ test('messages: no consecutive system messages without user in between across ro
   }
 });
 
-test('messages: compact ensures user message exists even when last N are all assistant+tool', async () => {
+test('messages: user message exists with assistant+tool-heavy context', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);
   try {
@@ -1061,16 +1042,14 @@ test('messages: compact ensures user message exists even when last N are all ass
           baseURL: 'http://127.0.0.1:0',
           model: 'stub-model',
           apiKey: 'stub-key',
-          contextWindow: 50,
+          contextWindow: 5000,
         },
       }),
       makeConnections()
     );
 
-    // Build a scenario where the last 6 messages are all assistant(tool_call)+tool pairs.
-    // After 4 tool calls: [sys, user, asst(tc), tool, asst(tc), tool, asst(tc), tool, asst(tc), tool]
-    // = 10 messages. With COMPACT_KEEP_LAST_N=6, kept tail = last 6 = [asst(tc), tool, asst(tc), tool, asst(tc), tool]
-    // No user message in the kept tail!
+    // Build a scenario with many assistant/tool items. The active request must
+    // still carry the root user message.
     const mkToolTurn = (id: string) => ({
       kind: 'stream' as const,
       chunks: streamChunks({
@@ -1088,13 +1067,6 @@ test('messages: compact ensures user message exists even when last N are all ass
     state.responses.push(mkToolTurn('call_3'));
     state.responses.push(mkToolTurn('call_4'));
 
-    // The 5th iteration triggers compact. The summarizer (non-stream) call:
-    state.responses.push({
-      kind: 'nonStream',
-      content:
-        'Summary of prior conversation including user request and tool interactions that is definitely long enough to pass the 50-char minimum guard check xxxxxxxxx',
-    });
-    // The 5th model call post-compact: final answer
     state.responses.push({
       kind: 'stream',
       chunks: streamChunks({ content: 'done with all tools' }),
@@ -1109,7 +1081,7 @@ test('messages: compact ensures user message exists even when last N are all ass
     const hasUserMsg = lastCall.some((m: any) => m.role === 'user');
     assert.ok(
       hasUserMsg,
-      'compact must ensure a user message exists even when last N messages are all assistant+tool'
+      'active context must keep a user message in model context'
     );
 
     // The user message should contain the task prompt (truncated to 200 chars)
@@ -1157,7 +1129,7 @@ test('qwen3: compact after 5 consecutive tool calls still has user message', asy
     );
 
     // 5 consecutive tool calls: messages grow to [sys, user, asst(tc), tool, asst(tc), tool, ...]
-    // = 12 messages. COMPACT_KEEP_LAST_N=6 means kept tail is last 6 = all asst+tool, no user.
+    // = 12 messages. Every model call must still include a user message.
     const mkToolTurn = (id: string) => ({
       kind: 'stream' as const,
       chunks: streamChunks({
