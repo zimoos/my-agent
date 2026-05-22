@@ -30,6 +30,7 @@ export class MessageStore {
         this.messages.push(m);
       }
     }
+    this.persistedCount = this.messages.length;
   }
 
   reset(systemPrompt: string): void {
@@ -238,6 +239,18 @@ export class MessageStore {
       content: (system.content as string) + '\n' + suffix,
     } as any;
     return [patchedSystem, ...this.messages.slice(1)];
+  }
+
+  buildContextRequestMessages(
+    suffix: string,
+    body: ChatCompletionMessageParam[]
+  ): ChatCompletionMessageParam[] {
+    const system = this.messages[0];
+    const patchedSystem: ChatCompletionMessageParam = {
+      role: 'system',
+      content: (system.content as string) + (suffix ? '\n' + suffix : ''),
+    } as any;
+    return [patchedSystem, ...body];
   }
 
   /** Get messages that have not yet been persisted (system excluded). */

@@ -407,11 +407,12 @@ export async function createAgent(
   const rootTranscriptAnchors: number[] = [];
 
   function persistPending(): ReturnType<typeof contextManager.recordMessages> {
-    if (!sessionStore || !sessionId) {
-      store.markPersisted();
-      return [];
-    }
     const pending = store.getPendingForPersist();
+    if (!sessionStore || !sessionId) {
+      const indexed = contextManager.recordMessages(pending);
+      store.markPersisted();
+      return indexed;
+    }
     const persisted: ChatCompletionMessageParam[] = [];
     for (const m of pending) {
       try {
@@ -570,12 +571,12 @@ export async function createAgent(
 
       const stateStr = renderStackState(stack);
       const suffix = [
-        contextManager.formatForPrompt(),
+        contextManager.formatRequestInstructions(),
         stateStr || '',
         loopWarning,
       ].filter(Boolean).join('\n\n');
       const requestMessages = providerCodec.encodeMessages(
-        store.buildRequestMessages(suffix)
+        store.buildContextRequestMessages(suffix, contextManager.buildLlmContext())
       );
 
       const request: Parameters<typeof client.chat.completions.create>[0] = {
@@ -649,11 +650,11 @@ export async function createAgent(
           store.truncateForRecovery(firstUserIdx, tailStart);
 
           const stateStr2 = [
-            contextManager.formatForPrompt(),
+            contextManager.formatRequestInstructions(),
             renderStackState(stack),
           ].filter(Boolean).join('\n\n');
           request.messages = providerCodec.encodeMessages(
-            store.buildRequestMessages(stateStr2)
+            store.buildContextRequestMessages(stateStr2, contextManager.buildLlmContext())
           );
           stream = await client.chat.completions.create(
             { ...request, stream: true },

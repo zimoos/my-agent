@@ -5,6 +5,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import OpenAI from 'openai';
 import { createAgent } from '../src/agent.js';
+import { createContextManager } from '../src/agent/context-manager.js';
 import { createSessionStore } from '../src/session/store.js';
 import type { AgentConfig, AgentEvent } from '../src/mcp/types.js';
 
@@ -13,11 +14,12 @@ function findCompletionsPrototype(): any {
   return Object.getPrototypeOf((probe as any).chat.completions);
 }
 
-function installOpenAiMock(content: string) {
+function installOpenAiMock(content: string, calls?: any[]) {
   const proto = findCompletionsPrototype();
   const original = proto.create;
   proto.create = function patched(body: any) {
     if (body.stream !== true) throw new Error('expected streaming chat call');
+    calls?.push(body);
     const chunks = [
       { choices: [{ delta: { content } }] },
     ];
@@ -77,3 +79,47 @@ test('agent chat writes monotonic transcript index sidecar for visible messages'
   }
 });
 
+test('agent chat sends context-manager active context, not full transcript', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ma-agent-context-request-'));
+  const sessionStore = createSessionStore(dir);
+  const sessionId = sessionStore.create({
+    createdAt: Date.now(),
+    cwd: process.cwd(),
+    model: 'stub-model',
+  });
+  const oldMessages = [
+    { role: 'user', content: 'old task that should stay out of request' },
+    { role: 'assistant', content: 'cold noisy assistant history' },
+  ] as any[];
+  for (const msg of oldMessages) sessionStore.append(sessionId, msg);
+  const contextManager = createContextManager(sessionId, dir);
+  contextManager.ensureIndexed(oldMessages);
+  contextManager.clearActive();
+  contextManager.recordMessages([
+    { role: 'user', content: 'current active task' },
+  ]);
+
+  const calls: any[] = [];
+  const restore = installOpenAiMock(
+    'visible answer\n<ma_context_patch>{"ops":[]}</ma_context_patch>',
+    calls
+  );
+  try {
+    const agent = await createAgent(config, [], {
+      resumeMessages: oldMessages,
+      sessionStore,
+      sessionId,
+    });
+    await drain(agent.chat('new task'));
+
+    const firstRequest = calls[0].messages;
+    const requestText = JSON.stringify(firstRequest);
+
+    assert.match(requestText, /current active task/);
+    assert.match(requestText, /new task/);
+    assert.doesNotMatch(requestText, /old task that should stay out of request/);
+    assert.doesNotMatch(requestText, /cold noisy assistant history/);
+  } finally {
+    restore();
+  }
+});

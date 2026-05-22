@@ -288,7 +288,7 @@ test('messages: chat() pushes user message before first model call', async () =>
   }
 });
 
-test('messages: tool_call + tool_result are paired with matching ids', async () => {
+test('messages: tool results are textualized in active context', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);
   try {
@@ -316,31 +316,26 @@ test('messages: tool_call + tool_result are paired with matching ids', async () 
 
     await drain(agent.chat('please plan'));
 
-    // Second model call contains the full turn-1 flow: assistant(tool_calls) + tool result.
+    // Second model call reads ContextManager active context, not raw tool protocol history.
     assert.ok(state.calls.length >= 2, 'expected at least 2 model calls');
     const round2 = state.calls[1].messages;
 
-    const asstWithCalls = round2.find(
-      (m: any) =>
-        m.role === 'assistant' &&
-        Array.isArray(m.tool_calls) &&
-        m.tool_calls.length > 0
+    assertQwen3Safe(round2);
+    assert.ok(
+      round2.some((m: any) => m.role === 'user' && m.content === 'please plan'),
+      'original user request must remain active'
     );
-    assert.ok(asstWithCalls, 'assistant message with tool_calls must exist');
-    assert.equal(asstWithCalls.tool_calls[0].id, 'call_todo_1');
-
-    const toolMsg = round2.find(
-      (m: any) => m.role === 'tool' && m.tool_call_id === 'call_todo_1'
+    assert.ok(
+      round2.some((m: any) => m.role === 'assistant' && String(m.content).includes('[tool result')),
+      'tool result must be represented as active-context text'
     );
-    assert.ok(toolMsg, 'tool result with matching id must exist');
-
-    assertToolCallPaired(round2);
+    assert.ok(!round2.some((m: any) => m.role === 'tool'), 'raw tool messages must not be sent');
   } finally {
     restore();
   }
 });
 
-test('messages: compact preserves system, inserts summary, keeps tool pairing intact', async () => {
+test('messages: compact path still sends active context with user', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);
   try {
@@ -397,38 +392,19 @@ test('messages: compact preserves system, inserts summary, keeps tool pairing in
     const last = state.calls[state.calls.length - 1].messages;
     assertSystemFirst(last);
 
-    const hasSummary = last.some(
-      (m: any) =>
-        m.role === 'system' &&
-        typeof m.content === 'string' &&
-        m.content.includes('[compact summary]')
-    );
-    assert.ok(hasSummary, 'compact summary system message must be present');
-
-    // The original user message in index 1 IS absorbed by compact when the
-    // keepLastN window (default 6) doesn't reach back to it — this is by
-    // design: the summary replaces the middle range. The critical invariant
-    // for lmStudio is that the summary exists (above) and the tail is
-    // well-formed (below).
-
-    // Tool-call pairing must remain valid after compact: no orphan tool
-    // messages, every assistant(tool_calls) has matching results.
-    assertToolCallPaired(last);
+    assertQwen3Safe(last);
     assertNoEmptyAssistant(last);
-
-    // Compact must not collapse messages down to only system — there must be
-    // post-summary content carrying forward recent context.
     const nonSystem = last.filter((m: any) => m.role !== 'system');
     assert.ok(
       nonSystem.length > 0,
-      'compact must not drop all non-system messages'
+      'active context request must not collapse to only system'
     );
   } finally {
     restore();
   }
 });
 
-test('messages: root task completion preserves tool history for follow-up context', async () => {
+test('messages: follow-up context preserves root user and textualized tool result', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);
   try {
@@ -469,16 +445,15 @@ test('messages: root task completion preserves tool history for follow-up contex
     );
     assert.ok(hasOriginalUser, 'root task user message must remain in history');
 
-    const hasOriginalToolCall = last.some(
-      (m: any) =>
-        m.role === 'assistant' &&
-        Array.isArray(m.tool_calls) &&
-        m.tool_calls.some((tc: any) => tc.id === 'call_a')
+    assert.ok(
+      last.some((m: any) => m.role === 'user' && m.content === 'second ask'),
+      'current root user message must remain in active context'
     );
-    assert.ok(hasOriginalToolCall, 'root task tool_call must remain in history');
-
-    // Critical: no orphan role:tool anywhere (every tool msg must pair with an assistant tool_call).
-    assertToolCallPaired(last);
+    assert.ok(
+      last.some((m: any) => m.role === 'assistant' && String(m.content).includes('[tool result')),
+      'prior tool result must be textualized in active context'
+    );
+    assert.ok(!last.some((m: any) => m.role === 'tool'), 'raw tool protocol messages must not be sent');
   } finally {
     restore();
   }
@@ -524,16 +499,7 @@ test('messages: 500 retry+truncate keeps system and preserves user message', asy
 
     const last = state.calls[state.calls.length - 1].messages;
     assertSystemFirst(last);
-    // Truncate inserts a system marker at index 1
-    const hasTruncateMarker = last.some(
-      (m: any) =>
-        m.role === 'system' &&
-        typeof m.content === 'string' &&
-        m.content.includes('[context truncated')
-    );
-    assert.ok(hasTruncateMarker, 'truncate marker must be injected');
-
-    assertHasRole(last, 'user');
+    assertQwen3Safe(last);
     const userMsgs = last.filter((m: any) => m.role === 'user');
     const thisRoundUser = userMsgs.find(
       (m: any) => m.content === 'round-4-truncate-preserved'
@@ -596,10 +562,10 @@ test('messages: thinking tokens are stripped from assistant content', async () =
     const asst = round2.find(
       (m: any) =>
         m.role === 'assistant' &&
-        Array.isArray(m.tool_calls) &&
-        m.tool_calls.length > 0
+        typeof m.content === 'string' &&
+        m.content.includes('real-visible-answer')
     );
-    assert.ok(asst, 'assistant message with tool_calls must exist');
+    assert.ok(asst, 'assistant visible content must exist in active context');
 
     const content =
       typeof asst.content === 'string'
@@ -630,7 +596,7 @@ test('messages: thinking tokens are stripped from assistant content', async () =
   }
 });
 
-test('messages: deepseek codec round-trips reasoning_content for tool-call turns', async () => {
+test('messages: deepseek active context does not replay reasoning protocol fields', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);
   try {
@@ -672,16 +638,10 @@ test('messages: deepseek codec round-trips reasoning_content for tool-call turns
 
     assert.ok(state.calls.length >= 2, 'expected second request after tool result');
     const round2 = state.calls[1].messages;
-    const asst = round2.find(
-      (m: any) =>
-        m.role === 'assistant' &&
-        Array.isArray(m.tool_calls) &&
-        m.tool_calls.length > 0
-    );
-    assert.ok(asst, 'assistant tool-call message must exist in second request');
-    assert.equal(
-      asst.reasoning_content,
-      'Need to inspect the todo list before answering.'
+    assertQwen3Safe(round2);
+    assert.ok(
+      !round2.some((m: any) => m.reasoning_content !== undefined),
+      'active context requests must not replay reasoning_content'
     );
   } finally {
     restore();
@@ -717,14 +677,11 @@ test('messages: default codec strips reasoning_content from outbound messages', 
 
     assert.ok(state.calls.length >= 2, 'expected second request after tool result');
     const round2 = state.calls[1].messages;
-    const asst = round2.find(
-      (m: any) =>
-        m.role === 'assistant' &&
-        Array.isArray(m.tool_calls) &&
-        m.tool_calls.length > 0
+    assertQwen3Safe(round2);
+    assert.ok(
+      !round2.some((m: any) => m.reasoning_content !== undefined),
+      'default codec must not send reasoning_content'
     );
-    assert.ok(asst, 'assistant tool-call message must exist in second request');
-    assert.equal(asst.reasoning_content, undefined);
   } finally {
     restore();
   }

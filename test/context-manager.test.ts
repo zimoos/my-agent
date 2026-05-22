@@ -99,7 +99,7 @@ test('context manager: records monotonic transcript ids and applies id-based ops
   const toolItem = state.activeItems.find((item) => item.i === 2);
 
   assert.equal(userItem?.mode, 'protected');
-  assert.equal(userItem?.content, undefined);
+  assert.equal(userItem?.content, 'Do not mutate this user message');
   assert.equal(assistantItem?.mode, 'summary');
   assert.equal(assistantItem?.content, 'Assistant assumption summarized');
   assert.equal(toolItem, undefined);
@@ -203,4 +203,48 @@ test('context manager: ensureIndexed backfills old sessions once', () => {
   assert.match(inspect, /Transcript index entries: 2/);
   assert.match(inspect, /\[i=0 role=user mode=protected\]/);
   assert.match(inspect, /\[i=1 role=assistant mode=raw\]/);
+});
+
+test('context manager: builds llm context from active items only', () => {
+  const dir = mktmp('ma-context-');
+  const ctx = createContextManager('s_llm_context_0000', dir);
+
+  ctx.recordMessages([
+    { role: 'user', content: 'current real user task' },
+    { role: 'assistant', content: 'active assistant finding' },
+    { role: 'tool', tool_call_id: 'tc_1', content: 'active tool result' },
+    { role: 'assistant', content: 'cold noisy result' },
+  ]);
+
+  ctx.applyPatch(JSON.stringify({
+    ops: [
+      { i: 3, act: 'rm', reason: 'not needed for current task' },
+    ],
+  }));
+
+  const messages = ctx.buildLlmContext();
+  const text = messages.map((msg) => String(msg.content)).join('\n');
+
+  assert.match(text, /current real user task/);
+  assert.match(text, /active assistant finding/);
+  assert.match(text, /active tool result/);
+  assert.doesNotMatch(text, /cold noisy result/);
+  assert.ok(ctx.search('cold noisy result').some((entry) => entry.i === 3));
+});
+
+test('context manager: protected user remains active after many tool messages', () => {
+  const dir = mktmp('ma-context-');
+  const ctx = createContextManager('s_protected_user_0000', dir);
+
+  ctx.recordMessages([{ role: 'user', content: 'do not drop this task' }]);
+  for (let i = 0; i < 40; i++) {
+    ctx.recordMessages([
+      { role: 'tool', tool_call_id: `tc_${i}`, content: `tool result ${i}` },
+    ]);
+  }
+
+  const messages = ctx.buildLlmContext();
+  assert.ok(
+    messages.some((msg) => msg.role === 'user' && msg.content === 'do not drop this task')
+  );
 });

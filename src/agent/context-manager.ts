@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 
 export const CONTEXT_PATCH_OPEN = '<ma_context_patch>';
 export const CONTEXT_PATCH_CLOSE = '</ma_context_patch>';
@@ -120,6 +121,8 @@ export interface ContextManager {
   state(): ActiveContextState;
   inspect(): string;
   formatForPrompt(): string;
+  formatRequestInstructions(): string;
+  buildLlmContext(): ChatCompletionMessageParam[];
   pin(text: string): string;
   search(query: string, limit?: number): SessionPoolEntry[];
   recall(entryId: string, reason?: string): string;
@@ -231,6 +234,7 @@ export function createContextManager(
   let current = readJson<ActiveContextState>(statePath) ?? initialState(id);
   current.sessionId = id;
   current.activeItems ??= [];
+  let memoryNextIndex = 0;
 
   function save(): void {
     current.updatedAt = Date.now();
@@ -280,6 +284,7 @@ export function createContextManager(
   }
 
   function nextTranscriptIndex(): number {
+    if (!sessionId) return memoryNextIndex++;
     const entries = loadIndex();
     return entries.length === 0
       ? 0
@@ -375,10 +380,19 @@ export function createContextManager(
   }
 
   function upsertActiveItem(item: ActiveContextItem): void {
-    current.activeItems = [
+    const next = [
       item,
       ...current.activeItems.filter((old) => old.i !== item.i),
-    ].slice(0, MAX_ACTIVE_ITEMS);
+    ];
+    const protectedItems = next.filter((candidate) =>
+      candidate.mode === 'protected' || candidate.role === 'user'
+    );
+    const rest = next
+      .filter((candidate) =>
+        candidate.mode !== 'protected' && candidate.role !== 'user'
+      )
+      .slice(0, Math.max(0, MAX_ACTIVE_ITEMS - protectedItems.length));
+    current.activeItems = [...protectedItems, ...rest];
   }
 
   function recordMessages(messages: any[]): TranscriptIndexEntry[] {
@@ -412,10 +426,12 @@ export function createContextManager(
         i: entry.i,
         role: entry.role,
         mode: entry.role === 'user' ? 'protected' : 'raw',
+        content: text,
         reason: 'latest transcript message',
         updatedAt: entry.createdAt,
       });
     }
+    if (!sessionId) memoryNextIndex = next;
     if (created.length > 0) save();
     return created;
   }
@@ -539,6 +555,62 @@ export function createContextManager(
     current.activeItems = [];
     save();
     return 'Cleared active context';
+  }
+
+  function activeItemContent(
+    item: ActiveContextItem,
+    index: TranscriptIndexEntry[]
+  ): string {
+    const source = index.find((entry) => entry.i === item.i);
+    return (item.content || source?.text || '').trim();
+  }
+
+  function buildLlmContext(): ChatCompletionMessageParam[] {
+    const index = loadIndex();
+    const out: ChatCompletionMessageParam[] = [];
+    const sorted = current.activeItems
+      .slice()
+      .sort((a, b) => a.i - b.i);
+
+    for (const item of sorted) {
+      const content = activeItemContent(item, index);
+      if (!content) continue;
+      if (item.role === 'user') {
+        out.push({ role: 'user', content });
+      } else {
+        out.push({
+          role: 'assistant',
+          content:
+            item.role === 'tool'
+              ? `[tool result i=${item.i}] ${content}`
+              : content,
+        });
+      }
+    }
+
+    const hasUser = out.some((msg) => msg.role === 'user');
+    if (!hasUser) {
+      const latestUser = index
+        .filter((entry) => entry.role === 'user')
+        .sort((a, b) => b.i - a.i)[0];
+      if (latestUser?.text.trim()) {
+        out.unshift({ role: 'user', content: latestUser.text.trim() });
+      }
+    }
+
+    for (const item of current.recalled.slice().reverse()) {
+      if (typeof item.i === 'number' && sorted.some((active) => active.i === item.i)) {
+        continue;
+      }
+      if (item.snippet.trim()) {
+        out.push({
+          role: 'assistant',
+          content: `[recalled ${item.entryId}] ${item.snippet.trim()}`,
+        });
+      }
+    }
+
+    return out;
   }
 
   function truncateFrom(i: number): void {
@@ -765,6 +837,27 @@ export function createContextManager(
     return lines.join('\n');
   }
 
+  function formatRequestInstructions(): string {
+    const lines: string[] = ['[MA Context Protocol]'];
+    if (current.currentTask) {
+      lines.push(`Current task: ${current.currentTask.title}`);
+      if (current.currentTask.goal) lines.push(`Goal: ${current.currentTask.goal}`);
+      if (current.currentTask.state) lines.push(`State: ${current.currentTask.state}`);
+    }
+    if (current.pins.length > 0) {
+      lines.push('Pins:');
+      for (const pin of current.pins.slice(0, 8)) lines.push(`- ${pin}`);
+    }
+    if (current.activeSummaries.length > 0) {
+      lines.push('Context hygiene notes:');
+      for (const note of current.activeSummaries.slice(0, 6)) lines.push(`- ${note}`);
+    }
+    lines.push(
+      'Your visible answer should solve the user task. At the end of your final visible response, emit a hidden JSON patch between <ma_context_patch> and </ma_context_patch>. The patch should describe the next-turn context only. Do not mention the patch to the user. Prefer indexed ops: {"ops":[{"i":102,"act":"rm|edit|protect|keep","res":"only for edit","reason":"..."},{"act":"search","q":"...","reason":"..."}]}. Message i values are stable original transcript IDs. Do not edit user messages or system prompts. If no context change is needed, emit {"ops":[]}.'
+    );
+    return lines.join('\n');
+  }
+
   function inspect(): string {
     const lines = [formatForPrompt()];
     const poolCount = loadPool().length;
@@ -778,6 +871,8 @@ export function createContextManager(
     state: () => current,
     inspect,
     formatForPrompt,
+    formatRequestInstructions,
+    buildLlmContext,
     pin,
     search,
     recall,
