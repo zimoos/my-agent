@@ -248,3 +248,20 @@ test('context manager: protected user remains active after many tool messages', 
     messages.some((msg) => msg.role === 'user' && msg.content === 'do not drop this task')
   );
 });
+
+test('context manager: does not silently cap active context items', () => {
+  const dir = mktmp('ma-context-');
+  const ctx = createContextManager('s_no_active_cap_0000', dir);
+
+  ctx.recordMessages([{ role: 'user', content: 'keep the whole active context' }]);
+  for (let i = 0; i < 40; i++) {
+    ctx.recordMessages([
+      { role: 'assistant', content: `assistant context ${i}` },
+    ]);
+  }
+
+  assert.equal(ctx.active().length, 41);
+  const text = ctx.buildLlmContext().map((msg) => String(msg.content)).join('\n');
+  assert.match(text, /assistant context 0/);
+  assert.match(text, /assistant context 39/);
+});

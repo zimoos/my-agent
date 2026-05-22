@@ -142,7 +142,6 @@ const MAX_SUMMARY = 1200;
 const MAX_RECALLS = 6;
 const MAX_RECALL_CHARS = 900;
 const MAX_ACTIVE_SUMMARIES = 8;
-const MAX_ACTIVE_ITEMS = 24;
 const VALID_HYGIENE = new Set<HygieneAction>([
   'keep',
   'demote',
@@ -380,19 +379,10 @@ export function createContextManager(
   }
 
   function upsertActiveItem(item: ActiveContextItem): void {
-    const next = [
+    current.activeItems = [
       item,
       ...current.activeItems.filter((old) => old.i !== item.i),
     ];
-    const protectedItems = next.filter((candidate) =>
-      candidate.mode === 'protected' || candidate.role === 'user'
-    );
-    const rest = next
-      .filter((candidate) =>
-        candidate.mode !== 'protected' && candidate.role !== 'user'
-      )
-      .slice(0, Math.max(0, MAX_ACTIVE_ITEMS - protectedItems.length));
-    current.activeItems = [...protectedItems, ...rest];
   }
 
   function recordMessages(messages: any[]): TranscriptIndexEntry[] {
@@ -818,7 +808,7 @@ export function createContextManager(
     if (current.activeItems.length > 0) {
       lines.push('Indexed Active Context View:');
       const index = loadIndex();
-      for (const item of current.activeItems.slice(0, MAX_ACTIVE_ITEMS)) {
+      for (const item of current.activeItems) {
         const source = index.find((entry) => entry.i === item.i);
         const content = item.content || source?.text || '';
         const prefix = `[i=${item.i} role=${item.role} mode=${item.mode}]`;
