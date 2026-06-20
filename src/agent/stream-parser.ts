@@ -8,17 +8,18 @@ import { normalizeToolCalls } from './normalize.js';
  * Parses an OpenAI-compatible streaming response.
  *
  * Yields token / thinking events as they arrive, and returns the final
- * aggregated content + tool calls when the stream ends.
+ * aggregated content + reasoning content + tool calls when the stream ends.
  */
 export class StreamParser {
   async *parse(
     stream: AsyncIterable<any>
   ): AsyncGenerator<
     AgentEvent,
-    { content: string; toolCalls: ChatCompletionMessageToolCall[] | null },
+    { content: string; reasoningContent: string; toolCalls: ChatCompletionMessageToolCall[] | null },
     unknown
   > {
     let contentBuf = '';
+    let reasoningBuf = '';
     const toolAcc = new Map<
       number,
       { id: string; name: string; argsBuf: string }
@@ -36,6 +37,7 @@ export class StreamParser {
         typeof (delta as any).reasoning_content === 'string' &&
         (delta as any).reasoning_content.length > 0
       ) {
+        reasoningBuf += (delta as any).reasoning_content;
         if (!isThinking) {
           isThinking = true;
           thinkingViaReasoning = true;
@@ -122,6 +124,6 @@ export class StreamParser {
         function: { name: v.name, arguments: v.argsBuf },
       }));
     const toolCalls = normalizeToolCalls(assembled);
-    return { content: contentBuf, toolCalls };
+    return { content: contentBuf, reasoningContent: reasoningBuf, toolCalls };
   }
 }

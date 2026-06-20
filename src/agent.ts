@@ -27,12 +27,14 @@ import {
 import { MessageStore } from './agent/message-store.js';
 import { ErrorTracker } from './agent/error-tracker.js';
 import { StreamParser } from './agent/stream-parser.js';
+import { ToolCallRepair } from './agent/tool-repair.js';
 import { ToolExecutor } from './agent/tool-executor.js';
 import { findToolSchema, routeToolCall } from './agent/tool-router.js';
 import { loadAgentMd } from './agent/memdir.js';
 import { estimateTokens } from './agent/tokenCount.js';
 import { summarizeRange } from './agent/summarize.js';
 import { createTodoList } from './agent/todo.js';
+import { prefixHash } from './agent/prefix-hash.js';
 import type { SessionStore } from './session/store.js';
 
 export interface CreateAgentOptions {
@@ -275,6 +277,18 @@ builtinTools.set('enter_plan_mode', {
   },
 });
 
+function isMutatingTool(name: string): boolean {
+  // Exec commands and write/edit/delete tools should never be storm-suppressed
+  if (DANGER_EXEC_TOOLS.has(name)) return true;
+  const lower = name.toLowerCase();
+  return /_(write|edit|delete|create|remove|move|rename)_/.test('_' + lower + '_');
+}
+
+function isStormExemptTool(name: string): boolean {
+  // ask_user and enter_plan_mode are always intentional — don't suppress
+  return name === 'ask_user' || name === 'enter_plan_mode';
+}
+
 function mcpToolsToOpenAI(connections: McpConnection[]): ChatCompletionTool[] {
   const out: ChatCompletionTool[] = [];
   for (const conn of connections) {
@@ -310,6 +324,12 @@ export async function createAgent(
     ...mcpTools,
     ...[...builtinTools.values()].map((b) => b.definition),
   ];
+  const allowedToolNames = new Set(tools.map((t) => t.function.name));
+  const toolRepair = new ToolCallRepair(
+    { allowedToolNames, isMutating: isMutatingTool, isStormExempt: isStormExemptTool },
+    6,  // storm window
+    3   // storm threshold
+  );
   const maxLoops = config.maxLoops ?? DEFAULT_MAX_LOOPS;
   const baseSystemPrompt =
     config.systemPrompt ??
@@ -464,6 +484,7 @@ export async function createAgent(
   ): AsyncGenerator<AgentEvent, { text: string; hitMaxLoops: boolean }, unknown> {
     const errorTracker = new ErrorTracker();
     const streamParser = new StreamParser();
+    toolRepair.resetStorm();
     const toolExecutor = new ToolExecutor(
       config,
       connections,
@@ -485,6 +506,7 @@ export async function createAgent(
     let finalText = '';
     let emptyArgsRetries = 0;
     let tempOverride: number | undefined;
+    let lastPrefixHash = '';
 
     for (let loop = 0; loop < maxLoops; loop++) {
       // Warn agent when approaching loop limit by appending to system prompt
@@ -502,6 +524,17 @@ export async function createAgent(
       const stateStr = renderStackState(stack);
       const suffix = (stateStr || '') + loopWarning;
       const requestMessages = store.buildRequestMessages(suffix);
+
+      // Prefix cache diagnostic: detect unexpected system prompt changes
+      // Only hash system[0] — the truly stable part that should never change mid-session
+      const curHash = prefixHash(requestMessages.slice(0, 1));
+      if (lastPrefixHash && curHash !== lastPrefixHash) {
+        yield {
+          type: 'text',
+          content: `[prefix] system prompt changed — cache miss (hash: ${lastPrefixHash.slice(0, 8)} → ${curHash.slice(0, 8)})`,
+        };
+      }
+      lastPrefixHash = curHash;
 
       const request: Parameters<typeof client.chat.completions.create>[0] = {
         model: config.model.model,
@@ -559,11 +592,23 @@ export async function createAgent(
         }
       }
 
-      const { content: contentBuf, toolCalls } = yield* streamParser.parse(
+      const { content: contentBuf, reasoningContent, toolCalls } = yield* streamParser.parse(
         stream
       );
 
-      if (!toolCalls) {
+      // Run the tool-call repair pipeline: scavenge + truncation fix + storm breaker
+      const repairResult = toolRepair.process(
+        toolCalls ?? [],
+        contentBuf,
+        reasoningContent
+      );
+      for (const note of repairResult.report.notes) {
+        yield { type: 'text', content: `[repair] ${note}` };
+      }
+
+      const repairedCalls = repairResult.calls.length > 0 ? repairResult.calls : null;
+
+      if (!repairedCalls) {
         // If content is empty/whitespace after tool use, nudge model to answer
         if (contentBuf.trim().length === 0 && loop > 0) {
           store.appendNudge();
@@ -576,11 +621,11 @@ export async function createAgent(
         return { text: finalText, hitMaxLoops: false };
       }
 
-      store.appendAssistant(contentBuf.trim() || '', toolCalls);
+      store.appendAssistant(contentBuf.trim() || '', repairedCalls);
 
       // P0-b: If ALL tool_calls have empty args, pop the assistant message and retry
       // with lower temperature. Don't let model see its own empty-args history.
-      const allEmpty = toolCalls.every((tc) => {
+      const allEmpty = repairedCalls.every((tc) => {
         const a = normalizeArguments(tc.function.arguments);
         return Object.keys(a).length === 0;
       });
@@ -595,7 +640,7 @@ export async function createAgent(
 
       const toolCtx = { stack, currentTask: task, todoList };
 
-      for (const tc of toolCalls) {
+      for (const tc of repairedCalls) {
         const fullName = tc.function.name;
         const args = normalizeArguments(tc.function.arguments);
 
