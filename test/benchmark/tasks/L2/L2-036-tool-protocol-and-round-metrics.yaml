@@ -1,0 +1,52 @@
+id: "L2-036"
+title: "工具稳定性：协议配对与逐轮工具计数"
+level: "L2"
+category: "tool-stability"
+weight: 1.1
+
+fixture:
+  project: "simple-node-project"
+
+behavior_expectations:
+  - "工具调用必须成组完成，不能出现 orphan tool result 或未闭合 tool call"
+  - "已读出的 package version 后续应从上下文回答"
+
+rounds:
+  - user: "读 package.json，只告诉我 version 字段。"
+    expect:
+      tool_calls_include: ["fs__read_file"]
+  - user: "刚才 version 是多少？不要再次读取 package.json。"
+
+hard_assertions:
+  - type: tool_call_count_by_round
+    round: 0
+    min: 1
+    max: 2
+    tool: "fs__read_file"
+  - type: tool_call_count_by_round
+    round: 1
+    max: 0
+    tool: "fs__read_file"
+  - type: no_repeat_read_same_file_after_context_available
+    max_reads: 1
+  - type: final_text_contains
+    contains: "1.0.0"
+  - type: no_orphan_tool
+  - type: no_error_5xx
+
+soft_assertions:
+  - type: llm_judge
+    rubric: "是否能保持工具协议稳定，并用上下文回答第二轮追问"
+    weight: 0.5
+  - type: tool_call_count_max
+    max: 2
+    weight: 0.3
+  - type: duration_max
+    ms: 180000
+    weight: 0.2
+
+runtime:
+  timeout_sec: 220
+  runs: 5
+  max_rounds: null
+  layer: "L2"

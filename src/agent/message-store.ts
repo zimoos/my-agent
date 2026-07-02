@@ -174,17 +174,17 @@ export class MessageStore {
 
   /**
    * Build the messages array to send to the LLM.
-   * The suffix (stack-state + loop-warning) is appended to the system
-   * prompt WITHOUT mutating the internal store.
+   *
+   * The system prompt at position [0] is kept immutable so that the
+   * prefix stays cache-stable across turns. Dynamic content (stack state,
+   * loop warnings) is appended as a separate system message at the tail.
    */
   buildRequestMessages(suffix: string): ChatCompletionMessageParam[] {
     if (!suffix) return [...this.messages];
-    const system = this.messages[0];
-    const patchedSystem: ChatCompletionMessageParam = {
-      role: 'system',
-      content: (system.content as string) + '\n' + suffix,
-    } as any;
-    return [patchedSystem, ...this.messages.slice(1)];
+    return [
+      ...this.messages,
+      { role: 'system', content: suffix },
+    ];
   }
 
   buildContextRequestMessages(

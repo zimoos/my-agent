@@ -9,11 +9,14 @@
  *   npm run benchmark -- --dry-run      # load + validate only
  *
  * L3 (universal agent benchmark):
- *   npm run benchmark -- --level L3 --adapter test/benchmark/adapters/ma.yaml --judge-key $OPENAI_API_KEY
- *   npm run benchmark -- --level L3 --adapter <path> --judge-key <key> --task L3-001
+ *   npm run benchmark -- --level L3 --adapter test/benchmark/adapters/codex.yaml --task L3-009 --runs 1
+ *   npm run benchmark -- --level L3 --adapter <path> --judge-key <key> --judge-model <model> --task L3-001
  */
 
+import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { loadTasks } from './task-loader.js';
 import { runTask } from './task-runner.js';
@@ -35,7 +38,7 @@ import {
   EXIT_L0_INVALID,
   EXIT_RUNTIME_ERROR,
 } from './types.js';
-import { loadAdapter } from './cli-adapter.js';
+import { loadAdapter, type AdapterConfig } from './cli-adapter.js';
 import { loadL3Tasks, runL3Task, type L3TaskResult } from './l3-task-runner.js';
 import { selectJudgeModel, type JudgeConfig, type JudgeScore } from './judge-client.js';
 
@@ -45,6 +48,7 @@ const TASKS_L3_DIR = path.join(ROOT, 'tasks', 'L3');
 const FIXTURES_DIR = path.join(ROOT, 'fixtures');
 const E2E_FIXTURES_DIR = path.resolve(ROOT, '..', 'e2e', 'fixtures');
 const REPORTS_DIR = path.join(ROOT, 'reports');
+const BENCHMARK_ENV_PATH = path.join(os.homedir(), '.my-agent', 'benchmark.env');
 
 interface CliArgs {
   level?: Level;
@@ -54,7 +58,10 @@ interface CliArgs {
   adapterPath?: string;
   judgeKey?: string;
   judgeBaseURL?: string;
+  judgeModel?: string;
   tasksL3Dir?: string;
+  runs?: number;
+  seed?: string;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -76,8 +83,17 @@ function parseArgs(argv: string[]): CliArgs {
       out.judgeKey = argv[++i];
     } else if (arg === '--judge-base-url' && argv[i + 1]) {
       out.judgeBaseURL = argv[++i];
+    } else if (arg === '--judge-model' && argv[i + 1]) {
+      out.judgeModel = argv[++i];
     } else if (arg === '--tasks-l3' && argv[i + 1]) {
       out.tasksL3Dir = argv[++i];
+    } else if (arg === '--runs' && argv[i + 1]) {
+      const runs = Number(argv[++i]);
+      if (Number.isInteger(runs) && runs > 0) {
+        out.runs = runs;
+      }
+    } else if (arg === '--seed' && argv[i + 1]) {
+      out.seed = argv[++i];
     }
   }
   return out;
@@ -85,18 +101,23 @@ function parseArgs(argv: string[]): CliArgs {
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv);
+  applyBenchmarkEnvDefaults(args);
+  const runL3 = args.level === 'L3' || (args.task?.startsWith('L3-') ?? false);
 
   // 1. Load L0-L2 tasks via existing loader
-  console.log(`Loading tasks from ${TASKS_DIR}...`);
-  const { tasks, errors } = loadTasks({
-    tasksDir: TASKS_DIR,
-    fixturesDir: FIXTURES_DIR,
-    e2eFixturesDir: E2E_FIXTURES_DIR,
-    // L3 由独立 loader 处理；现有 loader 看到 L3 YAML 会按 TaskDef 强校验失败，
-    // 因此 L3 时把 L0-L2 过滤器关掉不影响；但要确保 task-loader 不扫到 L3 目录。
-    filterLevel: args.level === 'L3' ? undefined : args.level,
-    filterTask: args.level === 'L3' ? undefined : args.task,
-  });
+  const l12Load = runL3
+    ? { tasks: [] as TaskDef[], errors: [] as string[] }
+    : loadTasks({
+        tasksDir: TASKS_DIR,
+        fixturesDir: FIXTURES_DIR,
+        e2eFixturesDir: E2E_FIXTURES_DIR,
+        filterLevel: args.level,
+        filterTask: args.task,
+      });
+  const tasks = args.runs
+    ? l12Load.tasks.map((t) => withRuns(t, args.runs!))
+    : l12Load.tasks;
+  const errors = l12Load.errors;
 
   if (errors.length > 0) {
     console.error('\n❌ Task validation errors:\n');
@@ -104,7 +125,6 @@ async function main(): Promise<void> {
     process.exit(EXIT_L0_INVALID);
   }
 
-  const runL3 = args.level === 'L3' || (args.task?.startsWith('L3-') ?? false);
   let l3Tasks: ReturnType<typeof loadL3Tasks> = [];
   if (runL3) {
     const l3Dir = args.tasksL3Dir ?? TASKS_L3_DIR;
@@ -116,6 +136,9 @@ async function main(): Promise<void> {
     }
     if (args.task) {
       l3Tasks = l3Tasks.filter((t) => t.id === args.task);
+    }
+    if (args.runs) {
+      l3Tasks = l3Tasks.map((t) => withRuns(t, args.runs!));
     }
   }
 
@@ -160,6 +183,19 @@ async function main(): Promise<void> {
   const allResults: TaskResult[] = [];
   const levelScores: LevelScore[] = [];
   const startedAt = Date.now();
+  const runId = makeRunId(startedAt);
+  const benchmarkSeed = args.seed ?? randomBytes(8).toString('hex');
+  let adapterConfigForReport: AdapterConfig | undefined;
+  const l12JudgeConfig: JudgeConfig | undefined = args.judgeKey
+    ? {
+        model: resolveJudgeModel(
+          args.judgeModel ?? selectJudgeModel('local'),
+          args.judgeBaseURL,
+        ),
+        apiKey: args.judgeKey,
+        ...(args.judgeBaseURL ? { baseURL: args.judgeBaseURL } : {}),
+      }
+    : undefined;
 
   for (const level of LEVEL_ORDER) {
     if (level === 'L3') continue; // L3 单独走
@@ -176,12 +212,19 @@ async function main(): Promise<void> {
       process.stdout.write(`  ${progress} ${task.id} ${task.title}...`);
 
       try {
-        const result = await runTask(task, { configPath: args.configPath });
+        const result = await runTask(task, {
+          configPath: args.configPath,
+          judgeConfig: l12JudgeConfig,
+          benchmarkRunId: runId,
+          benchmarkSeed,
+        });
         results.push(result);
         weights[task.id] = task.weight;
-        const icon = result.passRate >= 0.5 ? '✓' : '✗';
+        const icon = result.skipped ? '↷' : result.passRate >= 0.5 ? '✓' : '✗';
         console.log(
-          ` ${icon} median=${result.median.toFixed(2)} stability=${result.stability.toFixed(2)}`,
+          result.skipped
+            ? ` ${icon} skipped=${result.skipReason}`
+            : ` ${icon} median=${result.median.toFixed(2)} stability=${result.stability.toFixed(2)}`,
         );
       } catch (err) {
         console.log(` 💥 ${(err as Error).message}`);
@@ -218,8 +261,13 @@ async function main(): Promise<void> {
   const l3Details: L3TaskResult[] = [];
   if (runL3 && l3Tasks.length > 0) {
     const adapterConfig = loadAdapter(args.adapterPath!);
+    adapterConfigForReport = adapterConfig;
+    const model = resolveJudgeModel(
+      args.judgeModel ?? selectJudgeModel(adapterConfig.underlyingModel),
+      args.judgeBaseURL,
+    );
     const judgeConfig: JudgeConfig = {
-      model: selectJudgeModel(adapterConfig.underlyingModel),
+      model,
       apiKey: args.judgeKey!,
     };
     if (args.judgeBaseURL) judgeConfig.baseURL = args.judgeBaseURL;
@@ -287,11 +335,18 @@ async function main(): Promise<void> {
     }));
 
   const report: BenchmarkReport = {
-    runId:
-      new Date().toISOString().replace(/[:.]/g, '-') +
-      '-' +
-      Math.random().toString(36).slice(2, 6),
-    config: { agent: 'MA', model: 'local', baseURL: 'http://localhost' },
+    runId,
+    freshness: {
+      seed: benchmarkSeed,
+      mode: 'static-regression-isolated-workspace',
+      taskSelectionFingerprint: taskSelectionFingerprint(tasks, l3Tasks),
+      semanticVariation: 'static-regression',
+      notes: [
+        '每个 run 复制 fixture 到新的临时 workspace 并重启 agent。',
+        '当前模式保持题面稳定,用于回归可比性; 防背题的新鲜语义变体需要 seeded variant/hidden holdout 模式。',
+      ],
+    },
+    config: buildReportConfig(args, adapterConfigForReport),
     totalScore,
     level: finalLevel,
     byLevel: Object.fromEntries(
@@ -324,6 +379,35 @@ async function main(): Promise<void> {
 
 // ─── Helpers ───
 
+function makeRunId(startedAt: number): string {
+  return (
+    new Date(startedAt).toISOString().replace(/[:.]/g, '-') +
+    '-' +
+    randomBytes(3).toString('hex')
+  );
+}
+
+function taskSelectionFingerprint(
+  tasks: TaskDef[],
+  l3Tasks: ReturnType<typeof loadL3Tasks>,
+): string {
+  const payload = {
+    l12: tasks.map((t) => ({
+      id: t.id,
+      sourcePath: t.sourcePath,
+      weight: t.weight,
+      runs: t.runtime.runs,
+    })),
+    l3: l3Tasks.map((t) => ({
+      id: t.id,
+      sourcePath: t.sourcePath,
+      weight: t.weight,
+      runs: t.runtime.runs,
+    })),
+  };
+  return createHash('sha256').update(JSON.stringify(payload)).digest('hex').slice(0, 16);
+}
+
 // 把 L3 的 JudgeScore 包成现有 TaskResult 形状,以便复用 scoreLevel / reporter。
 // 每 run 的 rawScore 用 6 维加权 total;hardPass 用 L3 pass 四重门槛。
 function l3ResultToTaskResult(r: L3TaskResult): TaskResult {
@@ -332,10 +416,23 @@ function l3ResultToTaskResult(r: L3TaskResult): TaskResult {
     runIndex: 0,
     events: [],
     toolCalls: [],
+    rounds: [],
     finalText: '',
     messagesCount: 0,
     thinkingMs: 0,
     apiCalls: 0,
+    compactCount: 0,
+    contextRecallCount: 0,
+    contextWindow: undefined,
+    compactThreshold: undefined,
+    maxContextUsed: 0,
+    maxSilentToolStreak: 0,
+    progressCount: 0,
+    failureSummary: undefined,
+    warningCount: 0,
+    errorCount: 0,
+    repeatedToolCallCount: 0,
+    toolProtocol: { orphanToolResults: 0, unclosedToolCalls: 0 },
     startedAt: 0,
     elapsedMs: 0,
     hitMaxLoops: false,
@@ -390,6 +487,97 @@ function isL3Pass(s: JudgeScore, total: number): boolean {
     s.correctness >= 0.5 &&
     s.noRegression === 1
   );
+}
+
+function applyBenchmarkEnvDefaults(args: CliArgs): void {
+  const fileEnv = loadBenchmarkEnvFile();
+  for (const [key, value] of Object.entries(fileEnv)) {
+    process.env[key] ??= value;
+  }
+  const env = { ...fileEnv, ...process.env };
+
+  args.judgeKey ??= env.MA_BENCH_JUDGE_KEY;
+  args.judgeBaseURL ??= env.MA_BENCH_JUDGE_BASE_URL;
+  args.judgeModel ??= env.MA_BENCH_JUDGE_MODEL;
+}
+
+function buildReportConfig(
+  args: CliArgs,
+  adapterConfig?: AdapterConfig,
+): BenchmarkReport['config'] {
+  if (adapterConfig) {
+    return {
+      agent: adapterConfig.name,
+      model: adapterConfig.underlyingModel,
+      baseURL: 'cli-adapter',
+    };
+  }
+
+  const model = readModelConfigForReport(args.configPath);
+  return {
+    agent: 'MA',
+    model: model?.model ?? 'unknown',
+    baseURL: model?.baseURL ?? 'unknown',
+  };
+}
+
+function readModelConfigForReport(
+  configPath?: string,
+): { model?: string; baseURL?: string } | undefined {
+  if (!configPath) return undefined;
+  try {
+    const raw = fs.readFileSync(path.resolve(configPath), 'utf8');
+    const cfg = JSON.parse(raw) as { model?: { model?: unknown; baseURL?: unknown } };
+    if (!cfg.model || typeof cfg.model !== 'object') return undefined;
+    return {
+      model: typeof cfg.model.model === 'string' ? cfg.model.model : undefined,
+      baseURL: typeof cfg.model.baseURL === 'string' ? cfg.model.baseURL : undefined,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function loadBenchmarkEnvFile(): Record<string, string> {
+  const envPath = process.env.MA_BENCH_ENV_FILE ?? BENCHMARK_ENV_PATH;
+  if (!fs.existsSync(envPath)) return {};
+
+  const entries: Record<string, string> = {};
+  for (const rawLine of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) continue;
+
+    const [, key, rawValue] = match;
+    let value = rawValue.trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    entries[key] = value;
+  }
+  return entries;
+}
+
+function resolveJudgeModel(model: string, baseURL?: string): string {
+  if (baseURL?.includes('api.deepseek.com')) {
+    if (model === 'flash') return 'deepseek-v4-flash';
+    if (model === 'pro') return 'deepseek-v4-pro';
+  }
+  return model;
+}
+
+function withRuns<T extends { runtime: { runs: number } }>(task: T, runs: number): T {
+  return {
+    ...task,
+    runtime: {
+      ...task.runtime,
+      runs,
+    },
+  };
 }
 
 main().catch((err) => {

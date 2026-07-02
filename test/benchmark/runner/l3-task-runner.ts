@@ -26,6 +26,7 @@ import { medianJudgeScore, scoreL3 } from './l3-scorer.js';
 export interface L3ObjectiveCheck {
   command: string;
   weightInto: string;
+  expectedExit: number;
 }
 
 export interface L3TaskDef {
@@ -41,6 +42,7 @@ export interface L3TaskDef {
   prompt: string;
   rubricPoints: string[];
   referenceSolution?: string;
+  noModifyFiles: string[];
   objectiveChecks: L3ObjectiveCheck[];
   runtime: {
     timeoutSec: number;
@@ -62,6 +64,8 @@ export interface L3RunDetail {
   objectiveChecks: Array<{
     command: string;
     weightInto: string;
+    expectedExit: number;
+    actualExit: number;
     exitCode: number;
     stdoutTail: string;
   }>;
@@ -167,14 +171,47 @@ export function loadL3Task(yamlPath: string): L3TaskDef {
       throw new Error(`[${loc}] objective_checks[${i}] must be a mapping`);
     }
     const c = item as Record<string, unknown>;
-    const command = requireString(c, 'command', `${loc} objective_checks[${i}]`);
+    const command =
+      optionalString(c, 'command') ??
+      optionalString(c, 'cmd');
+    if (!command) {
+      throw new Error(
+        `[${loc} objective_checks[${i}]] field "command" or "cmd" must be a non-empty string`,
+      );
+    }
     const weightInto = requireString(
       c,
       'weight_into',
       `${loc} objective_checks[${i}]`,
     );
-    return { command, weightInto };
+    const expectedExitRaw = c['expected_exit'];
+    let expectedExit = 0;
+    if (expectedExitRaw !== undefined) {
+      if (
+        typeof expectedExitRaw !== 'number' ||
+        !Number.isInteger(expectedExitRaw) ||
+        expectedExitRaw < 0
+      ) {
+        throw new Error(
+          `[${loc} objective_checks[${i}]] expected_exit must be a non-negative integer`,
+        );
+      }
+      expectedExit = expectedExitRaw;
+    }
+    return { command, weightInto, expectedExit };
   });
+
+  const noModifyRaw = obj['no_modify_files'];
+  let noModifyFiles: string[] = [];
+  if (noModifyRaw !== undefined) {
+    if (
+      !Array.isArray(noModifyRaw) ||
+      !noModifyRaw.every((s) => typeof s === 'string' && s.length > 0)
+    ) {
+      throw new Error(`[${loc}] no_modify_files must be an array of non-empty strings`);
+    }
+    noModifyFiles = noModifyRaw as string[];
+  }
 
   const runtimeRaw = obj['runtime'];
   if (!runtimeRaw || typeof runtimeRaw !== 'object' || Array.isArray(runtimeRaw)) {
@@ -200,10 +237,19 @@ export function loadL3Task(yamlPath: string): L3TaskDef {
     prompt,
     rubricPoints,
     referenceSolution,
+    noModifyFiles,
     objectiveChecks,
     runtime: { timeoutSec, runs },
     sourcePath: yamlPath,
   };
+}
+
+function optionalString(
+  obj: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const v = obj[key];
+  return typeof v === 'string' && v.length > 0 ? v : undefined;
 }
 
 export function loadL3Tasks(tasksDir: string): L3TaskDef[] {
@@ -226,6 +272,8 @@ export function loadL3Tasks(tasksDir: string): L3TaskDef[] {
 interface ObjectiveCheckResult {
   command: string;
   weightInto: string;
+  expectedExit: number;
+  actualExit: number;
   exitCode: number;
   stdout: string;
 }
@@ -244,7 +292,9 @@ function runObjectiveCheck(
     return {
       command: check.command,
       weightInto: check.weightInto,
-      exitCode: 0,
+      expectedExit: check.expectedExit,
+      actualExit: 0,
+      exitCode: check.expectedExit === 0 ? 0 : 1,
       stdout,
     };
   } catch (err) {
@@ -254,8 +304,10 @@ function runObjectiveCheck(
     return {
       command: check.command,
       weightInto: check.weightInto,
-      exitCode,
-      stdout: out,
+      expectedExit: check.expectedExit,
+      actualExit: exitCode,
+      exitCode: exitCode === check.expectedExit ? 0 : exitCode || 1,
+      stdout: `expected_exit=${check.expectedExit} actual_exit=${exitCode}\n${out}`,
     };
   }
 }
@@ -289,9 +341,14 @@ async function runOnce(
 
     const diff: WorkspaceDiff = await collectDiff(ws.workdir);
 
-    const checkResults = task.objectiveChecks.map((c) =>
-      runObjectiveCheck(c, ws.workdir),
-    );
+    const checkResults = [
+      ...task.objectiveChecks,
+      ...task.noModifyFiles.map((file) => ({
+        command: `git diff --quiet HEAD -- ${shellQuote(file)}`,
+        weightInto: 'NoRegression',
+        expectedExit: 0,
+      })),
+    ].map((c) => runObjectiveCheck(c, ws.workdir));
 
     const judgeInput: JudgeInput = {
       taskDescription: `${task.id} - ${task.title}`,
@@ -326,6 +383,8 @@ async function runOnce(
       objectiveChecks: checkResults.map((c) => ({
         command: c.command,
         weightInto: c.weightInto,
+        expectedExit: c.expectedExit,
+        actualExit: c.actualExit,
         exitCode: c.exitCode,
         stdoutTail: (c.stdout ?? '').slice(-400),
       })),
@@ -335,6 +394,10 @@ async function runOnce(
   } finally {
     await ws.cleanup();
   }
+}
+
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
 // ─── Public entry ───

@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { BenchmarkReport, Level } from './types.js';
+import type { BenchmarkReport, Level, TaskResult } from './types.js';
 import { LEVEL_ORDER, LEVEL_CONFIG } from './types.js';
 
 // ─── Public API ───
@@ -26,11 +26,62 @@ export async function writeReport(
     for (const task of levelScore.tasks) {
       const filePath = path.join(perTaskDir, `${task.taskId}.json`);
       perTaskWrites.push(writeFile(filePath, JSON.stringify(task, null, 2), 'utf8'));
+      perTaskWrites.push(writeFile(
+        path.join(perTaskDir, `${task.taskId}.md`),
+        taskToMarkdown(task),
+        'utf8'
+      ));
     }
   }
   await Promise.all(perTaskWrites);
 
   return { jsonPath, mdPath };
+}
+
+function taskToMarkdown(task: TaskResult): string {
+  const lines: string[] = [];
+  lines.push(`# ${task.taskId}`);
+  if (task.skipped) {
+    lines.push('');
+    lines.push(`Skipped: ${task.skipReason ?? 'unknown reason'}`);
+    return lines.join('\n') + '\n';
+  }
+  lines.push('');
+  lines.push(`median=${formatScore(task.median)} passRate=${formatScore(task.passRate)} stability=${formatScore(task.stability)}`);
+  for (const run of task.runs) {
+    lines.push('');
+    lines.push(`## Run ${run.trace.runIndex}`);
+    lines.push(`hard=${run.hardPass ? 'pass' : 'fail'} raw=${formatScore(run.rawScore)} soft=${formatScore(run.softScore)}`);
+    lines.push(`compact=${run.trace.compactCount ?? 0} warnings=${run.trace.warningCount ?? 0} errors=${run.trace.errorCount ?? 0} repeatedTools=${run.trace.repeatedToolCallCount ?? 0}`);
+    lines.push(`ux=context ${run.trace.maxContextUsed ?? 0}/${run.trace.compactThreshold ?? 0}/${run.trace.contextWindow ?? 0} silentTools=${run.trace.maxSilentToolStreak ?? 0} progress=${run.trace.progressCount ?? 0}`);
+    if (run.trace.failureSummary) {
+      lines.push(`failureSummary=${truncate(run.trace.failureSummary.replace(/\s+/g, ' '), 160)}`);
+    }
+    if (run.hardResults.length > 0) {
+      lines.push('');
+      lines.push('Hard assertions:');
+      for (const h of run.hardResults) {
+        lines.push(`- ${h.passed ? 'PASS' : 'FAIL'} ${JSON.stringify(h.assertion)} — ${h.reason}`);
+      }
+    }
+    const judged = run.softResults.filter((s) => s.reason);
+    if (judged.length > 0) {
+      lines.push('');
+      lines.push('Judge notes:');
+      for (const s of judged) {
+        lines.push(`- score=${s.score === null ? 'null' : formatScore(s.score)} ${s.reason}`);
+      }
+    }
+    if ((run.trace.rounds ?? []).length > 0) {
+      lines.push('');
+      lines.push('Rounds:');
+      for (const r of run.trace.rounds ?? []) {
+        const tools = r.toolCalls.map((t) => t.name).join(', ') || 'none';
+        lines.push(`- #${r.roundIndex}: tools=[${tools}] compact=${r.compactCount} warn=${r.warningCount} err=${r.errorCount} answer=${truncate(r.finalText.replace(/\s+/g, ' '), 120)}`);
+      }
+    }
+  }
+  return lines.join('\n') + '\n';
 }
 
 export function formatDashboard(report: BenchmarkReport): string {
@@ -47,6 +98,9 @@ export function formatDashboard(report: BenchmarkReport): string {
   lines.push(`  Level:          L${formatScore(report.level)} / 5.0`);
   lines.push(`  Elapsed:        ${formatElapsed(report.elapsedMs)}`);
   lines.push('');
+  lines.push('  ─────── UX Redlines ───────');
+  for (const line of formatUxRedlines(report)) lines.push(line);
+  lines.push('');
   lines.push('  ─────── Levels ───────');
   for (const line of formatLevels(report)) lines.push(line);
   lines.push('');
@@ -56,6 +110,23 @@ export function formatDashboard(report: BenchmarkReport): string {
   lines.push(rule);
 
   return lines.join('\n');
+}
+
+function formatUxRedlines(report: BenchmarkReport): string[] {
+  const runs = LEVEL_ORDER
+    .flatMap((level) => report.byLevel[level]?.tasks ?? [])
+    .flatMap((task) => task.runs);
+  if (runs.length === 0) return ['  (no runs)'];
+  const maxSilent = Math.max(...runs.map((run) => run.trace.maxSilentToolStreak ?? 0));
+  const progressRuns = runs.filter((run) => (run.trace.progressCount ?? 0) > 0).length;
+  const maxWindow = Math.max(...runs.map((run) => run.trace.contextWindow ?? 0));
+  const failureSummaries = runs.filter((run) => run.trace.failureSummary).length;
+  return [
+    `  Context window max: ${maxWindow}`,
+    `  Max silent tools:   ${maxSilent}`,
+    `  Progress runs:      ${progressRuns}/${runs.length}`,
+    `  Failure summaries:  ${failureSummaries}/${runs.length}`,
+  ];
 }
 
 // ─── Internals ───
@@ -156,6 +227,10 @@ function formatTimestamp(iso: string): string {
   const hh = String(d.getHours()).padStart(2, '0');
   const mm = String(d.getMinutes()).padStart(2, '0');
   return `${y}-${mo}-${da} ${hh}:${mm}`;
+}
+
+function truncate(s: string, n: number): string {
+  return s.length <= n ? s : s.slice(0, n) + '…';
 }
 
 const LEVEL_NAMES: Record<Level, string> = {

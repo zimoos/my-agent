@@ -2,6 +2,7 @@ import { loadConfigDetailed, resolveConfigPath } from './config.js';
 import { connectMcpServer } from './mcp/client.js';
 import { createAgent } from './agent.js';
 import { createSessionStore } from './session/store.js';
+import { resolveModelCapabilities } from './provider/capabilities.js';
 import type { AgentConfig, McpConnection, Agent, McpServerConfig } from './mcp/types.js';
 
 export interface BootstrapOptions {
@@ -47,6 +48,8 @@ export async function bootstrap(
     // server unreachable, keep config as-is
   }
 
+  let lmStudioContextWindow: number | undefined;
+
   // Auto-detect context window from LM Studio native API
   if (!config.model.contextWindow) {
     try {
@@ -57,7 +60,7 @@ export async function bootstrap(
       };
       const found = data.data.find((m) => m.id === config.model.model);
       if (found?.max_context_length) {
-        config.model.contextWindow = found.max_context_length;
+        lmStudioContextWindow = found.max_context_length;
         process.stderr.write(
           `\x1b[33m[info] auto-detected context window: ${found.max_context_length}\x1b[0m\n`
         );
@@ -66,6 +69,10 @@ export async function bootstrap(
       // native API unavailable, use default
     }
   }
+
+  const capabilities = resolveModelCapabilities(config.model, { lmStudioContextWindow });
+  config.model.contextWindow = capabilities.contextWindow;
+  config.model.contextWindowSource = capabilities.contextWindowSource;
 
   const entries = Object.entries(config.mcpServers ?? {}) as Array<[string, McpServerConfig]>;
   const connections: McpConnection[] = [];

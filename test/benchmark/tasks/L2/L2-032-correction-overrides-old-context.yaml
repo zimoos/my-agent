@@ -1,0 +1,50 @@
+id: "L2-032"
+title: "多轮记忆：中途纠正覆盖旧结论"
+level: "L2"
+category: "multi-turn-memory"
+weight: 1.2
+
+fixture:
+  project: "simple-node-project"
+
+behavior_expectations:
+  - "用户明确更正后，最终答案必须遵循新约束"
+judge_rubric:
+  - "最终答案应以 Beta-9 为准，不能继续把 Alpha-1 当作有效结论"
+
+rounds:
+  - user: "先记住：发布代号是 Alpha-1。"
+  - user: "更正：Alpha-1 作废，发布代号改为 Beta-9。后续只能以 Beta-9 为准。"
+    judge_rubric:
+      - "应覆盖旧代号，而不是并列保留两个有效答案"
+  - user: "读一下 README，确认你还能处理项目文件。"
+    expect:
+      tool_calls_include: ["fs__read_file"]
+  - user: "最终发布代号是什么？只回答有效代号。"
+
+hard_assertions:
+  - type: tool_called
+    tool: "fs__read_file"
+    args_contains:
+      path: "README.md"
+  - type: final_text_contains
+    contains: "Beta-9"
+  - type: no_orphan_tool
+  - type: no_error_5xx
+
+soft_assertions:
+  - type: llm_judge
+    rubric: "是否正确处理用户纠正，并让新约束覆盖旧上下文"
+    weight: 0.6
+  - type: final_text_min_len
+    chars: 6
+    weight: 0.2
+  - type: tool_call_count_max
+    max: 4
+    weight: 0.2
+
+runtime:
+  timeout_sec: 260
+  runs: 5
+  max_rounds: null
+  layer: "L2"

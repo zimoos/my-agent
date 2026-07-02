@@ -1,0 +1,37 @@
+id: "L3-006"
+title: "Feature small: add note search"
+level: "L3"
+category: "feature-small"
+weight: 0.8
+
+fixture:
+  project: "feature-small-notes"
+
+prompt: |
+  给 notes 模块实现一个小需求：新增 `searchNotes(notes, query)`。
+  要求：
+  - 在 `src/notes.js` 中导出 `searchNotes`
+  - 根据 title 或 body 做大小写不敏感搜索
+  - query 前后空格要忽略
+  - 没有匹配返回空数组
+  - 不要修改测试文件
+  完成后运行 `npm test` 验证。
+
+rubric_points:
+  - "searchNotes 已导出且可被 tests/notes.test.js 使用"
+  - "搜索同时覆盖 title 和 body，且大小写不敏感"
+  - "query trim 后匹配，未匹配返回 []"
+  - "npm test 通过"
+  - "未修改 tests/notes.test.js"
+
+objective_checks:
+  - command: "npm test"
+    weight_into: "Correctness"
+  - command: "git diff --quiet HEAD -- tests/notes.test.js"
+    weight_into: "NoRegression"
+  - command: "grep -R \"searchNotes\" src/notes.js"
+    weight_into: "TaskCompletion"
+
+runtime:
+  timeout_sec: 240
+  runs: 3

@@ -28,7 +28,11 @@ export interface TaskDef {
   weight: number;
   fixture?: FixtureSpec;
   userInput?: string;
+  attachments?: AttachmentSpec[];
   rounds?: RoundDef[];
+  behaviorExpectations?: string[];
+  requires?: Requirement[];
+  judgeRubric?: string[];
   hardAssertions: HardAssertion[];
   softAssertions: SoftAssertion[];
   runtime: RuntimeSpec;
@@ -42,8 +46,18 @@ export interface FixtureSpec {
   setup?: string[];
 }
 
+export type Requirement = 'vision' | 'network' | 'write_access';
+
+export interface AttachmentSpec {
+  type: 'image';
+  path: string;
+  mime?: string;
+}
+
 export interface RoundDef {
   user: string;
+  attachments?: AttachmentSpec[];
+  judgeRubric?: string[];
   expect?: {
     toolCallsInclude?: string[];
   };
@@ -68,6 +82,17 @@ export type HardAssertion =
   | { type: 'tool_called'; tool?: string; toolMatches?: string; argsContains?: Record<string, unknown>; argsMatches?: Record<string, string> }
   | { type: 'tool_not_called'; tool?: string; toolMatches?: string }
   | { type: 'tool_retry_max'; maxSameError: number }
+  | { type: 'no_orphan_tool' }
+  | { type: 'compact_count_min'; min: number }
+  | { type: 'compact_count_max'; max: number }
+  | { type: 'context_window_min'; min: number }
+  | { type: 'no_silent_tool_streak'; max: number }
+  | { type: 'progress_count_min'; min: number }
+  | { type: 'compact_failure_has_user_summary' }
+  | { type: 'task_failure_has_actionable_summary' }
+  | { type: 'tool_call_count_by_round'; round: number; min?: number; max?: number; tool?: string; toolMatches?: string }
+  | { type: 'final_text_mentions_uncertainty_or_question' }
+  | { type: 'no_repeat_read_same_file_after_context_available'; maxReads?: number }
   | { type: 'file_content'; path: string; contains?: string; notContains?: string; regex?: string; exact?: string }
   | { type: 'file_exists'; path: string }
   | { type: 'not_file_modified'; path: string }
@@ -98,6 +123,7 @@ export interface SoftResult {
   assertion: SoftAssertion;
   score: number | null;
   weight: number;
+  reason?: string;
 }
 
 // ─── Dimensions (M1 records but doesn't score) ───
@@ -109,12 +135,29 @@ export type Dimension = 'ToolAcc' | 'TaskDone' | 'AnsQual' | 'CtxKeep' | 'ErrRec
 export interface RunTrace {
   taskId: string;
   runIndex: number;
+  freshness?: RunFreshness;
   events: AgentEvent[];
   toolCalls: ToolCallRecord[];
+  rounds?: RoundTrace[];
   finalText: string;
   messagesCount: number;
   thinkingMs: number;
   apiCalls: number;
+  compactCount?: number;
+  contextRecallCount?: number;
+  contextWindow?: number;
+  compactThreshold?: number;
+  maxContextUsed?: number;
+  maxSilentToolStreak?: number;
+  progressCount?: number;
+  failureSummary?: string;
+  warningCount?: number;
+  errorCount?: number;
+  repeatedToolCallCount?: number;
+  toolProtocol?: {
+    orphanToolResults: number;
+    unclosedToolCalls: number;
+  };
   startedAt: number;
   elapsedMs: number;
   hitMaxLoops: boolean;
@@ -123,11 +166,34 @@ export interface RunTrace {
   crashReason?: string;
 }
 
+export interface RunFreshness {
+  runId: string;
+  seed: string;
+  caseId: string;
+  workspaceId: string;
+  fixtureProject?: string;
+  fixtureFingerprint?: string;
+  promptFingerprint: string;
+  mode: 'static-regression-isolated-workspace';
+}
+
 export interface ToolCallRecord {
   name: string;
   args: Record<string, unknown>;
   ok: boolean;
   resultPreview: string;
+  roundIndex?: number;
+}
+
+export interface RoundTrace {
+  roundIndex: number;
+  user: string;
+  toolCalls: ToolCallRecord[];
+  finalText: string;
+  compactCount: number;
+  warningCount: number;
+  errorCount: number;
+  elapsedMs: number;
 }
 
 // ─── Scoring ───
@@ -140,6 +206,8 @@ export interface TaskScore {
   hardResults: HardAssertionResult[];
   softResults: SoftResult[];
   trace: RunTrace;
+  skipped?: boolean;
+  skipReason?: string;
 }
 
 export interface TaskResult {
@@ -149,6 +217,8 @@ export interface TaskResult {
   median: number;
   stability: number;
   passRate: number;
+  skipped?: boolean;
+  skipReason?: string;
 }
 
 export interface LevelScore {
@@ -161,6 +231,7 @@ export interface LevelScore {
 
 export interface BenchmarkReport {
   runId: string;
+  freshness?: BenchmarkFreshness;
   config: { agent: string; model: string; baseURL: string };
   totalScore: number;
   level: number;
@@ -168,6 +239,14 @@ export interface BenchmarkReport {
   weakest: Array<{ taskId: string; median: number; reason: string }>;
   startedAt: string;
   elapsedMs: number;
+}
+
+export interface BenchmarkFreshness {
+  seed: string;
+  mode: 'static-regression-isolated-workspace';
+  taskSelectionFingerprint: string;
+  semanticVariation: 'static-regression';
+  notes: string[];
 }
 
 // ─── Run Options (CLI → runner) ───

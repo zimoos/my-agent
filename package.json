@@ -39,6 +39,7 @@
     "marked": "^15.0.12",
     "marked-terminal": "^7.3.0",
     "openai": "^4.76.0",
+    "p-retry": "^8.0.0",
     "parse-diff": "^0.12.0",
     "picocolors": "^1.1.1",
     "react": "^19.2.5",

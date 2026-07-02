@@ -1,0 +1,17 @@
+# Codex CLI adapter
+# Requires a logged-in local Codex CLI. Uses real codex exec against the prepared workspace.
+name: codex
+version: local
+underlying_model: codex-default
+command: codex
+args:
+  - exec
+  - --cd
+  - ${WORKDIR}
+  - --sandbox
+  - workspace-write
+  - --skip-git-repo-check
+  - --color
+  - never
+  - ${PROMPT}
+timeout_sec: 900

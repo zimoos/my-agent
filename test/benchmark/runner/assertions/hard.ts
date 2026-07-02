@@ -31,6 +31,28 @@ function evaluateOne(
       return checkToolNotCalled(a, trace);
     case 'tool_retry_max':
       return checkToolRetryMax(a, trace);
+    case 'no_orphan_tool':
+      return checkNoOrphanTool(a, trace);
+    case 'compact_count_min':
+      return checkCompactCountMin(a, trace);
+    case 'compact_count_max':
+      return checkCompactCountMax(a, trace);
+    case 'context_window_min':
+      return checkContextWindowMin(a, trace);
+    case 'no_silent_tool_streak':
+      return checkNoSilentToolStreak(a, trace);
+    case 'progress_count_min':
+      return checkProgressCountMin(a, trace);
+    case 'compact_failure_has_user_summary':
+      return checkCompactFailureHasUserSummary(a, trace);
+    case 'task_failure_has_actionable_summary':
+      return checkTaskFailureHasActionableSummary(a, trace);
+    case 'tool_call_count_by_round':
+      return checkToolCallCountByRound(a, trace);
+    case 'final_text_mentions_uncertainty_or_question':
+      return checkFinalTextMentionsUncertaintyOrQuestion(a, trace);
+    case 'no_repeat_read_same_file_after_context_available':
+      return checkNoRepeatReadSameFile(a, trace);
     case 'file_content':
       return checkFileContent(a, cwd);
     case 'file_exists':
@@ -52,6 +74,184 @@ function evaluateOne(
   }
 }
 
+// ─── 3b. no_orphan_tool ───
+
+function checkNoOrphanTool(
+  a: Extract<HardAssertion, { type: 'no_orphan_tool' }>,
+  trace: RunTrace
+): HardAssertionResult {
+  const orphan = trace.toolProtocol?.orphanToolResults ?? 0;
+  const unclosed = trace.toolProtocol?.unclosedToolCalls ?? 0;
+  if (orphan === 0 && unclosed === 0) {
+    return { assertion: a, passed: true, reason: 'tool protocol events are paired' };
+  }
+  return {
+    assertion: a,
+    passed: false,
+    reason: `orphan tool results=${orphan}, unclosed tool calls=${unclosed}`,
+  };
+}
+
+// ─── 3c. compact_count_min/max ───
+
+function checkCompactCountMin(
+  a: Extract<HardAssertion, { type: 'compact_count_min' }>,
+  trace: RunTrace
+): HardAssertionResult {
+  const count = trace.compactCount ?? 0;
+  if (count >= a.min) return { assertion: a, passed: true, reason: `${count} ≥ ${a.min}` };
+  return { assertion: a, passed: false, reason: `${count} < ${a.min}` };
+}
+
+function checkCompactCountMax(
+  a: Extract<HardAssertion, { type: 'compact_count_max' }>,
+  trace: RunTrace
+): HardAssertionResult {
+  const count = trace.compactCount ?? 0;
+  if (count <= a.max) return { assertion: a, passed: true, reason: `${count} ≤ ${a.max}` };
+  return { assertion: a, passed: false, reason: `${count} > ${a.max}` };
+}
+
+function checkContextWindowMin(
+  a: Extract<HardAssertion, { type: 'context_window_min' }>,
+  trace: RunTrace
+): HardAssertionResult {
+  const actual = trace.contextWindow ?? 0;
+  if (actual >= a.min) {
+    return { assertion: a, passed: true, reason: `contextWindow ${actual} >= ${a.min}` };
+  }
+  return { assertion: a, passed: false, reason: `contextWindow ${actual} < ${a.min}` };
+}
+
+function checkNoSilentToolStreak(
+  a: Extract<HardAssertion, { type: 'no_silent_tool_streak' }>,
+  trace: RunTrace
+): HardAssertionResult {
+  const actual = trace.maxSilentToolStreak ?? 0;
+  if (actual <= a.max) {
+    return { assertion: a, passed: true, reason: `max silent tool streak ${actual} <= ${a.max}` };
+  }
+  return { assertion: a, passed: false, reason: `max silent tool streak ${actual} > ${a.max}` };
+}
+
+function checkProgressCountMin(
+  a: Extract<HardAssertion, { type: 'progress_count_min' }>,
+  trace: RunTrace
+): HardAssertionResult {
+  const actual = trace.progressCount ?? 0;
+  if (actual >= a.min) {
+    return { assertion: a, passed: true, reason: `progressCount ${actual} >= ${a.min}` };
+  }
+  return { assertion: a, passed: false, reason: `progressCount ${actual} < ${a.min}` };
+}
+
+function checkCompactFailureHasUserSummary(
+  a: Extract<HardAssertion, { type: 'compact_failure_has_user_summary' }>,
+  trace: RunTrace
+): HardAssertionResult {
+  const failure = trace.events.find(
+    (ev) =>
+      ev.type === 'task:failed' &&
+      /context|compact|compaction|上下文/i.test(ev.error)
+  );
+  if (!failure) {
+    return { assertion: a, passed: false, reason: 'no compact/context failure observed' };
+  }
+  return checkActionableSummary(a, trace, 'compact/context failure');
+}
+
+function checkTaskFailureHasActionableSummary(
+  a: Extract<HardAssertion, { type: 'task_failure_has_actionable_summary' }>,
+  trace: RunTrace
+): HardAssertionResult {
+  const failed = trace.events.some((ev) => ev.type === 'task:failed');
+  const toolErrors = trace.errorCount ?? 0;
+  if (!failed && toolErrors === 0) {
+    return { assertion: a, passed: true, reason: 'no task/tool failure observed' };
+  }
+  return checkActionableSummary(a, trace, failed ? 'task failure' : 'tool failure');
+}
+
+function checkActionableSummary(
+  assertion: HardAssertion,
+  trace: RunTrace,
+  label: string
+): HardAssertionResult {
+  const summary = trace.failureSummary ?? trace.finalText;
+  const markers = ['已完成', '失败点', '下一步', '建议', '需要', '请'].filter((m) => summary.includes(m));
+  const actionable = summary.length >= 25 && markers.length >= 2;
+  if (actionable) {
+    return { assertion, passed: true, reason: `${label} has actionable summary` };
+  }
+  return {
+    assertion,
+    passed: false,
+    reason: `${label} missing actionable summary; got: ${truncate(summary, 160)}`,
+  };
+}
+
+// ─── 3d. tool_call_count_by_round ───
+
+function checkToolCallCountByRound(
+  a: Extract<HardAssertion, { type: 'tool_call_count_by_round' }>,
+  trace: RunTrace
+): HardAssertionResult {
+  const round = (trace.rounds ?? []).find((r) => r.roundIndex === a.round);
+  if (!round) {
+    return { assertion: a, passed: false, reason: `round ${a.round} not found` };
+  }
+  const count = round.toolCalls.filter((tc) => matchToolName(tc, a.tool, a.toolMatches)).length;
+  if (a.min !== undefined && count < a.min) {
+    return { assertion: a, passed: false, reason: `round ${a.round}: ${count} < min ${a.min}` };
+  }
+  if (a.max !== undefined && count > a.max) {
+    return { assertion: a, passed: false, reason: `round ${a.round}: ${count} > max ${a.max}` };
+  }
+  return { assertion: a, passed: true, reason: `round ${a.round}: count=${count}` };
+}
+
+// ─── 3e. uncertainty / question ───
+
+function checkFinalTextMentionsUncertaintyOrQuestion(
+  a: Extract<HardAssertion, { type: 'final_text_mentions_uncertainty_or_question' }>,
+  trace: RunTrace
+): HardAssertionResult {
+  const pattern = /[?？]|不确定|无法确定|需要确认|请确认|请提供|需要你|还需要|clarify|confirm|need more/i;
+  if (pattern.test(trace.finalText)) {
+    return { assertion: a, passed: true, reason: 'final text asks/acknowledges uncertainty' };
+  }
+  return {
+    assertion: a,
+    passed: false,
+    reason: `final text does not ask or mention uncertainty; tail: ${truncate(trace.finalText.slice(-160), 160)}`,
+  };
+}
+
+// ─── 3f. no_repeat_read_same_file_after_context_available ───
+
+function checkNoRepeatReadSameFile(
+  a: Extract<HardAssertion, { type: 'no_repeat_read_same_file_after_context_available' }>,
+  trace: RunTrace
+): HardAssertionResult {
+  const maxReads = a.maxReads ?? 1;
+  const counts = new Map<string, number>();
+  for (const tc of trace.toolCalls) {
+    if (!isReadFileTool(tc.name)) continue;
+    const p = readPathArg(tc.args);
+    if (!p) continue;
+    counts.set(p, (counts.get(p) ?? 0) + 1);
+  }
+  const offenders = [...counts.entries()].filter(([, count]) => count > maxReads);
+  if (offenders.length === 0) {
+    return { assertion: a, passed: true, reason: `no file read more than ${maxReads} time(s)` };
+  }
+  return {
+    assertion: a,
+    passed: false,
+    reason: offenders.map(([p, count]) => `${p} read ${count}x`).join('; '),
+  };
+}
+
 // ─── Matchers ───
 
 function matchToolName(record: ToolCallRecord, tool?: string, toolMatches?: string): boolean {
@@ -69,8 +269,9 @@ function matchPath(actual: unknown, expected: unknown): boolean {
   const na = normalizePath(actual);
   const ne = normalizePath(expected);
   if (na === ne) return true;
-  if (typeof expected === 'string' && !expected.includes('/') && typeof actual === 'string') {
-    return na.endsWith('/' + ne) || na === ne;
+  if (typeof expected === 'string' && typeof actual === 'string') {
+    const expectedIsAbsolute = path.isAbsolute(expected);
+    if (!expectedIsAbsolute && (na.endsWith('/' + ne) || na === ne)) return true;
   }
   return false;
 }
@@ -364,6 +565,15 @@ function stableStringify(obj: Record<string, unknown>): string {
   const sorted: Record<string, unknown> = {};
   for (const k of keys) sorted[k] = obj[k];
   return JSON.stringify(sorted);
+}
+
+function isReadFileTool(name: string): boolean {
+  return /(^|__)read_file$/.test(name) || /(^|__)readFile$/.test(name);
+}
+
+function readPathArg(args: Record<string, unknown>): string {
+  const raw = args.path ?? args.file ?? args.filePath;
+  return typeof raw === 'string' ? normalizePath(raw) : '';
 }
 
 function describeToolFilter(

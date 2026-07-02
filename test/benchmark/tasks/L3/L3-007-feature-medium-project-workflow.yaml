@@ -1,0 +1,37 @@
+id: "L3-007"
+title: "Feature medium: move tasks and summarize projects"
+level: "L3"
+category: "feature-medium"
+weight: 1.0
+
+fixture:
+  project: "feature-medium-projects"
+
+prompt: |
+  给项目任务模块实现一个中等需求：支持跨项目移动任务，并返回项目摘要。
+  具体要求：
+  - 在 `src/projects.js` 中实现并导出 `moveTask(workspace, taskId, targetProjectId)`
+  - 任务移动后必须从原项目移除，并加入目标项目，任务数据不能丢
+  - task 不存在时报 `task not found`，project 不存在时报 `project not found`
+  - 实现并导出 `projectSummary(workspace)`，返回每个项目的 total/open/done 计数
+  - 不要修改测试文件
+  完成后运行 `npm test`。
+
+rubric_points:
+  - "moveTask 完成跨项目移动并保持任务对象数据"
+  - "错误路径清晰，且失败时不破坏 workspace"
+  - "projectSummary 输出稳定结构和正确计数"
+  - "npm test 通过"
+  - "未修改 tests/projects.test.js"
+
+objective_checks:
+  - command: "npm test"
+    weight_into: "Correctness"
+  - command: "git diff --quiet HEAD -- tests/projects.test.js"
+    weight_into: "NoRegression"
+  - command: "grep -R \"projectSummary\" src/projects.js && grep -R \"moveTask\" src/projects.js"
+    weight_into: "TaskCompletion"
+
+runtime:
+  timeout_sec: 300
+  runs: 3

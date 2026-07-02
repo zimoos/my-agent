@@ -1,0 +1,53 @@
+id: "L2-037"
+title: "上下文压力：长多轮后召回最早事实"
+level: "L2"
+category: "context-compact"
+weight: 1.2
+
+fixture:
+  project: "simple-node-project"
+
+behavior_expectations:
+  - "长多轮之后仍应保留第一轮关键事实"
+judge_rubric:
+  - "最终答案必须包含锚点 ZX-418，不应被后续噪声覆盖"
+
+rounds:
+  - user: "关键锚点是 ZX-418。后面我会给很多无关背景，最后你需要准确回忆这个锚点。"
+  - user: "背景 A：这是一段用于压测上下文的说明，包含很多实现讨论、命名方案、部署注意事项和版本计划，但这些都不是关键锚点。请只做简短确认。"
+  - user: "背景 B：我们讨论过 agent 的工具稳定性、上下文池、压缩、报告格式、judge 分数、trace 字段和 gate 规则。这些内容都不改变最早的锚点。"
+  - user: "背景 C：如果后续信息很多，仍然要优先保留用户显式标记为关键的信息。现在继续保持上下文。"
+  - user: "读一下 README 第一行，确认你还能处理项目文件。"
+    expect:
+      tool_calls_include: ["fs__read_file"]
+  - user: "背景 D：再补充一段无关内容，包含 L1、L2、L3、工具协议、hard assertion、soft assertion、报告、跳过能力和可选图片任务。"
+  - user: "现在不要读文件，直接回答最早的关键锚点是什么。"
+
+hard_assertions:
+  - type: tool_called
+    tool: "fs__read_file"
+    args_contains:
+      path: "README.md"
+  - type: final_text_contains
+    contains: "ZX-418"
+  - type: compact_count_max
+    max: 5
+  - type: no_orphan_tool
+  - type: no_error_5xx
+
+soft_assertions:
+  - type: llm_judge
+    rubric: "是否在长上下文压力下保留第一轮关键事实"
+    weight: 0.6
+  - type: tool_call_count_max
+    max: 3
+    weight: 0.2
+  - type: duration_max
+    ms: 260000
+    weight: 0.2
+
+runtime:
+  timeout_sec: 320
+  runs: 5
+  max_rounds: null
+  layer: "L2"

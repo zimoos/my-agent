@@ -124,8 +124,8 @@ test('loadAdapter: 文件不存在应抛错', () => {
   assert.throws(() => loadAdapter('/nonexistent/adapter.yaml'), /not found/);
 });
 
-test('loadAdapter: 项目内三个示例 YAML 全部可加载', () => {
-  for (const name of ['ma.yaml', 'claude-code.yaml', 'echo-mock.yaml']) {
+test('loadAdapter: 项目内示例 YAML 全部可加载', () => {
+  for (const name of ['ma.yaml', 'claude-code.yaml', 'codex.yaml', 'echo-mock.yaml']) {
     const p = path.join(ADAPTERS_DIR, name);
     const cfg = loadAdapter(p);
     assert.ok(cfg.name.length > 0, `${name} name`);

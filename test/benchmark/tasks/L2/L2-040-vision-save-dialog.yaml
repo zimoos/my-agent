@@ -1,0 +1,48 @@
+id: "L2-040"
+title: "图片识别：UI 表单失败原因"
+level: "L2"
+category: "vision"
+weight: 0.8
+
+fixture:
+  project: "vision-ui"
+
+requires:
+  - "vision"
+attachments:
+  - type: "image"
+    path: "assets/save-dialog.svg"
+    mime: "image/svg+xml"
+
+behavior_expectations:
+  - "应定位 UI 中导致保存失败的具体字段"
+  - "不能只给通用排查建议"
+judge_rubric:
+  - "最终回答应指出文件名为空或 File name required，并说明 Save 不能继续"
+
+user_input: "看这张 UI 图，为什么保存不了？应该先让用户做什么？"
+
+hard_assertions:
+  - type: final_text_contains
+    regex: "文件名|File name|empty|Required"
+  - type: final_text_min_chars
+    chars: 20
+  - type: no_orphan_tool
+  - type: no_error_5xx
+
+soft_assertions:
+  - type: llm_judge
+    rubric: "是否准确识别表单保存失败的根因，并给出第一步处理"
+    weight: 0.7
+  - type: final_text_min_len
+    chars: 30
+    weight: 0.2
+  - type: duration_max
+    ms: 180000
+    weight: 0.1
+
+runtime:
+  timeout_sec: 220
+  runs: 3
+  max_rounds: null
+  layer: "L2"

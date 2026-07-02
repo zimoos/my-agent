@@ -33,6 +33,15 @@ weight: 10
 user_input: 请阅读 README 并总结三点
 fixture:
   project: demo-project
+attachments:
+  - type: image
+    path: screenshots/home.png
+requires:
+  - vision
+behavior_expectations:
+  - 信息不足时先提问
+judge_rubric:
+  - 是否稳定保留上下文
 runtime:
   timeout_sec: 30
   runs: 5
@@ -44,6 +53,13 @@ hard_assertions:
   - type: final_text_min_chars
     chars: 20
     chinese: true
+  - type: context_window_min
+    min: 1000000
+  - type: no_silent_tool_streak
+    max: 4
+  - type: progress_count_min
+    min: 1
+  - type: task_failure_has_actionable_summary
 soft_assertions:
   - type: final_text_min_len
     chars: 100
@@ -85,6 +101,10 @@ fixture:
     - npm install
 rounds:
   - user: 打开 index.js
+    judge_rubric:
+      - 必须先读文件
+    attachments:
+      - path: screenshots/code.png
     expect:
       tool_calls_include:
         - readFile
@@ -154,8 +174,14 @@ test('loads valid L0/L1/L2 tasks with camelCase conversion', () => {
   const l1 = byId['L1-001'];
   assert.equal(l1.userInput, '请阅读 README 并总结三点');
   assert.equal(l1.fixture?.project, 'demo-project');
+  assert.deepEqual(l1.requires, ['vision']);
+  assert.deepEqual(l1.behaviorExpectations, ['信息不足时先提问']);
+  assert.deepEqual(l1.judgeRubric, ['是否稳定保留上下文']);
+  assert.deepEqual(l1.attachments, [
+    { type: 'image', path: 'screenshots/home.png', mime: undefined },
+  ]);
   assert.equal(l1.runtime.maxRounds, null);
-  assert.equal(l1.hardAssertions.length, 2);
+  assert.equal(l1.hardAssertions.length, 6);
   assert.equal(l1.softAssertions.length, 3);
   // camelCase-converted final_text_min_chars
   const minChars = l1.hardAssertions.find((h) => h.type === 'final_text_min_chars');
@@ -164,11 +190,31 @@ test('loads valid L0/L1/L2 tasks with camelCase conversion', () => {
     assert.equal(minChars.chars, 20);
     assert.equal(minChars.chinese, true);
   }
+  assert.deepEqual(
+    l1.hardAssertions.find((h) => h.type === 'context_window_min'),
+    { type: 'context_window_min', min: 1000000 }
+  );
+  assert.deepEqual(
+    l1.hardAssertions.find((h) => h.type === 'no_silent_tool_streak'),
+    { type: 'no_silent_tool_streak', max: 4 }
+  );
+  assert.deepEqual(
+    l1.hardAssertions.find((h) => h.type === 'progress_count_min'),
+    { type: 'progress_count_min', min: 1 }
+  );
+  assert.deepEqual(
+    l1.hardAssertions.find((h) => h.type === 'task_failure_has_actionable_summary'),
+    { type: 'task_failure_has_actionable_summary' }
+  );
 
   // L2 multi-round + setup + dimWeights + reference
   const l2 = byId['L2-001'];
   assert.equal(l2.userInput, undefined);
   assert.equal(l2.rounds?.length, 2);
+  assert.deepEqual(l2.rounds?.[0].judgeRubric, ['必须先读文件']);
+  assert.deepEqual(l2.rounds?.[0].attachments, [
+    { type: 'image', path: 'screenshots/code.png', mime: undefined },
+  ]);
   assert.deepEqual(l2.rounds?.[0].expect?.toolCallsInclude, ['readFile']);
   assert.deepEqual(l2.fixture?.setup, ['npm install']);
   assert.equal(l2.reference?.referenceRounds, 4);
@@ -364,6 +410,34 @@ test('filters by --level and --task', () => {
   });
   assert.deepEqual(noMatch.errors, []);
   assert.equal(noMatch.tasks.length, 0);
+});
+
+test('default load ignores L3 directory because L3 uses a separate schema', () => {
+  const root = mkTmp();
+  const fixturesRoot = path.join(root, 'fixtures');
+  mkFixtureDir(fixturesRoot, 'demo-project');
+  const tasksDir = path.join(root, 'tasks');
+  writeYaml(tasksDir, 'L1/readme.yaml', VALID_L1_YAML);
+  writeYaml(
+    tasksDir,
+    'L3/l3-task.yaml',
+    `
+id: L3-001
+title: separate schema
+level: L3
+category: implement
+weight: 1
+prompt: "L3 tasks do not use user_input"
+runtime:
+  timeout_sec: 10
+  runs: 1
+`
+  );
+
+  const { tasks, errors } = loadTasks({ tasksDir, fixturesDir: fixturesRoot });
+  assert.deepEqual(errors, []);
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].id, 'L1-001');
 });
 
 test('resolves fixture from e2eFixturesDir when fixturesDir misses', () => {

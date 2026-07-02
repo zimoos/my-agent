@@ -7,14 +7,28 @@ interface StatusBarProps {
   debug?: boolean;
   contextUsed?: number;
   contextTotal?: number;
+  contextThreshold?: number;
+  contextSource?: string;
 }
 
-export function StatusBar({ model, taskCount, debug, contextUsed, contextTotal }: StatusBarProps) {
+export function StatusBar({
+  model,
+  taskCount,
+  debug,
+  contextUsed,
+  contextTotal,
+  contextThreshold,
+  contextSource,
+}: StatusBarProps) {
   let ctxLabel = '';
   if (contextUsed != null && contextTotal && contextTotal > 0) {
-    const pct = Math.round((contextUsed / contextTotal) * 100);
-    const color = pct > 75 ? 'red' : pct > 50 ? 'yellow' : undefined;
-    ctxLabel = ` · ctx: ${Math.round(contextUsed / 1000)}k/${Math.round(contextTotal / 1000)}k (${pct}%)`;
+    const threshold = contextThreshold && contextThreshold > 0
+      ? contextThreshold
+      : contextTotal;
+    const pct = Math.round((contextUsed / threshold) * 100);
+    const color = pct > 100 ? 'red' : pct > 80 ? 'yellow' : undefined;
+    const source = contextSource ? ` ${contextSource}` : '';
+    ctxLabel = ` · ctx: ${formatK(contextUsed)}/${formatK(threshold)} trigger · win ${formatK(contextTotal)}${source}`;
     if (color) {
       return (
         <Text dimColor>
@@ -35,4 +49,9 @@ export function StatusBar({ model, taskCount, debug, contextUsed, contextTotal }
       {debug ? ' · 🔧 debug' : ''}
     </Text>
   );
+}
+
+function formatK(n: number): string {
+  if (n >= 1_000_000) return `${Math.round(n / 100_000) / 10}m`;
+  return `${Math.round(n / 1000)}k`;
 }

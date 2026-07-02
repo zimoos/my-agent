@@ -36,7 +36,7 @@ function hasRepeatedSuffix(
  * Parses an OpenAI-compatible streaming response.
  *
  * Yields token / thinking events as they arrive, and returns the final
- * aggregated content + tool calls when the stream ends.
+ * aggregated content + reasoning content + tool calls when the stream ends.
  */
 export class StreamParser {
   constructor(private readonly options: StreamParserOptions = {}) {}

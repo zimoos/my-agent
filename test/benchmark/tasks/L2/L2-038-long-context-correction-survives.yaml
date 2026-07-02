@@ -1,0 +1,55 @@
+id: "L2-038"
+title: "上下文压力：压测后更正仍然生效"
+level: "L2"
+category: "context-compact"
+weight: 1.2
+
+fixture:
+  project: "simple-node-project"
+
+behavior_expectations:
+  - "中途用户纠正必须覆盖更早事实，即使后续上下文较长"
+judge_rubric:
+  - "最终答案应使用 Final-22，不能把 Draft-11 当作最终有效版本"
+
+rounds:
+  - user: "当前计划版本先记为 Draft-11。"
+  - user: "背景：我们会评估多轮对话、工具调用、上下文压缩、任务质量、错误恢复和长任务执行。请简短确认。"
+  - user: "更正：Draft-11 只是草案，最终计划版本是 Final-22。后面以 Final-22 为准。"
+    judge_rubric:
+      - "应明确新版本覆盖旧版本"
+  - user: "背景：继续讨论测试门禁，包括 no orphan tool、max loops、schema error、危险操作越权和重复读取。"
+  - user: "读一下 package.json 的 name 字段。"
+    expect:
+      tool_calls_include: ["fs__read_file"]
+  - user: "背景：再补充 judge 关注完成度、正确性、完整性、边界意识、效率和无回归。"
+  - user: "最终计划版本是什么？只回答有效版本。"
+
+hard_assertions:
+  - type: tool_called
+    tool: "fs__read_file"
+    args_contains:
+      path: "package.json"
+  - type: final_text_contains
+    contains: "Final-22"
+  - type: compact_count_max
+    max: 5
+  - type: no_orphan_tool
+  - type: no_error_5xx
+
+soft_assertions:
+  - type: llm_judge
+    rubric: "是否在长上下文和中途纠正后遵守最新有效事实"
+    weight: 0.6
+  - type: final_text_min_len
+    chars: 8
+    weight: 0.2
+  - type: duration_max
+    ms: 260000
+    weight: 0.2
+
+runtime:
+  timeout_sec: 320
+  runs: 5
+  max_rounds: null
+  layer: "L2"

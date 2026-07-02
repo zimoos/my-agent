@@ -554,8 +554,10 @@ export function createContextManager(
       const source = index.find((entry) => entry.i === item.i);
       const content = activeItemContent(item, index);
 
-      // Assistant message with tool_calls but no text — keep for pairing
-      if (!content && source?.toolCalls?.length) {
+      // Assistant tool_calls must be replayed as a protocol pair with the
+      // following tool result. Keep them even when the assistant also emitted
+      // visible text; otherwise providers reject the orphan tool message.
+      if (source?.toolCalls?.length) {
         out.push({
           role: 'assistant',
           content: null,

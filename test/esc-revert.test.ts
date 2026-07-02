@@ -84,7 +84,9 @@ test('message store: request builder keeps full transcript and suffix', () => {
   const request = store.buildRequestMessages('[active context]');
 
   assert.equal(request[0].role, 'system');
-  assert.match(String(request[0].content), /\[active context\]/);
+  assert.equal(request[0].content, 'sys');
+  assert.equal(request.at(-1)?.role, 'system');
+  assert.match(String(request.at(-1)?.content), /\[active context\]/);
   assert.ok(
     request.some((m) => m.role === 'user' && m.content === 'original task'),
     'request must retain the original user message'

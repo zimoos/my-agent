@@ -53,6 +53,41 @@ test('collectEvents: text event also contributes to finalText (fallback source)'
   assert.equal(trace.finalText, 'stream-part-and-fallback');
 });
 
+test('collectEvents: records context usage, progress and silent tool streak', async () => {
+  const gen = fromArray([
+    { type: 'context:usage', used: 25_000, total: 1_000_000, compactThreshold: 750_000, source: 'registry' },
+    { type: 'tool:call', name: 'read_file', args: { path: 'a.ts' } },
+    { type: 'tool:result', ok: true, content: 'a' },
+    { type: 'tool:call', name: 'read_file', args: { path: 'b.ts' } },
+    { type: 'tool:result', ok: true, content: 'b' },
+    { type: 'progress', message: '已执行 2 个工具调用，最近：read_file b.ts 完成。继续基于这些结果推进。' },
+    { type: 'tool:call', name: 'grep', args: { pattern: 'x' } },
+    { type: 'tool:result', ok: true, content: 'x' },
+  ]);
+
+  const trace = await collectEvents(gen, 't', 0);
+  assert.equal(trace.contextWindow, 1_000_000);
+  assert.equal(trace.compactThreshold, 750_000);
+  assert.equal(trace.maxContextUsed, 25_000);
+  assert.equal(trace.progressCount, 1);
+  assert.equal(trace.maxSilentToolStreak, 2);
+});
+
+test('collectEvents: task failure captures actionable failure summary', async () => {
+  const summary = '[失败总结]\n已完成：已执行 4 个工具调用。\n失败点：provider timeout\n下一步：建议检查 provider。';
+  const trace = await collectEvents(
+    fromArray([
+      { type: 'text', content: summary },
+      { type: 'task:failed', taskId: 't', error: 'provider timeout' },
+    ]),
+    't',
+    0
+  );
+
+  assert.equal(trace.failureSummary, summary);
+  assert.equal(trace.errorCount, 1);
+});
+
 test('collectEvents: tool:call + tool:result pair into ToolCallRecord (order preserved)', async () => {
   const gen = fromArray([
     { type: 'tool:call', name: 'read_file', args: { path: 'a.ts' } },
@@ -103,6 +138,7 @@ test('collectEvents: orphan tool:result produces <unknown>', async () => {
   assert.equal(trace.toolCalls.length, 1);
   assert.equal(trace.toolCalls[0].name, '<unknown>');
   assert.equal(trace.toolCalls[0].ok, false);
+  assert.equal(trace.toolProtocol?.orphanToolResults, 1);
 });
 
 test('collectEvents: resultPreview truncates at 200 chars', async () => {
@@ -225,6 +261,35 @@ test('collectEvents: apiCalls counts tool:call + task:done', async () => {
   assert.equal(trace.apiCalls, 3);
 });
 
+test('collectEvents: records round, compact, warning, error and unclosed tool metrics', async () => {
+  const gen = fromArray([
+    { type: 'tool:call', name: 'fs__read_file', args: { path: 'README.md' } },
+    { type: 'tool:result', ok: true, content: 'readme' },
+    { type: 'tool:call', name: 'fs__read_file', args: { path: 'README.md' } },
+    { type: 'tool:result', ok: true, content: 'readme again' },
+    { type: 'tool:call', name: 'context_recall', args: { query: 'first constraint' } },
+    { type: 'tool:result', ok: false, content: 'miss' },
+    { type: 'tool:call', name: 'shell', args: { cmd: 'ma ctx recall abc' } },
+    { type: 'compact:done', freed: 1200 },
+    { type: 'warning', message: 'near limit' },
+    { type: 'token', text: 'done' },
+  ]);
+
+  const trace = await collectEvents(gen, 'T', 1, { index: 2, user: 'round text' });
+
+  assert.equal(trace.compactCount, 1);
+  assert.equal(trace.contextRecallCount, 2);
+  assert.equal(trace.warningCount, 1);
+  assert.equal(trace.errorCount, 1);
+  assert.equal(trace.repeatedToolCallCount, 1);
+  assert.equal(trace.toolProtocol?.unclosedToolCalls, 1);
+  assert.equal(trace.rounds?.length, 1);
+  assert.equal(trace.rounds?.[0].roundIndex, 2);
+  assert.equal(trace.rounds?.[0].user, 'round text');
+  assert.equal(trace.rounds?.[0].finalText, 'done');
+  assert.equal(trace.toolCalls.every((tc) => tc.roundIndex === 2), true);
+});
+
 test('collectEvents: complete realistic run — token stream + tools + thinking + done', async () => {
   const gen = fromArray([
     { type: 'task:start', taskId: 't', prompt: '分析项目' },
@@ -302,6 +367,45 @@ test('mergeTraces: concatenates events, toolCalls, sums counters, ORs flags', as
   assert.equal(m.hitMaxLoops, true);
   assert.equal(m.aborted, false);
   assert.equal(m.crashed, false);
+});
+
+test('mergeTraces: combines behavior metrics and round traces', async () => {
+  const t1 = await collectEvents(
+    fromArray([
+      { type: 'tool:call', name: 'fs__read_file', args: { path: 'a.ts' } },
+      { type: 'tool:result', ok: true, content: 'a' },
+      { type: 'compact:done', freed: 500 },
+      { type: 'warning', message: 'w1' },
+      { type: 'token', text: 'one' },
+    ]),
+    'T',
+    0,
+    { index: 0, user: 'r1' }
+  );
+  const t2 = await collectEvents(
+    fromArray([
+      { type: 'tool:result', ok: false, content: 'orphan' },
+      { type: 'tool:call', name: 'fs__read_file', args: { path: 'a.ts' } },
+      { type: 'tool:result', ok: true, content: 'a again' },
+      { type: 'tool:call', name: 'context_recall', args: { query: 'x' } },
+      { type: 'compact:done', freed: 700 },
+      { type: 'token', text: 'two' },
+    ]),
+    'T',
+    0,
+    { index: 1, user: 'r2' }
+  );
+
+  const m = mergeTraces([t1, t2]);
+
+  assert.equal(m.compactCount, 2);
+  assert.equal(m.contextRecallCount, 1);
+  assert.equal(m.warningCount, 1);
+  assert.equal(m.errorCount, 1);
+  assert.equal(m.toolProtocol?.orphanToolResults, 1);
+  assert.equal(m.toolProtocol?.unclosedToolCalls, 1);
+  assert.equal(m.repeatedToolCallCount, 1);
+  assert.equal(m.rounds?.length, 2);
 });
 
 test('mergeTraces: aborted OR crashed propagates from any round', async () => {

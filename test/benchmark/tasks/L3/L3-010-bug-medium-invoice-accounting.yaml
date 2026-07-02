@@ -1,0 +1,39 @@
+id: "L3-010"
+title: "Bug medium: invoice accounting"
+level: "L3"
+category: "bug-medium"
+weight: 1.1
+
+fixture:
+  project: "bug-medium-invoice"
+
+prompt: |
+  修复一个中等 bug：invoice 的折扣、税费和付款状态有问题。
+  当前表现：
+  - 折扣被错误地应用在含税金额上，正确逻辑应是先对 subtotal 打折，再对折扣后金额计税
+  - 多次付款不会累计
+  - 超额付款没有被拒绝
+  要求：
+  - 修复 `src/invoice.js`
+  - 不要修改测试
+  - 金额字段都保持 cents 整数
+  - 完成后运行 `npm test`
+
+rubric_points:
+  - "discountCents 基于 subtotal 计算"
+  - "taxCents 基于 subtotal - discount 计算"
+  - "applyPayment 支持累计付款并在余额为 0 时标记 paid"
+  - "超额付款抛出错误且不改变 invoice 状态"
+  - "npm test 通过且未修改 tests/invoice.test.js"
+
+objective_checks:
+  - command: "npm test"
+    weight_into: "Correctness"
+  - command: "git diff --quiet HEAD -- tests/invoice.test.js"
+    weight_into: "NoRegression"
+  - command: "node -e \"const {calculateInvoice}=require('./src/invoice'); const x=calculateInvoice([{unitCents:10000,quantity:1},{unitCents:5000,quantity:1}],{discountPercent:10,taxRate:0.08}); if (x.totalCents !== 14580) process.exit(1)\""
+    weight_into: "Correctness"
+
+runtime:
+  timeout_sec: 320
+  runs: 3

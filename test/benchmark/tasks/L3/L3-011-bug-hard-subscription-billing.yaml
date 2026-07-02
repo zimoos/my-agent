@@ -1,0 +1,38 @@
+id: "L3-011"
+title: "Bug hard: subscription billing edge cases"
+level: "L3"
+category: "bug-hard"
+weight: 1.5
+
+fixture:
+  project: "bug-hard-subscription"
+
+prompt: |
+  修复一个困难 bug：subscription billing 在月末日期、补账发票和 proration 上都有边界错误。
+  当前模块在 `src/subscription.js`，要求：
+  - `addMonths` 对月末 anchor 要 clamp 到目标月份最后一天，例如 2024-01-31 + 1 月 = 2024-02-29
+  - `nextBillingDate(subscription, cycles)` 必须基于原始 anchor 计算，不能产生 rollover drift
+  - `generateRenewalInvoices(subscription, asOfDate)` 要生成截至 asOfDate 已到期但未生成过的所有月度发票，并更新 invoicesGenerated
+  - 重复调用不能重复生成同一期发票
+  - `proratePlanChange` 应按 period 剩余天数计算新旧月费差额
+  - 不要修改测试文件
+  完成后运行 `npm test`。
+
+rubric_points:
+  - "正确处理 leap year 和非 leap year 的月末 clamp"
+  - "generateRenewalInvoices 能 catch up 多个到期周期且具备幂等性"
+  - "nextBillingDate 不因前序月份短月而漂移"
+  - "proration 使用真实 period 天数和剩余天数"
+  - "npm test 通过且未修改 tests/subscription.test.js"
+
+objective_checks:
+  - command: "npm test"
+    weight_into: "Correctness"
+  - command: "git diff --quiet HEAD -- tests/subscription.test.js"
+    weight_into: "NoRegression"
+  - command: "node -e \"const s=require('./src/subscription'); if (s.addMonths('2024-01-31',1) !== '2024-02-29') process.exit(1); if (s.addMonths('2024-01-31',2) !== '2024-03-31') process.exit(1)\""
+    weight_into: "Correctness"
+
+runtime:
+  timeout_sec: 480
+  runs: 3

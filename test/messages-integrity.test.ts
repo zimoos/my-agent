@@ -443,7 +443,9 @@ test('messages: 500 retry does not hidden-truncate transcript', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);
   try {
-    const agent = await createAgent(makeConfig(), makeConnections());
+    const config = makeConfig();
+    config.model.maxRetries = 2;
+    const agent = await createAgent(config, makeConnections());
 
     // First, build up enough history. A 500 must not trigger hidden MessageStore
     // truncation as a recovery mechanism.
@@ -465,7 +467,7 @@ test('messages: 500 retry does not hidden-truncate transcript', async () => {
     });
     await drain(agent.chat('round-3'));
 
-    // Now round-4: server returns 500 for withRetry attempts (retries=2 -> 3 tries).
+    // Now round-4: server returns 500 for configured attempts (retries=2 -> 3 tries).
     // The agent should surface the error after retries, with no hidden recovery.
     state.responses.push({ kind: 'error', status: 500 });
     state.responses.push({ kind: 'error', status: 500 });
@@ -1093,6 +1095,43 @@ test('messages: user message exists with assistant+tool-heavy context', async ()
 
     // Tool pairing must still be valid
     assertToolCallPaired(lastCall);
+  } finally {
+    restore();
+  }
+});
+
+test('agent UX: compact failure emits actionable user summary before task failed', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    const agent = await createAgent(
+      makeConfig({
+        model: {
+          baseURL: 'http://127.0.0.1:0',
+          model: 'stub-model',
+          apiKey: 'stub-key',
+          contextWindow: 30,
+        },
+      }),
+      makeConnections()
+    );
+
+    const events = await drain(agent.chat('超长输入 '.repeat(2000)));
+    const text = events
+      .filter((ev) => ev.type === 'text')
+      .map((ev) => ev.content)
+      .join('\n');
+    const failed = events.find((ev) => ev.type === 'task:failed');
+    const usage = events.find((ev) => ev.type === 'context:usage');
+
+    assert.equal(state.calls.length, 0, 'compact failure should happen before provider call');
+    assert.ok(usage && usage.type === 'context:usage');
+    assert.equal(usage.total, 30);
+    assert.match(text, /\[失败总结\]/);
+    assert.match(text, /失败点/);
+    assert.match(text, /下一步/);
+    assert.ok(failed && failed.type === 'task:failed');
+    assert.match(failed.error, /context|上下文|compact/i);
   } finally {
     restore();
   }
