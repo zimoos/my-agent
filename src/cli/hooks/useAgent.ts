@@ -13,6 +13,10 @@ function extractToolPath(_name: string, args: Record<string, any>): string | und
   return '…/' + parts.slice(-2).join('/');
 }
 
+function seconds(ms: number): number {
+  return Math.max(1, Math.round(ms / 1000));
+}
+
 export interface PendingConfirm {
   requestId: string;
   cmd: string;
@@ -51,6 +55,38 @@ export function applyAgentEvent(
         id: nextId(),
         text: `[compact] freed ~${event.freed} tokens`,
       });
+      break;
+    case 'provider:attempt':
+      store.updateThinking({
+        event: event.attempt <= 1
+          ? `等待模型响应 · ${seconds(event.timeoutMs)}s 超时`
+          : `等待模型响应（重试 ${event.attempt - 1}/${Math.max(1, event.maxAttempts - 1)}）· ${seconds(event.timeoutMs)}s 超时`,
+      });
+      break;
+    case 'provider:retry':
+      store.pushMessage({
+        kind: 'system',
+        id: nextId(),
+        text: `[provider] 第 ${event.attempt}/${event.maxRetries} 次重试将在 ${seconds(event.delayMs)}s 后开始：${event.error}`,
+      });
+      store.updateThinking({
+        event: `准备重试 ${event.attempt}/${event.maxRetries}`,
+      });
+      break;
+    case 'progress': {
+      const pending = store.flushInFlight();
+      if (pending.trim()) {
+        store.pushMessage({ kind: 'assistant', id: nextId(), markdown: pending, elapsedMs: 0 });
+      }
+      store.pushMessage({
+        kind: 'system',
+        id: nextId(),
+        text: `[progress] ${event.message}`,
+      });
+      store.updateThinking({ event: '继续执行中' });
+      break;
+    }
+    case 'context:usage':
       break;
     case 'tool:call':
       store.updateThinking({

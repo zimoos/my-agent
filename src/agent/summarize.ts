@@ -1,4 +1,4 @@
-import type OpenAI from 'openai';
+import type { ProviderRuntime } from '../provider/runtime.js';
 
 export interface ContextSummaryInput {
   i: number;
@@ -12,7 +12,7 @@ export interface ContextSummaryOutput {
 }
 
 export async function summarizeContextItems(
-  client: OpenAI,
+  providerRuntime: ProviderRuntime,
   model: string,
   items: ContextSummaryInput[],
   signal?: AbortSignal
@@ -24,7 +24,7 @@ export async function summarizeContextItems(
     role: item.role,
     content: item.content.slice(0, 6000),
   }));
-  const resp = await client.chat.completions.create(
+  const resp = await providerRuntime.createChatCompletion(
     {
       model,
       messages: [
@@ -38,7 +38,7 @@ export async function summarizeContextItems(
       temperature: 0.2,
       stream: false,
     },
-    signal ? { signal } : undefined
+    { signal }
   );
 
   const raw = (resp as any)?.choices?.[0]?.message?.content;

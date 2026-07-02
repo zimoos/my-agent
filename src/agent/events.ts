@@ -28,10 +28,14 @@ export type AgentEvent =
   | { type: 'workspace:diff'; artifact: WorkspaceDiffArtifact }
   | { type: 'token'; text: string }
   | { type: 'text'; content: string }
+  | { type: 'progress'; message: string }
+  | { type: 'context:usage'; used: number; total: number; compactThreshold: number; source: string }
   | { type: 'thinking:start' }
   | { type: 'thinking:end'; durationMs: number }
   | { type: 'tool:confirm'; requestId: string; cmd: string; reason: string }
   | { type: 'compact:done'; freed: number }
+  | { type: 'provider:attempt'; attempt: number; maxAttempts: number; timeoutMs: number; stream: boolean }
+  | { type: 'provider:retry'; attempt: number; nextAttempt: number; retriesLeft: number; maxRetries: number; delayMs: number; error: string; stream: boolean }
   | { type: 'ask_user'; question: string }
   | { type: 'plan'; content: string }
   | { type: 'aborted' }

@@ -1,5 +1,5 @@
-import OpenAI from 'openai';
 import type {
+  ChatCompletionCreateParamsStreaming,
   ChatCompletionMessageParam,
   ChatCompletionTool,
   ChatCompletionUserMessageParam,
@@ -27,9 +27,15 @@ import {
 import { MessageStore } from './agent/message-store.js';
 import { ErrorTracker } from './agent/error-tracker.js';
 import { StreamParser } from './agent/stream-parser.js';
+import { ToolCallRepair } from './agent/tool-repair.js';
 import { ToolExecutor } from './agent/tool-executor.js';
 import { findToolSchema, routeToolCall } from './agent/tool-router.js';
 import { resolveProviderCodec } from './provider/detect.js';
+import {
+  createProviderRuntime,
+  type ProviderAttemptEvent,
+} from './provider/runtime.js';
+import { DEFAULT_CONTEXT_WINDOW, resolveModelCapabilities } from './provider/capabilities.js';
 import { loadAgentMd } from './agent/memdir.js';
 import { estimateTokens } from './agent/tokenCount.js';
 import { summarizeContextItems } from './agent/summarize.js';
@@ -38,6 +44,7 @@ import {
   collectWorkspaceSnapshot,
   diffWorkspaceSnapshots,
 } from './agent/workspace-diff.js';
+import { prefixHash } from './agent/prefix-hash.js';
 import type { SessionStore } from './session/store.js';
 import {
   createContextManager,
@@ -69,37 +76,238 @@ function isTtyInteractive(): boolean {
   return Boolean((process.stdin as any)?.isTTY);
 }
 
-const DEFAULT_CONTEXT_WINDOW = 32768;
-
 const COMPACT_TRIGGER_RATIO = 0.75;
 const COMPACT_MAX_FAILURES = 2;
 const COMPACT_MIN_SUMMARY_CHARS = 50;
 const COMPACT_BATCH_SIZE = 4;
+const PROGRESS_TOOL_STREAK = 4;
+const PROGRESS_IDLE_MS = 10_000;
 
-async function withRetry<T>(
-  fn: () => Promise<T>,
-  retries = 2,
-  delay = 1000
-): Promise<T> {
-  for (let i = 0; i <= retries; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      const status = (err as any)?.status;
-      if (i < retries && (status === 500 || status === 502 || status === 503)) {
-        await new Promise((r) => setTimeout(r, delay * (i + 1)));
-        continue;
-      }
-      throw err;
-    }
-  }
-  throw new Error('unreachable');
+interface ContextUsageSnapshot {
+  used: number;
+  total: number;
+  compactThreshold: number;
+  source: string;
+}
+
+interface ToolProgressRecord {
+  name: string;
+  args: Record<string, unknown>;
+  ok: boolean;
+  preview: string;
+}
+
+interface TaskDiagnostics {
+  recentTools: ToolProgressRecord[];
+  totalTools: number;
+  lastContext?: ContextUsageSnapshot;
 }
 
 function cleanErrorMessage(msg: string): string {
   let clean = msg.replace(/<[^>]*>/g, '').trim();
   clean = clean.replace(/\s+/g, ' ');
   return clean.slice(0, 200) || 'unknown error';
+}
+
+function compactArgSummary(args: Record<string, unknown>): string {
+  for (const key of ['path', 'file', 'filePath', 'directory', 'dir_path', 'cwd', 'cmd', 'command']) {
+    const value = args[key];
+    if (typeof value === 'string' && value.trim()) {
+      const text = value.trim().replace(/\s+/g, ' ');
+      return text.length > 80 ? ` ${text.slice(0, 77)}...` : ` ${text}`;
+    }
+  }
+  return '';
+}
+
+function compactResultPreview(content: string): string {
+  const oneLine = String(content ?? '').replace(/\s+/g, ' ').trim();
+  if (!oneLine) return '';
+  return oneLine.length > 90 ? `${oneLine.slice(0, 87)}...` : oneLine;
+}
+
+function buildProgressMessage(records: ToolProgressRecord[], totalTools: number): string {
+  const recent = records.slice(-3).map((item) => {
+    const arg = compactArgSummary(item.args);
+    const status = item.ok ? '完成' : '失败';
+    const preview = item.preview ? `：${item.preview}` : '';
+    return `${item.name}${arg} ${status}${preview}`;
+  });
+  return `已执行 ${totalTools} 个工具调用，最近：${recent.join('；')}。继续基于这些结果推进。`;
+}
+
+function failureNextStep(error: string): string {
+  if (/context|compact|compaction|上下文/i.test(error)) {
+    return '建议先减少本轮活跃上下文、扩大模型 contextWindow，或检查压缩策略是否能移出非关键工具结果。';
+  }
+  if (/timeout|retry|network|provider|abort/i.test(error)) {
+    return '建议先确认 provider 可用性、超时/重试配置和当前网络状态，再重新执行同一任务。';
+  }
+  if (/max\s*loops?|最大循环/i.test(error)) {
+    return '建议缩小任务范围，检查是否存在重复工具调用或缺少停止条件。';
+  }
+  return '建议根据失败点缩小复现输入，保留当前工具结果后继续定位。';
+}
+
+function buildFailureSummary(
+  error: string,
+  diagnostics: TaskDiagnostics
+): string {
+  const done = diagnostics.totalTools > 0
+    ? buildProgressMessage(diagnostics.recentTools, diagnostics.totalTools).replace(/。继续基于这些结果推进。$/, '')
+    : '尚未完成可记录的工具调用';
+  const ctx = diagnostics.lastContext
+    ? `当前上下文约 ${diagnostics.lastContext.used}/${diagnostics.lastContext.compactThreshold} tokens（窗口 ${diagnostics.lastContext.total}，来源 ${diagnostics.lastContext.source}）。`
+    : '';
+  return [
+    '[失败总结]',
+    `已完成：${done}。${ctx}`,
+    `失败点：${error}`,
+    `下一步：${failureNextStep(error)}`,
+  ].filter(Boolean).join('\n');
+}
+
+function providerEventToAgentEvent(event: ProviderAttemptEvent): AgentEvent {
+  if (event.type === 'attempt') {
+    return {
+      type: 'provider:attempt',
+      attempt: event.attempt,
+      maxAttempts: event.maxAttempts,
+      timeoutMs: event.timeoutMs,
+      stream: event.stream,
+    };
+  }
+  return {
+    type: 'provider:retry',
+    attempt: event.attempt,
+    nextAttempt: event.nextAttempt,
+    retriesLeft: event.retriesLeft,
+    maxRetries: event.maxRetries,
+    delayMs: event.delayMs,
+    error: cleanErrorMessage(event.error),
+    stream: event.stream,
+  };
+}
+
+async function* drainProviderEvents<T>(
+  factory: (
+    onProviderEvent: (event: ProviderAttemptEvent) => void
+  ) => AsyncGenerator<AgentEvent, T, unknown>
+): AsyncGenerator<AgentEvent, T, unknown> {
+  type QueueItem =
+    | { kind: 'event'; event: AgentEvent }
+    | { kind: 'done'; value: T }
+    | { kind: 'error'; error: unknown };
+
+  const queue: QueueItem[] = [];
+  let wake: (() => void) | null = null;
+  const push = (item: QueueItem) => {
+    queue.push(item);
+    if (wake) {
+      wake();
+      wake = null;
+    }
+  };
+
+  void (async () => {
+    try {
+      const gen = factory((event) =>
+        push({ kind: 'event', event: providerEventToAgentEvent(event) })
+      );
+      while (true) {
+        const next = await gen.next();
+        if (next.done) {
+          push({ kind: 'done', value: next.value });
+          return;
+        }
+        push({ kind: 'event', event: next.value });
+      }
+    } catch (err) {
+      push({ kind: 'error', error: err });
+    }
+  })();
+
+  while (true) {
+    if (queue.length === 0) {
+      await new Promise<void>((resolve) => {
+        wake = resolve;
+      });
+    }
+    const item = queue.shift();
+    if (!item) continue;
+    if (item.kind === 'event') {
+      yield item.event;
+      continue;
+    }
+    if (item.kind === 'done') return item.value;
+    throw item.error;
+  }
+}
+
+function textFromChatContent(content: ChatContent): string {
+  if (typeof content === 'string') return content;
+  const text = content.find((p) => p.type === 'text');
+  return text?.type === 'text' ? text.text : '';
+}
+
+function mentionsConcreteFileOrPath(text: string): boolean {
+  return /(?:^|[\s"'`(])(?:\.{0,2}\/)?[\w@.-]+\/[\w@./-]+/.test(text) ||
+    /\b[\w@.-]+\.(?:js|jsx|ts|tsx|json|md|txt|ya?ml|css|html|mjs|cjs)\b/i.test(text) ||
+    /\b(?:README|package\.json|src|test|tests|docs|config\.json)\b/i.test(text);
+}
+
+function recentHistoryMentionsFile(messages: ChatCompletionMessageParam[]): boolean {
+  return messages.some((m) => {
+    if (m.role !== 'user') return false;
+    const content = typeof m.content === 'string' ? m.content : '';
+    return mentionsConcreteFileOrPath(content);
+  });
+}
+
+function clarificationForAmbiguousPrompt(
+  prompt: string,
+  priorMessages: ChatCompletionMessageParam[],
+): string | null {
+  const trimmed = prompt.trim();
+  if (!trimmed) return null;
+
+  if (
+    /(?:刚才|之前|上面|那个|这个).{0,12}(?:文件|路径)/.test(trimmed) &&
+    !mentionsConcreteFileOrPath(trimmed) &&
+    !recentHistoryMentionsFile(priorMessages)
+  ) {
+    return '我还不知道你指的是哪个文件。请提供具体文件路径或文件名，我再继续读取。';
+  }
+
+  const vagueProductionConfig =
+    /(?:配置|config|设置).{0,12}(?:线上|生产|production|prod)|(?:线上|生产|production|prod).{0,12}(?:配置|config|设置)/i;
+  const mutatingIntent = /(?:帮我|请|把|将|改|修改|调整|配置|make|change|update|set)/i;
+  if (
+    vagueProductionConfig.test(trimmed) &&
+    mutatingIntent.test(trimmed) &&
+    !mentionsConcreteFileOrPath(trimmed) &&
+    !/[=:=]\s*[\w./:-]+/.test(trimmed)
+  ) {
+    return '这条需求还缺少关键信息：请提供要改的配置文件、线上环境的目标值，以及是否有不能改的范围？确认后我再动手。';
+  }
+
+  return null;
+}
+
+function userAskedForConcreteToolWork(prompt: string): boolean {
+  return /(?:读|读取|查看|列出|搜索|搜|grep|执行|运行|统计|创建|写|写入|修改|编辑|替换|修复|实现|测试|read|list|search|grep|run|execute|count|create|write|edit|replace|fix|implement|test)/i.test(prompt);
+}
+
+function looksLikeVerbalToolIntent(text: string): boolean {
+  const compact = text.replace(/\s+/g, ' ').trim();
+  if (!compact) return false;
+  if (/[?？]|请(?:提供|确认|告诉)|需要(?:你|确认|提供)|无法|不能|不存在|没有找到/.test(compact)) {
+    return false;
+  }
+  if (/(?:结果|如下|内容|已经|已完成|完成|找到|共有|共\s*\d+|输出|行数)/.test(compact)) {
+    return false;
+  }
+  return /(?:我|让我|好的，我|接下来|现在).{0,12}(?:先|来|会|去|准备|继续|再)?\s*(?:读|读取|查看|列|列出|搜索|搜|执行|运行|统计|创建|写|写入|修改|编辑|替换|修复|实现|检查)/.test(compact);
 }
 
 function getRequiredArgs(
@@ -313,6 +521,17 @@ builtinTools.set('enter_plan_mode', {
   },
 });
 
+function isMutatingTool(name: string): boolean {
+  // Exec commands and write/edit/delete tools should never be storm-suppressed
+  if (DANGER_EXEC_TOOLS.has(name)) return true;
+  const lower = name.toLowerCase();
+  return /_(write|edit|delete|create|remove|move|rename)_/.test('_' + lower + '_');
+}
+
+function isStormExemptTool(name: string): boolean {
+  // ask_user and enter_plan_mode are always intentional — don't suppress
+  return name === 'ask_user' || name === 'enter_plan_mode';
+}
 
 function mcpToolsToOpenAI(connections: McpConnection[]): ChatCompletionTool[] {
   const out: ChatCompletionTool[] = [];
@@ -339,10 +558,7 @@ export async function createAgent(
   connections: McpConnection[],
   options: CreateAgentOptions = {}
 ): Promise<Agent> {
-  const client = new OpenAI({
-    baseURL: config.model.baseURL,
-    apiKey: config.model.apiKey,
-  });
+  const providerRuntime = createProviderRuntime(config.model);
   const providerCodec = resolveProviderCodec(config.model);
 
   const mcpTools = mcpToolsToOpenAI(connections);
@@ -350,6 +566,12 @@ export async function createAgent(
     ...mcpTools,
     ...[...builtinTools.values()].map((b) => b.definition),
   ];
+  const allowedToolNames = new Set(tools.map((t) => t.function.name));
+  const toolRepair = new ToolCallRepair(
+    { allowedToolNames, isMutating: isMutatingTool, isStormExempt: isStormExemptTool },
+    6,  // storm window
+    3   // storm threshold
+  );
   const maxLoops = config.maxLoops ?? DEFAULT_MAX_LOOPS;
   const baseSystemPrompt =
     config.systemPrompt ??
@@ -367,6 +589,9 @@ export async function createAgent(
       '',
       '# Tool usage (critical)',
       '- Prefer dedicated tools over execute_command: read_file for reading, write_file for writing, file_edit for editing, grep for searching, list_directory for listing.',
+      '- If the user asks to list a directory, call list_directory. Do not use execute_command for ls/find/tree unless the dedicated tool cannot do the job.',
+      '- If the user asks to create, append, or edit a file, use write_file or file_edit. Do not use shell redirection such as echo >> file.',
+      '- If a request combines directory listing with a shell operation, use list_directory for the listing part and execute_command only for the shell operation.',
       '- Use execute_command only for shell operations (install deps, run tests, git, etc.).',
       '- Always provide complete parameters: read_file needs path (e.g. ./package.json), list_directory uses . for cwd.',
       '- Call multiple independent tools in parallel for efficiency.',
@@ -463,9 +688,14 @@ export async function createAgent(
       }
     });
   }
-  const contextWindow = config.model.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+  const capabilities = resolveModelCapabilities(config.model);
+  const contextWindow = capabilities.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+  const contextWindowSource = capabilities.contextWindowSource;
+  config.model.contextWindow = contextWindow;
+  config.model.contextWindowSource = contextWindowSource;
   const compactThreshold = Math.floor(contextWindow * COMPACT_TRIGGER_RATIO);
   let compactFailures = 0;
+  let lastTaskDiagnostics: TaskDiagnostics = { recentTools: [], totalTools: 0 };
 
   function buildRequestSuffix(loopWarning = ''): string {
     const stateStr = renderStackState(stack);
@@ -480,6 +710,15 @@ export async function createAgent(
     return estimateTokens(
       store.buildContextRequestMessages(suffix, contextManager.buildLlmContext())
     );
+  }
+
+  function contextUsageSnapshot(suffix = buildRequestSuffix()): ContextUsageSnapshot {
+    return {
+      used: activeContextTokens(suffix),
+      total: contextWindow,
+      compactThreshold,
+      source: contextWindowSource,
+    };
   }
 
   function oldestCompressibleActiveItems(): Array<{ i: number; role: string; content: string }> {
@@ -517,7 +756,7 @@ export async function createAgent(
       let summaries: Awaited<ReturnType<typeof summarizeContextItems>> = [];
       try {
         summaries = await summarizeContextItems(
-          client,
+          providerRuntime,
           config.model.model,
           candidates,
           signal
@@ -598,6 +837,7 @@ export async function createAgent(
       repeatWindowChars: config.model.repeatWindowChars,
       repeatWindowRepeats: config.model.repeatWindowRepeats,
     });
+    toolRepair.resetStorm();
     const toolExecutor = new ToolExecutor(
       config,
       connections,
@@ -613,6 +853,7 @@ export async function createAgent(
     } else {
       openingContent = rootUserMessage as unknown as ChatCompletionUserMessageParam['content'];
     }
+    const priorMessages = store.snapshot().slice(1);
     store.appendUser(openingContent as any, { rootTurn: !task.parentId });
     const openingIndexed = persistPending();
     if (!task.parentId) {
@@ -620,9 +861,62 @@ export async function createAgent(
       if (rootEntry) rootTranscriptAnchors.push(rootEntry.i);
     }
 
+    if (!task.parentId) {
+      const clarification = clarificationForAmbiguousPrompt(
+        textFromChatContent(rootUserMessage),
+        priorMessages,
+      );
+      if (clarification) {
+        store.appendAssistant(clarification);
+        persistPending();
+        yield { type: 'text', content: clarification };
+        return { text: clarification, hitMaxLoops: false };
+      }
+    }
+
     let finalText = '';
     let emptyArgsRetries = 0;
     let tempOverride: number | undefined;
+    let lastPrefixHash = '';
+    let verbalIntentRetries = 0;
+    let silentToolResults = 0;
+    let lastVisibleAt = Date.now();
+    lastTaskDiagnostics = { recentTools: [], totalTools: 0 };
+
+    const noteVisible = () => {
+      silentToolResults = 0;
+      lastVisibleAt = Date.now();
+    };
+
+    const recordToolProgress = (
+      name: string,
+      args: Record<string, unknown>,
+      ok: boolean,
+      content: string
+    ): AgentEvent | null => {
+      const record: ToolProgressRecord = {
+        name,
+        args,
+        ok,
+        preview: compactResultPreview(content),
+      };
+      lastTaskDiagnostics.totalTools++;
+      lastTaskDiagnostics.recentTools.push(record);
+      lastTaskDiagnostics.recentTools = lastTaskDiagnostics.recentTools.slice(-8);
+      silentToolResults++;
+      const idleMs = Date.now() - lastVisibleAt;
+      if (silentToolResults >= PROGRESS_TOOL_STREAK || idleMs >= PROGRESS_IDLE_MS) {
+        noteVisible();
+        return {
+          type: 'progress',
+          message: buildProgressMessage(
+            lastTaskDiagnostics.recentTools,
+            lastTaskDiagnostics.totalTools
+          ),
+        };
+      }
+      return null;
+    };
 
     for (let loop = 0; loop < maxLoops; loop++) {
       // Warn agent when approaching loop limit by appending to system prompt
@@ -633,9 +927,15 @@ export async function createAgent(
       }
 
       const preCompactSuffix = buildRequestSuffix(loopWarning);
+      const beforeCompactUsage = contextUsageSnapshot(preCompactSuffix);
+      lastTaskDiagnostics.lastContext = beforeCompactUsage;
+      yield { type: 'context:usage', ...beforeCompactUsage };
       const compactResult = await compactActiveContext(preCompactSuffix, signal);
       if (compactResult.compacted) {
         yield { type: 'compact:done', freed: compactResult.freed };
+        const afterCompactUsage = contextUsageSnapshot(preCompactSuffix);
+        lastTaskDiagnostics.lastContext = afterCompactUsage;
+        yield { type: 'context:usage', ...afterCompactUsage };
       }
 
       const suffix = buildRequestSuffix(loopWarning);
@@ -643,9 +943,21 @@ export async function createAgent(
         store.buildContextRequestMessages(suffix, contextManager.buildLlmContext())
       );
 
-      const request: Parameters<typeof client.chat.completions.create>[0] = {
+      // Prefix cache diagnostic: detect unexpected system prompt changes
+      // Only hash system[0] — the truly stable part that should never change mid-session
+      const curHash = prefixHash(requestMessages.slice(0, 1));
+      if (lastPrefixHash && curHash !== lastPrefixHash) {
+        yield {
+          type: 'text',
+          content: `[prefix] system prompt changed — cache miss (hash: ${lastPrefixHash.slice(0, 8)} → ${curHash.slice(0, 8)})`,
+        };
+      }
+      lastPrefixHash = curHash;
+
+      const request: ChatCompletionCreateParamsStreaming = {
         model: config.model.model,
         messages: requestMessages,
+        stream: true,
         temperature: tempOverride ?? config.model.temperature ?? 0.6,
         ...(config.model.topP !== undefined ? { top_p: config.model.topP } : {}),
         ...(config.model.presencePenalty !== undefined ? { presence_penalty: config.model.presencePenalty } : {}),
@@ -691,25 +1003,22 @@ export async function createAgent(
         fs.appendFileSync(logFile, `[${new Date().toISOString()}] API REQUEST messages (${requestMessages.length}):\n${JSON.stringify(dbg, null, 2)}\n\n`);
       } catch { /* ignore */ }
 
-      let stream;
-      try {
-        stream = await withRetry(() =>
-          client.chat.completions.create(
-            { ...request, stream: true },
-            { signal }
-          )
-        );
-      } catch (retryErr) {
-        throw retryErr;
-      }
-
-      const parsedTurn = yield* streamParser.parse(
-        stream
+      const parsedTurn = yield* drainProviderEvents((onProviderEvent) =>
+        (async function* () {
+          const stream = await providerRuntime.createStreamingChatCompletion(
+            request,
+            { signal, onEvent: onProviderEvent }
+          );
+          return yield* streamParser.parse(stream);
+        })()
       );
       const { content: contentBuf, toolCalls, finishReason } = parsedTurn;
       const reasoningContent = providerCodec.shouldStoreReasoningContent(parsedTurn)
         ? parsedTurn.reasoningContent
         : undefined;
+      if (contentBuf.trim().length > 0) {
+        noteVisible();
+      }
 
       if (finishReason === 'length' && !toolCalls) {
         yield { type: 'warning', message: 'Model output was truncated (token limit reached). Continuing...' };
@@ -720,10 +1029,38 @@ export async function createAgent(
         continue;
       }
 
-      if (!toolCalls) {
-        if (contentBuf.trim().length === 0) {
+      // Run the tool-call repair pipeline: scavenge + truncation fix + storm breaker
+      const repairResult = toolRepair.process(
+        toolCalls ?? [],
+        contentBuf,
+        reasoningContent,
+        { userText: textFromChatContent(rootUserMessage) }
+      );
+      for (const note of repairResult.report.notes) {
+        yield { type: 'text', content: `[repair] ${note}` };
+      }
+
+      const repairedCalls = repairResult.calls.length > 0 ? repairResult.calls : null;
+
+      if (!repairedCalls) {
+        // If content is empty/whitespace after tool use, nudge model to answer
+        if (contentBuf.trim().length === 0 && loop > 0) {
           store.appendNudge();
           persistPending();
+          continue;
+        }
+        if (
+          verbalIntentRetries < 2 &&
+          userAskedForConcreteToolWork(textFromChatContent(rootUserMessage)) &&
+          looksLikeVerbalToolIntent(contentBuf)
+        ) {
+          verbalIntentRetries += 1;
+          store.appendAssistant(contentBuf, undefined, { reasoningContent });
+          store.appendUser(
+            '你刚才说要继续操作，但没有调用工具。请现在直接调用合适的工具完成这一步；如果信息不足，请直接向用户提一个明确问题。'
+          );
+          persistPending();
+          tempOverride = 0.1;
           continue;
         }
         store.appendAssistant(contentBuf, undefined, { reasoningContent });
@@ -732,7 +1069,7 @@ export async function createAgent(
         return { text: finalText, hitMaxLoops: false };
       }
 
-      const invalidToolCalls = toolCalls
+      const invalidToolCalls = repairedCalls
         .map((tc) => {
           const args = normalizeArguments(tc.function.arguments);
           const missing = missingRequiredArgs(tools, tc.function.name, args);
@@ -758,11 +1095,14 @@ export async function createAgent(
           .join('; ');
         for (const { tc, args, missing } of invalidToolCalls) {
           yield { type: 'tool:call', name: tc.function.name, args };
+          const errorMessage = `Error: tool "${tc.function.name}" requires [${missing.join(', ')}] but received incomplete arguments.`;
           yield {
             type: 'tool:result',
             ok: false,
-            content: `Error: tool "${tc.function.name}" requires [${missing.join(', ')}] but received incomplete arguments.`,
+            content: errorMessage,
           };
+          const progress = recordToolProgress(tc.function.name, args, false, errorMessage);
+          if (progress) yield progress;
         }
         store.appendUser(
           `Your previous tool call arguments were invalid: ${details}. Retry with complete JSON arguments for every required field.`
@@ -773,10 +1113,10 @@ export async function createAgent(
         continue;
       }
 
-      store.appendAssistant(contentBuf.trim() || '', toolCalls, { reasoningContent });
+      store.appendAssistant(contentBuf.trim() || '', repairedCalls, { reasoningContent });
 
       // P0-b compatibility guard retained for tools without explicit schemas.
-      const allEmpty = toolCalls.every((tc) => {
+      const allEmpty = repairedCalls.every((tc) => {
         const a = normalizeArguments(tc.function.arguments);
         return Object.keys(a).length === 0;
       });
@@ -791,7 +1131,7 @@ export async function createAgent(
 
       const toolCtx = { stack, currentTask: task, todoList, contextManager };
 
-      for (const tc of toolCalls) {
+      for (const tc of repairedCalls) {
         const fullName = tc.function.name;
         const args = normalizeArguments(tc.function.arguments);
 
@@ -800,6 +1140,8 @@ export async function createAgent(
           yield { type: 'tool:call', name: fullName, args };
           yield { type: 'tool:result', ok: false, content: blockCheck.message! };
           store.appendToolResult(tc.id, blockCheck.message!);
+          const progress = recordToolProgress(fullName, args, false, blockCheck.message!);
+          if (progress) yield progress;
           continue;
         }
 
@@ -810,11 +1152,17 @@ export async function createAgent(
         );
         store.appendToolResult(tc.id, result);
         errorTracker.record(fullName, args, isError);
+        const progress = recordToolProgress(fullName, args, !isError, result);
+        if (progress) yield progress;
       }
       persistPending();
     }
 
-    const stop = `[agent] task [${task.id}] reached max loop count (${maxLoops}), aborting`;
+    const stop = [
+      `[agent] task [${task.id}] reached max loop count (${maxLoops}), aborting`,
+      '失败点：达到最大循环次数。',
+      '下一步：请缩小任务范围，或检查是否存在重复工具调用/缺少停止条件。',
+    ].join('\n');
     store.appendAssistant(stop);
     persistPending();
     yield { type: 'text', content: stop };
@@ -905,8 +1253,13 @@ export async function createAgent(
 
       if (failed) {
         const cleanError = cleanErrorMessage(failMessage);
+        const summary = buildFailureSummary(cleanError, lastTaskDiagnostics);
+        store.appendAssistant(summary);
+        persistPending();
+        taskText = summary;
+        yield { type: 'text', content: summary };
         stack.markFailed(task.id, cleanError);
-        foldTaskIfNeeded(task, `FAILED: ${cleanError}`);
+        foldTaskIfNeeded(task, `FAILED: ${cleanError}\n${summary}`);
         yield { type: 'task:failed', taskId: task.id, error: cleanError };
       } else if (hitMaxLoops) {
         stack.markFailed(task.id, taskText);
@@ -968,11 +1321,8 @@ export async function createAgent(
     return removed;
   }
 
-  function getContextUsage(): { used: number; total: number } {
-    return {
-      used: estimateTokens(store.snapshot()),
-      total: config.model.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
-    };
+  function getContextUsage(): { used: number; total: number; compactThreshold: number; source: string } {
+    return contextUsageSnapshot();
   }
 
   function inspectContext(): string {

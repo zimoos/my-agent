@@ -122,6 +122,53 @@ async function runChat(configPath: string | undefined, runOpts: RunChatOptions):
   }
 }
 
+async function runPrompt(configPath: string | undefined, prompt: string): Promise<void> {
+  let boot: BootstrapResult;
+  try {
+    boot = await bootstrap(configPath);
+  } catch (err) {
+    console.error(pc.red(`[error] ${(err as Error).message}`));
+    process.exit(1);
+  }
+
+  const { connections, agent } = boot;
+  activeConnections = connections;
+  let finalText = '';
+
+  try {
+    for await (const event of agent.chat(prompt)) {
+      if (event.type === 'token') {
+        process.stdout.write(event.text);
+        finalText += event.text;
+      } else if (event.type === 'text') {
+        process.stdout.write(event.content);
+        finalText += event.content;
+      } else if (event.type === 'ask_user') {
+        const text = event.question;
+        process.stdout.write(text);
+        finalText += text;
+      } else if (event.type === 'plan') {
+        process.stdout.write(event.content);
+        finalText += event.content;
+      } else if (event.type === 'warning') {
+        process.stderr.write(`[warning] ${event.message}\n`);
+      } else if (event.type === 'progress') {
+        process.stderr.write(`[progress] ${event.message}\n`);
+      } else if (event.type === 'task:failed') {
+        process.stderr.write(`[task:failed] ${event.error}\n`);
+      } else if (event.type === 'tool:call') {
+        process.stderr.write(`[tool] ${event.name}\n`);
+      }
+    }
+
+    if (!finalText.endsWith('\n')) process.stdout.write('\n');
+    process.stdout.write(`\n===FINAL_ANSWER===\n${finalText.trim()}\n===END===\n`);
+  } finally {
+    await shutdown(connections);
+    activeConnections = [];
+  }
+}
+
 async function main(): Promise<void> {
   const program = new Command();
   program.name('my-agent').description('CLI agent with local model + MCP').version(VERSION);
@@ -144,6 +191,15 @@ async function main(): Promise<void> {
     .action(async (opts: { config?: string; resume?: string | boolean }) => {
       const resume = parseResume(opts.resume);
       await runChat(opts.config, { debug: true, resume });
+    });
+
+  program
+    .command('run')
+    .description('Run a single prompt non-interactively')
+    .requiredOption('--prompt <prompt>', 'prompt to run')
+    .option('-c, --config <path>', 'path to config file')
+    .action(async (opts: { prompt: string; config?: string }) => {
+      await runPrompt(opts.config, opts.prompt);
     });
 
   program

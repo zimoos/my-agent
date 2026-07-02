@@ -57,10 +57,101 @@ test('tool_called: pass when exact tool name present', () => {
   assert.equal(res.passed, true, res.reason);
 });
 
+test('tool_called: argsContains relative path matches absolute workspace path', () => {
+  const trace = makeTrace({
+    toolCalls: [tc('fs__read_file', { path: '/tmp/ma-bench-fixture-x/src/index.js' })],
+  });
+  const [res] = evaluateHard(
+    [{ type: 'tool_called', tool: 'fs__read_file', argsContains: { path: 'src/index.js' } }],
+    trace,
+    '/tmp'
+  );
+  assert.equal(res.passed, true, res.reason);
+});
+
 test('tool_called: fail when tool not present', () => {
   const trace = makeTrace({ toolCalls: [tc('fs__read_file')] });
   const [res] = evaluateHard([{ type: 'tool_called', tool: 'exec__execute_command' }], trace, '/tmp');
   assert.equal(res.passed, false);
+});
+
+test('context_window_min: fails when resolved model window is too small', () => {
+  const [res] = evaluateHard(
+    [{ type: 'context_window_min', min: 1_000_000 }],
+    makeTrace({ contextWindow: 32_768 }),
+    '/tmp'
+  );
+  assert.equal(res.passed, false);
+  assert.match(res.reason, /32768 < 1000000/);
+});
+
+test('no_silent_tool_streak: fails when tools run without visible progress', () => {
+  const [res] = evaluateHard(
+    [{ type: 'no_silent_tool_streak', max: 4 }],
+    makeTrace({ maxSilentToolStreak: 6 }),
+    '/tmp'
+  );
+  assert.equal(res.passed, false);
+  assert.match(res.reason, /6 > 4/);
+});
+
+test('progress_count_min: fails when no visible progress is emitted', () => {
+  const [res] = evaluateHard(
+    [{ type: 'progress_count_min', min: 1 }],
+    makeTrace({ progressCount: 0 }),
+    '/tmp'
+  );
+  assert.equal(res.passed, false);
+  assert.match(res.reason, /0 < 1/);
+});
+
+test('task_failure_has_actionable_summary: requires failure summary when task fails', () => {
+  const failedTrace = makeTrace({
+    events: [{ type: 'task:failed', taskId: 't', error: 'provider timeout' }],
+    failureSummary: '[失败总结]\n已完成：已执行 4 个工具调用。\n失败点：provider timeout\n下一步：建议检查 provider。',
+  });
+  const [passed] = evaluateHard(
+    [{ type: 'task_failure_has_actionable_summary' }],
+    failedTrace,
+    '/tmp'
+  );
+  assert.equal(passed.passed, true, passed.reason);
+
+  const missingTrace = makeTrace({
+    events: [{ type: 'task:failed', taskId: 't', error: 'provider timeout' }],
+    failureSummary: 'timeout',
+  });
+  const [failed] = evaluateHard(
+    [{ type: 'task_failure_has_actionable_summary' }],
+    missingTrace,
+    '/tmp'
+  );
+  assert.equal(failed.passed, false);
+});
+
+test('task_failure_has_actionable_summary: also covers handled tool failures', () => {
+  const [res] = evaluateHard(
+    [{ type: 'task_failure_has_actionable_summary' }],
+    makeTrace({
+      errorCount: 1,
+      finalText: '操作失败。已完成：尝试读取目录。失败点：目录不存在。下一步：请确认路径后重试。',
+    }),
+    '/tmp'
+  );
+  assert.equal(res.passed, true, res.reason);
+});
+
+test('compact_failure_has_user_summary: requires compact failure plus actionable summary', () => {
+  const trace = makeTrace({
+    events: [{ type: 'task:failed', taskId: 't', error: 'active context still too large after compaction' }],
+    failureSummary: '[失败总结]\n已完成：读取多个文件。\n失败点：active context still too large after compaction\n下一步：建议减少活跃上下文。',
+  });
+  const [res] = evaluateHard(
+    [{ type: 'compact_failure_has_user_summary' }],
+    trace,
+    '/tmp'
+  );
+  assert.equal(res.passed, true, res.reason);
 });
 
 test('tool_called: regex toolMatches + argsMatches', () => {
@@ -148,6 +239,88 @@ test('tool_retry_max: args order should not affect key equality', () => {
   });
   const [res] = evaluateHard([{ type: 'tool_retry_max', maxSameError: 2 }], trace, '/tmp');
   assert.equal(res.passed, false, 'three same-args failures should fail max=2');
+});
+
+test('no_orphan_tool: fails on orphan result or unclosed call', () => {
+  const ok = evaluateHard(
+    [{ type: 'no_orphan_tool' }],
+    makeTrace({ toolProtocol: { orphanToolResults: 0, unclosedToolCalls: 0 } }),
+    '/tmp'
+  )[0];
+  const bad = evaluateHard(
+    [{ type: 'no_orphan_tool' }],
+    makeTrace({ toolProtocol: { orphanToolResults: 1, unclosedToolCalls: 0 } }),
+    '/tmp'
+  )[0];
+  assert.equal(ok.passed, true);
+  assert.equal(bad.passed, false);
+});
+
+test('compact_count_min/max checks trace compact count', () => {
+  const trace = makeTrace({ compactCount: 2 });
+  const min = evaluateHard([{ type: 'compact_count_min', min: 2 }], trace, '/tmp')[0];
+  const max = evaluateHard([{ type: 'compact_count_max', max: 1 }], trace, '/tmp')[0];
+  assert.equal(min.passed, true);
+  assert.equal(max.passed, false);
+});
+
+test('tool_call_count_by_round counts matching tools in a round', () => {
+  const trace = makeTrace({
+    rounds: [
+      {
+        roundIndex: 0,
+        user: 'r0',
+        toolCalls: [tc('fs__read_file'), tc('grep__grep')],
+        finalText: '',
+        compactCount: 0,
+        warningCount: 0,
+        errorCount: 0,
+        elapsedMs: 1,
+      },
+    ],
+  });
+  const ok = evaluateHard(
+    [{ type: 'tool_call_count_by_round', round: 0, max: 1, toolMatches: 'read_file$' }],
+    trace,
+    '/tmp'
+  )[0];
+  const bad = evaluateHard(
+    [{ type: 'tool_call_count_by_round', round: 0, max: 0, toolMatches: 'read_file$' }],
+    trace,
+    '/tmp'
+  )[0];
+  assert.equal(ok.passed, true);
+  assert.equal(bad.passed, false);
+});
+
+test('final_text_mentions_uncertainty_or_question detects clarification', () => {
+  const ok = evaluateHard(
+    [{ type: 'final_text_mentions_uncertainty_or_question' }],
+    makeTrace({ finalText: '我需要确认目标文件路径。' }),
+    '/tmp'
+  )[0];
+  const bad = evaluateHard(
+    [{ type: 'final_text_mentions_uncertainty_or_question' }],
+    makeTrace({ finalText: '我已经完成。' }),
+    '/tmp'
+  )[0];
+  assert.equal(ok.passed, true);
+  assert.equal(bad.passed, false);
+});
+
+test('no_repeat_read_same_file_after_context_available fails repeated reads', () => {
+  const trace = makeTrace({
+    toolCalls: [
+      tc('fs__read_file', { path: 'src/index.js' }),
+      tc('fs__read_file', { path: './src/index.js' }),
+    ],
+  });
+  const [res] = evaluateHard(
+    [{ type: 'no_repeat_read_same_file_after_context_available' }],
+    trace,
+    '/tmp'
+  );
+  assert.equal(res.passed, false);
 });
 
 // ─── 4. file_content ───

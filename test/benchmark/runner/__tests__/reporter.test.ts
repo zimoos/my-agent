@@ -181,7 +181,7 @@ test('writeReport: creates summary.json, summary.md, per-task files', async () =
     const perTaskStat = await stat(perTaskDir);
     assert.ok(perTaskStat.isDirectory());
 
-    // All tasks from L0 (2) + L1 (1) + L2 (2) = 5 per-task files
+    // All tasks from L0 (2) + L1 (1) + L2 (2) = 5 tasks, each has JSON and Markdown detail.
     for (const id of ['L0-001', 'L0-002', 'L1-001', 'L2-001', 'L2-002']) {
       const p = path.join(perTaskDir, `${id}.json`);
       const s = await stat(p);
@@ -189,6 +189,11 @@ test('writeReport: creates summary.json, summary.md, per-task files', async () =
       const body = JSON.parse(await readFile(p, 'utf8'));
       assert.equal(body.taskId, id);
       assert.ok(Array.isArray(body.runs));
+
+      const md = path.join(perTaskDir, `${id}.md`);
+      const mdStat = await stat(md);
+      assert.ok(mdStat.isFile(), `${id}.md should exist`);
+      assert.match(await readFile(md, 'utf8'), new RegExp(`# ${id}`));
     }
   } finally {
     await rm(tmp, { recursive: true, force: true });

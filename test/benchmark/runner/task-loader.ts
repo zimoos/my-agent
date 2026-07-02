@@ -11,6 +11,8 @@ import type {
   RuntimeSpec,
   ReferenceSpec,
   Dimension,
+  Requirement,
+  AttachmentSpec,
 } from './types.js';
 import { LEVEL_ORDER } from './types.js';
 
@@ -20,6 +22,17 @@ const HARD_ASSERTION_TYPES = new Set<string>([
   'tool_called',
   'tool_not_called',
   'tool_retry_max',
+  'no_orphan_tool',
+  'compact_count_min',
+  'compact_count_max',
+  'context_window_min',
+  'no_silent_tool_streak',
+  'progress_count_min',
+  'compact_failure_has_user_summary',
+  'task_failure_has_actionable_summary',
+  'tool_call_count_by_round',
+  'final_text_mentions_uncertainty_or_question',
+  'no_repeat_read_same_file_after_context_available',
   'file_content',
   'file_exists',
   'not_file_modified',
@@ -42,8 +55,11 @@ const SOFT_ASSERTION_TYPES = new Set<string>([
 
 const LEVEL_SET = new Set<string>(LEVEL_ORDER);
 const LAYER_SET = new Set<string>(['L1', 'L2']);
+const REQUIREMENT_SET = new Set<string>(['vision', 'network', 'write_access']);
+const ATTACHMENT_TYPE_SET = new Set<string>(['image']);
 const DIMENSIONS: Dimension[] = ['ToolAcc', 'TaskDone', 'AnsQual', 'CtxKeep', 'ErrRec', 'Eff'];
 const DIMENSION_SET = new Set<string>(DIMENSIONS);
+const L0_TO_L2_LEVELS: Level[] = ['L0', 'L1', 'L2'];
 
 const ID_REGEX = /^L[0-5]-\d{3}$/;
 
@@ -112,7 +128,7 @@ function collectYamlPaths(tasksDir: string, filterLevel: Level | undefined, erro
     return [];
   }
 
-  const levels = filterLevel ? [filterLevel] : LEVEL_ORDER;
+  const levels = filterLevel ? [filterLevel] : L0_TO_L2_LEVELS;
 
   const out: string[] = [];
   for (const level of levels) {
@@ -161,8 +177,16 @@ function parseTask(
   }
 
   const userInput = optionalString(obj, 'user_input', push);
+  const attachments = parseAttachments(obj['attachments'], push, 'attachments');
   const roundsRaw = obj['rounds'];
   const rounds = parseRounds(roundsRaw, push);
+  const behaviorExpectations = parseStringArray(
+    obj['behavior_expectations'],
+    push,
+    'behavior_expectations'
+  );
+  const requires = parseRequires(obj['requires'], push);
+  const judgeRubric = parseStringArray(obj['judge_rubric'], push, 'judge_rubric');
 
   if (userInput === undefined && rounds === undefined) {
     push(`must define either user_input or rounds`);
@@ -210,7 +234,11 @@ function parseTask(
     weight,
     fixture,
     userInput,
+    attachments,
     rounds,
+    behaviorExpectations,
+    requires,
+    judgeRubric,
     hardAssertions,
     softAssertions,
     runtime,
@@ -329,6 +357,16 @@ function parseRounds(raw: unknown, push: (m: string) => void): RoundDef[] | unde
       push(`rounds[${i}].user must be a non-empty string`);
       continue;
     }
+    const attachments = parseAttachments(
+      obj['attachments'],
+      push,
+      `rounds[${i}].attachments`
+    );
+    const judgeRubric = parseStringArray(
+      obj['judge_rubric'],
+      push,
+      `rounds[${i}].judge_rubric`
+    );
     const expectRaw = obj['expect'];
     let expect: RoundDef['expect'];
     if (expectRaw !== undefined) {
@@ -346,7 +384,75 @@ function parseRounds(raw: unknown, push: (m: string) => void): RoundDef[] | unde
         }
       }
     }
-    out.push({ user, expect });
+    out.push({ user, attachments, judgeRubric, expect });
+  }
+  return out;
+}
+
+function parseStringArray(
+  raw: unknown,
+  push: (m: string) => void,
+  field: string
+): string[] | undefined {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw) || !raw.every((s) => typeof s === 'string' && s.length > 0)) {
+    push(`${field} must be a non-empty string[] when present`);
+    return undefined;
+  }
+  return raw as string[];
+}
+
+function parseRequires(raw: unknown, push: (m: string) => void): Requirement[] | undefined {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) {
+    push(`requires must be a string[]`);
+    return undefined;
+  }
+  const out: Requirement[] = [];
+  for (const v of raw) {
+    if (typeof v !== 'string' || !REQUIREMENT_SET.has(v)) {
+      push(`requires contains unknown capability "${String(v)}"`);
+      continue;
+    }
+    out.push(v as Requirement);
+  }
+  return out;
+}
+
+function parseAttachments(
+  raw: unknown,
+  push: (m: string) => void,
+  field: string
+): AttachmentSpec[] | undefined {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) {
+    push(`${field} must be an array`);
+    return undefined;
+  }
+  const out: AttachmentSpec[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const item = raw[i];
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      push(`${field}[${i}] must be a mapping`);
+      continue;
+    }
+    const obj = item as Record<string, unknown>;
+    const type = obj['type'] ?? 'image';
+    if (typeof type !== 'string' || !ATTACHMENT_TYPE_SET.has(type)) {
+      push(`${field}[${i}].type must be "image"`);
+      continue;
+    }
+    const p = obj['path'];
+    if (typeof p !== 'string' || p.length === 0) {
+      push(`${field}[${i}].path must be a non-empty string`);
+      continue;
+    }
+    const mime = obj['mime'];
+    if (mime !== undefined && typeof mime !== 'string') {
+      push(`${field}[${i}].mime must be string`);
+      continue;
+    }
+    out.push({ type: 'image', path: p, mime });
   }
   return out;
 }
@@ -553,6 +659,106 @@ function parseHardAssertion(
         return null;
       }
       return { type: 'tool_retry_max', maxSameError: v };
+    }
+    case 'no_orphan_tool':
+      return { type: 'no_orphan_tool' };
+    case 'compact_count_min': {
+      const min = obj['min'];
+      if (typeof min !== 'number' || !Number.isInteger(min) || min < 0) {
+        push(`${tagged}.min must be a non-negative integer`);
+        return null;
+      }
+      return { type: 'compact_count_min', min };
+    }
+    case 'compact_count_max': {
+      const max = obj['max'];
+      if (typeof max !== 'number' || !Number.isInteger(max) || max < 0) {
+        push(`${tagged}.max must be a non-negative integer`);
+        return null;
+      }
+      return { type: 'compact_count_max', max };
+    }
+    case 'context_window_min': {
+      const min = obj['min'];
+      if (typeof min !== 'number' || !Number.isInteger(min) || min < 0) {
+        push(`${tagged}.min must be a non-negative integer`);
+        return null;
+      }
+      return { type: 'context_window_min', min };
+    }
+    case 'no_silent_tool_streak': {
+      const max = obj['max'];
+      if (typeof max !== 'number' || !Number.isInteger(max) || max < 0) {
+        push(`${tagged}.max must be a non-negative integer`);
+        return null;
+      }
+      return { type: 'no_silent_tool_streak', max };
+    }
+    case 'progress_count_min': {
+      const min = obj['min'];
+      if (typeof min !== 'number' || !Number.isInteger(min) || min < 0) {
+        push(`${tagged}.min must be a non-negative integer`);
+        return null;
+      }
+      return { type: 'progress_count_min', min };
+    }
+    case 'compact_failure_has_user_summary':
+      return { type: 'compact_failure_has_user_summary' };
+    case 'task_failure_has_actionable_summary':
+      return { type: 'task_failure_has_actionable_summary' };
+    case 'tool_call_count_by_round': {
+      const round = obj['round'];
+      if (typeof round !== 'number' || !Number.isInteger(round) || round < 0) {
+        push(`${tagged}.round must be a non-negative integer`);
+        return null;
+      }
+      const out: HardAssertion = { type: 'tool_call_count_by_round', round };
+      if (obj['min'] !== undefined) {
+        if (typeof obj['min'] !== 'number' || !Number.isInteger(obj['min']) || obj['min'] < 0) {
+          push(`${tagged}.min must be a non-negative integer`);
+          return null;
+        }
+        out.min = obj['min'];
+      }
+      if (obj['max'] !== undefined) {
+        if (typeof obj['max'] !== 'number' || !Number.isInteger(obj['max']) || obj['max'] < 0) {
+          push(`${tagged}.max must be a non-negative integer`);
+          return null;
+        }
+        out.max = obj['max'];
+      }
+      if (obj['tool'] !== undefined) {
+        if (typeof obj['tool'] !== 'string') {
+          push(`${tagged}.tool must be string`);
+          return null;
+        }
+        out.tool = obj['tool'];
+      }
+      if (obj['tool_matches'] !== undefined) {
+        if (typeof obj['tool_matches'] !== 'string') {
+          push(`${tagged}.tool_matches must be string`);
+          return null;
+        }
+        out.toolMatches = obj['tool_matches'];
+      }
+      if (out.min === undefined && out.max === undefined) {
+        push(`${tagged} requires min or max`);
+        return null;
+      }
+      return out;
+    }
+    case 'final_text_mentions_uncertainty_or_question':
+      return { type: 'final_text_mentions_uncertainty_or_question' };
+    case 'no_repeat_read_same_file_after_context_available': {
+      const rawMax = obj['max_reads'];
+      if (rawMax !== undefined && (typeof rawMax !== 'number' || !Number.isInteger(rawMax) || rawMax < 1)) {
+        push(`${tagged}.max_reads must be a positive integer`);
+        return null;
+      }
+      return {
+        type: 'no_repeat_read_same_file_after_context_available',
+        maxReads: rawMax as number | undefined,
+      };
     }
     case 'file_content': {
       const p = obj['path'];

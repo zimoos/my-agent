@@ -1,0 +1,50 @@
+id: "L2-033"
+title: "多轮记忆：读过文件后追问不重复读"
+level: "L2"
+category: "multi-turn-memory"
+weight: 1.1
+
+fixture:
+  project: "simple-node-project"
+
+behavior_expectations:
+  - "已经读取过同一文件后，后续追问应优先使用上下文而不是无意义重复读"
+
+rounds:
+  - user: "读 src/index.js，告诉我它导入了什么。"
+    expect:
+      tool_calls_include: ["fs__read_file"]
+  - user: "根据刚才读到的内容，它使用了哪个 React hook？不要重复读同一个文件。"
+
+hard_assertions:
+  - type: tool_called
+    tool: "fs__read_file"
+    args_contains:
+      path: "src/index.js"
+  - type: tool_call_count_by_round
+    round: 1
+    max: 0
+    tool: "fs__read_file"
+  - type: no_repeat_read_same_file_after_context_available
+    max_reads: 1
+  - type: final_text_contains
+    contains: "useState"
+  - type: no_orphan_tool
+  - type: no_error_5xx
+
+soft_assertions:
+  - type: llm_judge
+    rubric: "是否能利用刚读过的文件上下文回答追问，而不是重复调用读取工具"
+    weight: 0.5
+  - type: tool_call_count_max
+    max: 1
+    weight: 0.3
+  - type: duration_max
+    ms: 160000
+    weight: 0.2
+
+runtime:
+  timeout_sec: 220
+  runs: 5
+  max_rounds: null
+  layer: "L2"

@@ -31,6 +31,7 @@ const DEFAULT_FINAL_ANSWER_MARKER = '===FINAL_ANSWER===';
 const FINAL_ANSWER_END_MARKER = '===END===';
 const FINAL_ANSWER_TAIL_BYTES = 4 * 1024; // 4KB 兜底
 const SIGKILL_GRACE_MS = 5_000; // SIGTERM → 5s → SIGKILL
+const REPO_ROOT = path.resolve(import.meta.dirname, '..', '..', '..');
 
 // ─── loadAdapter ───
 
@@ -122,12 +123,13 @@ export async function runAdapter(
   prompt: string,
   workdir: string,
 ): Promise<AdapterResult> {
-  const args = config.args.map((a) => substitute(a, { PROMPT: prompt, WORKDIR: workdir }));
+  const vars = { PROMPT: prompt, WORKDIR: workdir, REPO_ROOT };
+  const args = config.args.map((a) => substitute(a, vars));
 
   const env: NodeJS.ProcessEnv = { ...process.env };
   if (config.env) {
     for (const [k, v] of Object.entries(config.env)) {
-      env[k] = substitute(v, { PROMPT: prompt, WORKDIR: workdir });
+      env[k] = substitute(v, vars);
     }
   }
 
@@ -209,6 +211,7 @@ export function extractFinalAnswer(stdout: string, marker?: string): string {
 function substitute(template: string, vars: Record<string, string>): string {
   return template.replace(/\$\{(\w+)\}/g, (match, key: string) => {
     if (key in vars) return vars[key];
+    if (process.env[key]) return process.env[key]!;
     return match;
   });
 }

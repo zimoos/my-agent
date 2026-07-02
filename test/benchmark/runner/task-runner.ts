@@ -14,11 +14,15 @@
  * - 多轮用 mergeTraces 聚合再打断言
  */
 
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 import { bootstrap, shutdown } from '../../../src/index.js';
+import type { ChatContent } from '../../../src/mcp/types.js';
 import { prepareFixture } from './fixture-manager.js';
 import { collectEvents, mergeTraces } from './event-collector.js';
 import { evaluateHard } from './assertions/hard.js';
-import { evaluateSoft } from './assertions/soft.js';
+import { evaluateSoftWithJudge } from './assertions/soft.js';
 import { scoreTask, computeMedian } from './scorer.js';
 import type {
   TaskDef,
@@ -27,10 +31,16 @@ import type {
   RunTrace,
   HardAssertionResult,
   SoftResult,
+  AttachmentSpec,
+  Requirement,
 } from './types.js';
+import type { JudgeConfig } from './judge-client.js';
 
 export interface RunTaskOptions {
   configPath?: string;
+  judgeConfig?: JudgeConfig;
+  benchmarkRunId?: string;
+  benchmarkSeed?: string;
 }
 
 /**
@@ -44,11 +54,23 @@ export async function runTask(
   task: TaskDef,
   options: RunTaskOptions = {}
 ): Promise<TaskResult> {
+  const unmet = unmetRequirements(task.requires);
+  if (unmet.length > 0) {
+    return skippedTaskResult(task, unmet.join(', '));
+  }
+
   const runs: TaskScore[] = [];
   const totalRuns = Math.max(1, task.runtime.runs);
 
   for (let i = 0; i < totalRuns; i++) {
-    const score = await runSingle(task, i, options.configPath);
+    const score = await runSingle(
+      task,
+      i,
+      options.configPath,
+      options.judgeConfig,
+      options.benchmarkRunId,
+      options.benchmarkSeed,
+    );
     runs.push(score);
   }
 
@@ -71,7 +93,10 @@ export async function runTask(
 async function runSingle(
   task: TaskDef,
   runIndex: number,
-  configPath?: string
+  configPath?: string,
+  judgeConfig?: JudgeConfig,
+  benchmarkRunId = 'ad-hoc',
+  benchmarkSeed = 'none',
 ): Promise<TaskScore> {
   const originalCwd = process.cwd();
 
@@ -100,17 +125,30 @@ async function runSingle(
     if (task.rounds && task.rounds.length > 0) {
       // 多轮：逐轮采集 → mergeTraces
       const partials: RunTrace[] = [];
-      for (const round of task.rounds) {
+      const maxRounds = task.runtime.maxRounds ?? task.rounds.length;
+      for (let roundIndex = 0; roundIndex < task.rounds.length && roundIndex < maxRounds; roundIndex++) {
+        const round = task.rounds[roundIndex];
         if (abortCtl.signal.aborted) break;
-        const gen = agent.chat(round.user, abortCtl.signal);
-        const partial = await collectEvents(gen, task.id, runIndex);
+        const gen = agent.chat(
+          buildChatContent(round.user, round.attachments, prepared.cwd),
+          abortCtl.signal
+        );
+        const partial = await collectEvents(
+          gen,
+          task.id,
+          runIndex,
+          { index: roundIndex, user: round.user }
+        );
         partials.push(partial);
       }
       trace = partials.length > 0 ? mergeTraces(partials) : emptyTrace(task.id, runIndex);
     } else if (task.userInput !== undefined) {
       // 单轮
-      const gen = agent.chat(task.userInput, abortCtl.signal);
-      trace = await collectEvents(gen, task.id, runIndex);
+      const gen = agent.chat(
+        buildChatContent(task.userInput, task.attachments, prepared.cwd),
+        abortCtl.signal
+      );
+      trace = await collectEvents(gen, task.id, runIndex, { index: 0, user: task.userInput });
     } else {
       // task-loader 应该拦住，兜底：空 trace
       trace = emptyTrace(task.id, runIndex);
@@ -121,10 +159,26 @@ async function runSingle(
     if (abortCtl.signal.aborted) {
       trace.aborted = true;
     }
+    trace.freshness = {
+      runId: benchmarkRunId,
+      seed: benchmarkSeed,
+      caseId: `${task.id}#${runIndex}#${sha256(`${benchmarkSeed}:${task.id}:${runIndex}`).slice(0, 8)}`,
+      workspaceId: prepared.workspaceId,
+      ...(task.fixture?.project ? { fixtureProject: task.fixture.project } : {}),
+      ...(prepared.fixtureFingerprint ? { fixtureFingerprint: prepared.fixtureFingerprint } : {}),
+      promptFingerprint: taskPromptFingerprint(task),
+      mode: 'static-regression-isolated-workspace',
+    };
 
     // 断言评估；cwd 仍在 fixture 目录，file_content/exit_code 才能拿到正确路径
     hardResults = evaluateHard(task.hardAssertions, trace, prepared.cwd);
-    softResults = evaluateSoft(task.softAssertions, trace);
+    softResults = await evaluateSoftWithJudge(
+      task.softAssertions,
+      trace,
+      task,
+      hardResults,
+      judgeConfig
+    );
   } catch (err) {
     // bootstrap / fixture / chat 任何阶段挂了都进这里
     trace.crashed = true;
@@ -138,7 +192,13 @@ async function runSingle(
       }
     }
     try {
-      softResults = evaluateSoft(task.softAssertions, trace);
+      softResults = await evaluateSoftWithJudge(
+        task.softAssertions,
+        trace,
+        task,
+        hardResults,
+        judgeConfig
+      );
     } catch {
       softResults = [];
     }
@@ -177,6 +237,21 @@ async function runSingle(
   return score;
 }
 
+function sha256(input: string): string {
+  return createHash('sha256').update(input).digest('hex');
+}
+
+function taskPromptFingerprint(task: TaskDef): string {
+  return sha256(JSON.stringify({
+    userInput: task.userInput,
+    attachments: task.attachments,
+    rounds: task.rounds?.map((round) => ({
+      user: round.user,
+      attachments: round.attachments,
+    })),
+  })).slice(0, 16);
+}
+
 /**
  * crash 兜底用的空 trace。
  */
@@ -186,14 +261,101 @@ function emptyTrace(taskId: string, runIndex: number): RunTrace {
     runIndex,
     events: [],
     toolCalls: [],
+    rounds: [],
     finalText: '',
     messagesCount: 0,
     thinkingMs: 0,
     apiCalls: 0,
+    compactCount: 0,
+    contextRecallCount: 0,
+    contextWindow: undefined,
+    compactThreshold: undefined,
+    maxContextUsed: 0,
+    maxSilentToolStreak: 0,
+    progressCount: 0,
+    failureSummary: undefined,
+    warningCount: 0,
+    errorCount: 0,
+    repeatedToolCallCount: 0,
+    toolProtocol: {
+      orphanToolResults: 0,
+      unclosedToolCalls: 0,
+    },
     startedAt: Date.now(),
     elapsedMs: 0,
     hitMaxLoops: false,
     aborted: false,
     crashed: false,
   };
+}
+
+function unmetRequirements(requires: Requirement[] | undefined): string[] {
+  const missing: string[] = [];
+  for (const req of requires ?? []) {
+    if (req === 'vision' && process.env.MA_BENCH_VISION !== '1') {
+      missing.push('vision (set MA_BENCH_VISION=1)');
+    }
+    if (req === 'network' && process.env.MA_BENCH_NETWORK !== '1') {
+      missing.push('network (set MA_BENCH_NETWORK=1)');
+    }
+    if (req === 'write_access' && process.env.MA_BENCH_READONLY === '1') {
+      missing.push('write_access (MA_BENCH_READONLY=1)');
+    }
+  }
+  return missing;
+}
+
+function skippedTaskResult(task: TaskDef, reason: string): TaskResult {
+  const trace = emptyTrace(task.id, 0);
+  const score: TaskScore = {
+    taskId: task.id,
+    hardPass: true,
+    softScore: 1,
+    rawScore: 1,
+    hardResults: [],
+    softResults: [],
+    trace,
+    skipped: true,
+    skipReason: reason,
+  };
+  return {
+    taskId: task.id,
+    level: task.level,
+    runs: [score],
+    median: 1,
+    stability: 1,
+    passRate: 1,
+    skipped: true,
+    skipReason: reason,
+  };
+}
+
+function buildChatContent(
+  text: string,
+  attachments: AttachmentSpec[] | undefined,
+  cwd: string
+): ChatContent {
+  if (!attachments || attachments.length === 0) return text;
+  return [
+    { type: 'text', text },
+    ...attachments.map((attachment) => ({
+      type: 'image_url' as const,
+      image_url: { url: imageToDataUrl(path.resolve(cwd, attachment.path), attachment.mime) },
+    })),
+  ];
+}
+
+function imageToDataUrl(file: string, explicitMime?: string): string {
+  const mime = explicitMime ?? mimeFromPath(file);
+  const data = fs.readFileSync(file).toString('base64');
+  return `data:${mime};base64,${data}`;
+}
+
+function mimeFromPath(file: string): string {
+  const ext = path.extname(file).toLowerCase().replace(/^\./, '');
+  if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg';
+  if (ext === 'webp') return 'image/webp';
+  if (ext === 'gif') return 'image/gif';
+  if (ext === 'svg') return 'image/svg+xml';
+  return 'image/png';
 }

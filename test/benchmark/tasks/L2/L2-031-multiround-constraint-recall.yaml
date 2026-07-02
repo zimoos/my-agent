@@ -1,0 +1,54 @@
+id: "L2-031"
+title: "多轮记忆：早期约束召回"
+level: "L2"
+category: "multi-turn-memory"
+weight: 1.2
+
+fixture:
+  project: "simple-node-project"
+
+behavior_expectations:
+  - "后续回答必须保留第一轮给出的项目代号和输出风格约束"
+judge_rubric:
+  - "最终回答应准确召回 Apollo-7，并保持中文简洁"
+
+rounds:
+  - user: "从现在开始，项目代号记为 Apollo-7。后续回答请保持中文简洁，不要主动扩展无关背景。"
+    judge_rubric:
+      - "应确认或内化 Apollo-7 与中文简洁约束"
+  - user: "读一下 package.json，告诉我 name 字段"
+    expect:
+      tool_calls_include: ["fs__read_file"]
+  - user: "读一下 README 第一行"
+    expect:
+      tool_calls_include: ["fs__read_file"]
+  - user: "不看文件，回忆一下项目代号是什么？"
+
+hard_assertions:
+  - type: tool_called
+    tool: "fs__read_file"
+    args_contains:
+      path: "package.json"
+  - type: final_text_contains
+    contains: "Apollo-7"
+  - type: final_text_min_chars
+    chars: 8
+  - type: no_orphan_tool
+  - type: no_error_5xx
+
+soft_assertions:
+  - type: llm_judge
+    rubric: "是否稳定保留早期用户约束，并在最终轮准确召回项目代号"
+    weight: 0.5
+  - type: tool_call_count_max
+    max: 5
+    weight: 0.3
+  - type: duration_max
+    ms: 240000
+    weight: 0.2
+
+runtime:
+  timeout_sec: 300
+  runs: 5
+  max_rounds: null
+  layer: "L2"

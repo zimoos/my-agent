@@ -201,6 +201,20 @@ test('judge: 首次无效 JSON → 重试 1 次后成功', async () => {
   assert.equal(score.taskCompletion, 0.9);
 });
 
+test('judge: transient network error retries before scoring', async () => {
+  let calls = 0;
+  const config = makeConfig(async () => {
+    calls++;
+    if (calls === 1) {
+      throw new Error('Invalid response body: read ECONNRESET');
+    }
+    return makeResponse(validScoreJson());
+  });
+  const score = await judge(makeInput(), config);
+  assert.equal(calls, 2);
+  assert.equal(score.correctness, 0.8);
+});
+
 test('judge: 连续 2 次无效 JSON → 抛错', async () => {
   let calls = 0;
   const config = makeConfig(async () => {

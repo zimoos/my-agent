@@ -280,6 +280,7 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
 
   const taskStack = agent.getTaskStack();
   const taskCount = taskStack.pending().length + (taskStack.current() ? 1 : 0);
+  const contextUsage = agent.getContextUsage();
 
   return (
     <Box flexDirection="column">
@@ -332,8 +333,10 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
         model={config.model.model}
         taskCount={taskCount}
         debug={debug}
-        contextUsed={agent.getContextUsage().used}
-        contextTotal={agent.getContextUsage().total}
+        contextUsed={contextUsage.used}
+        contextTotal={contextUsage.total}
+        contextThreshold={contextUsage.compactThreshold}
+        contextSource={contextUsage.source}
       />
     </Box>
   );

@@ -53,6 +53,10 @@ export interface ModelConfig {
   maxOutputChars?: number;
   repeatWindowChars?: number;
   repeatWindowRepeats?: number;
+  requestTimeoutMs?: number;
+  streamIdleTimeoutMs?: number;
+  maxRetries?: number;
+  contextWindowSource?: 'config' | 'lmstudio' | 'registry' | 'default';
   extraParams?: Record<string, unknown>;
 }
 
@@ -114,7 +118,7 @@ export interface Agent {
   abortAll(): number;
   revertLastTurnContextOnly(): number;
   respondConfirm(requestId: string, approved: boolean): void;
-  getContextUsage(): { used: number; total: number };
+  getContextUsage(): { used: number; total: number; compactThreshold: number; source: string };
   inspectContext(): string;
   searchContext(query: string): SessionPoolEntry[];
   recallContext(entryId: string): string;

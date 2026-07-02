@@ -245,6 +245,21 @@ test('computeMedian: 空 runs → 全 0', () => {
   assert.deepEqual(r, { median: 0, stability: 0, passRate: 0 });
 });
 
+test('computeMedian: skipped runs 不计入中位数和通过率', () => {
+  const skipped = {
+    ...taskScore('T1', true, 1),
+    skipped: true,
+    skipReason: 'vision unavailable',
+  };
+  const r = computeMedian([
+    skipped,
+    taskScore('T1', true, 0.8),
+    taskScore('T1', false, 0),
+  ]);
+  assert.equal(r.median, 0.4);
+  assert.equal(r.passRate, 0.5);
+});
+
 // ─── scoreLevel ───
 
 test('scoreLevel: L1 双门通过（score≥0.75 且 passRate≥0.9）', () => {
@@ -318,6 +333,37 @@ test('scoreLevel: 空 tasks → score 0 门失败', () => {
   assert.equal(ls.score, 0);
   assert.equal(ls.passRate, 0);
   assert.equal(ls.gateOk, false);
+});
+
+test('scoreLevel: skipped tasks 不参与 gate 统计', () => {
+  const tasks = [
+    taskResult('active', 'L1', 0.9, 1.0),
+    {
+      ...taskResult('skipped', 'L1', 1.0, 1.0),
+      skipped: true,
+      skipReason: 'vision unavailable',
+    },
+  ];
+  const ls = scoreLevel(tasks, 'L1', { active: 1, skipped: 100 });
+  assert.equal(ls.score, 0.9);
+  assert.equal(ls.passRate, 1);
+  assert.equal(ls.gateOk, true);
+  assert.equal(ls.tasks.length, 2);
+});
+
+test('scoreLevel: 全部 skipped 时 gate 失败但保留任务报告', () => {
+  const tasks = [
+    {
+      ...taskResult('skipped', 'L2', 1.0, 1.0),
+      skipped: true,
+      skipReason: 'vision unavailable',
+    },
+  ];
+  const ls = scoreLevel(tasks, 'L2');
+  assert.equal(ls.score, 0);
+  assert.equal(ls.passRate, 0);
+  assert.equal(ls.gateOk, false);
+  assert.equal(ls.tasks.length, 1);
 });
 
 // ─── scoreBenchmark ───

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+  <rect width="960" height="540" fill="#eef2f7"/>
+  <rect x="260" y="120" width="440" height="300" rx="8" fill="#ffffff" stroke="#aab2bf"/>
+  <text x="300" y="174" font-family="Arial, sans-serif" font-size="26" fill="#111827">Export Settings</text>
+  <text x="300" y="226" font-family="Arial, sans-serif" font-size="18" fill="#374151">File name</text>
+  <rect x="300" y="244" width="320" height="42" rx="4" fill="#ffffff" stroke="#ef4444"/>
+  <text x="312" y="272" font-family="Arial, sans-serif" font-size="18" fill="#9ca3af">Required</text>
+  <text x="300" y="316" font-family="Arial, sans-serif" font-size="17" fill="#b91c1c">Cannot save: file name is empty</text>
+  <rect x="300" y="352" width="120" height="44" rx="6" fill="#d1d5db"/>
+  <text x="336" y="381" font-family="Arial, sans-serif" font-size="18" fill="#6b7280">Save</text>
+  <rect x="436" y="352" width="120" height="44" rx="6" fill="#ffffff" stroke="#9ca3af"/>
+  <text x="468" y="381" font-family="Arial, sans-serif" font-size="18" fill="#111827">Cancel</text>
+</svg>

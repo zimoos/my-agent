@@ -1,0 +1,34 @@
+id: "L2-041"
+title: "体验红线：DeepSeek 上下文窗口能力解析"
+level: "L2"
+category: "ux-regression"
+weight: 1.2
+
+behavior_expectations:
+  - "DeepSeek v4 flash/pro 不应回落到 32768 context window"
+
+user_input: "只回答：context capability ok"
+
+hard_assertions:
+  - type: context_window_min
+    min: 1000000
+  - type: no_silent_tool_streak
+    max: 4
+  - type: final_text_contains
+    contains: "context capability ok"
+  - type: no_orphan_tool
+  - type: no_error_5xx
+
+soft_assertions:
+  - type: llm_judge
+    rubric: "是否按要求简短回答，并且 trace 记录到正确的 DeepSeek context window"
+    weight: 0.6
+  - type: duration_max
+    ms: 180000
+    weight: 0.4
+
+runtime:
+  timeout_sec: 220
+  runs: 5
+  max_rounds: 1
+  layer: "L2"

@@ -218,7 +218,7 @@ export async function judge(input: JudgeInput, config: JudgeConfig): Promise<Jud
   let lastErr: Error | undefined;
   // 最多调 2 次：首次 + 解析失败 1 次重试
   for (let attempt = 0; attempt < 2; attempt++) {
-    const resp = await client.chat.completions.create({
+    const resp = await createCompletionWithRetry(client, {
       model: config.model,
       messages,
       temperature,
@@ -237,4 +237,44 @@ export async function judge(input: JudgeInput, config: JudgeConfig): Promise<Jud
   throw new Error(
     `judge: 连续 2 次解析失败: ${lastErr ? lastErr.message : 'unknown'}`,
   );
+}
+
+async function createCompletionWithRetry(
+  client: Pick<OpenAI, 'chat'>,
+  params: {
+    model: string;
+    messages: ChatCompletionMessageParam[];
+    temperature: number;
+    stream: false;
+  },
+): Promise<unknown> {
+  let lastErr: Error | undefined;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await client.chat.completions.create(params);
+    } catch (err) {
+      lastErr = err as Error;
+      if (attempt >= 2 || !isRetryableJudgeRequestError(err)) break;
+      await sleep(50 * (attempt + 1));
+    }
+  }
+  throw lastErr ?? new Error('judge request failed');
+}
+
+function isRetryableJudgeRequestError(err: unknown): boolean {
+  const anyErr = err as { status?: unknown; code?: unknown; message?: unknown };
+  const status = typeof anyErr?.status === 'number' ? anyErr.status : undefined;
+  if (status === 408 || status === 409 || status === 425 || status === 429 || (status !== undefined && status >= 500)) {
+    return true;
+  }
+  const code = typeof anyErr?.code === 'string' ? anyErr.code : '';
+  if (/^(ECONNRESET|ETIMEDOUT|ECONNABORTED|EAI_AGAIN|ENOTFOUND)$/.test(code)) {
+    return true;
+  }
+  const message = typeof anyErr?.message === 'string' ? anyErr.message : String(err);
+  return /ECONNRESET|ETIMEDOUT|fetch failed|network|socket|connection|rate limit|timeout|temporarily unavailable|5\d\d/i.test(message);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

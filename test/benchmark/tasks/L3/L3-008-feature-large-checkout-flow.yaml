@@ -1,0 +1,39 @@
+id: "L3-008"
+title: "Feature large: complete checkout flow"
+level: "L3"
+category: "feature-large"
+weight: 1.4
+
+fixture:
+  project: "feature-large-checkout"
+
+prompt: |
+  完成一个较大的真实需求：实现 checkout 流程。
+  当前项目已有 catalog/cart 基础模块，但 `src/checkout.js` 还没实现。
+  请实现 `checkout({ catalog, cart, couponCode, taxRate, idempotencyKey })`，满足：
+  - 生成订单 lines、subtotalCents、discountCents、taxCents、totalCents
+  - 支持优惠码 `SAVE10`，按 subtotal 打 10% 折扣
+  - 税费按折扣后金额计算
+  - 扣减库存前要先校验所有商品库存，库存不足不能部分扣减
+  - 同一个 idempotencyKey 重复 checkout 要返回同一订单，不能重复扣库存
+  - 不要修改测试文件
+  完成后运行 `npm test`。
+
+rubric_points:
+  - "checkout 跨 catalog/cart/checkout 完成完整订单流程"
+  - "金额字段以 cents 计算且 subtotal/discount/tax/total 正确"
+  - "库存不足时不发生部分扣减"
+  - "idempotencyKey 防止重复扣库存"
+  - "npm test 通过且未修改 tests/checkout.test.js"
+
+objective_checks:
+  - command: "npm test"
+    weight_into: "Correctness"
+  - command: "git diff --quiet HEAD -- tests/checkout.test.js"
+    weight_into: "NoRegression"
+  - command: "node -e \"const {checkout}=require('./src/checkout'); if (typeof checkout !== 'function') process.exit(1)\""
+    weight_into: "TaskCompletion"
+
+runtime:
+  timeout_sec: 420
+  runs: 3

@@ -57,13 +57,14 @@ export function computeMedian(runs: TaskScore[]): {
   stability: number;
   passRate: number;
 } {
-  if (runs.length === 0) {
+  const activeRuns = runs.filter((r) => !r.skipped);
+  if (activeRuns.length === 0) {
     return { median: 0, stability: 0, passRate: 0 };
   }
-  const scores = runs.map((r) => r.rawScore);
+  const scores = activeRuns.map((r) => r.rawScore);
   const median = medianOf(scores);
   const stability = clamp01(1 - stdDev(scores));
-  const passRate = runs.filter((r) => r.hardPass).length / runs.length;
+  const passRate = activeRuns.filter((r) => r.hardPass).length / activeRuns.length;
   return { median, stability, passRate };
 }
 
@@ -102,13 +103,14 @@ export function scoreLevel(
   taskWeights?: Record<string, number>
 ): LevelScore {
   const cfg = LEVEL_CONFIG[level];
-  if (tasks.length === 0) {
+  const activeTasks = tasks.filter((t) => !t.skipped);
+  if (activeTasks.length === 0) {
     return { level, score: 0, passRate: 0, gateOk: false, tasks };
   }
   let scoreSum = 0;
   let passSum = 0;
   let weightSum = 0;
-  for (const t of tasks) {
+  for (const t of activeTasks) {
     const w = taskWeights?.[t.taskId] ?? 1;
     scoreSum += w * t.median;
     passSum += w * t.passRate;
