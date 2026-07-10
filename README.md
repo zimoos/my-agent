@@ -22,6 +22,16 @@ Release: https://github.com/zimoos/my-agent/releases/tag/v0.2.0-alpha.1
 
 See [MA Showcase](https://github.com/zimoos/ma-showcase) for recorded MA + Agora runs with the exact prompt, generated artifact, verification command, and terminal GIF. Each showcase entry is an auditable example, not a benchmark claim.
 
+## First Useful Task
+
+After `ma init`, try MA in a trusted project without changing anything:
+
+```bash
+ma run --prompt "Read this project's README and package.json. Tell me how to start and test it. Do not modify files."
+```
+
+That gives a new user an observable first result before they ask the agent to edit code. For a browser-interaction example with the prompt, generated artifact, and verifier included, see [MA Showcase](https://github.com/zimoos/ma-showcase).
+
 ## The Hook
 
 - **Local small models become productive**: MA's alpha gate runs 70 L0-L2 tasks through a local Qwen3-30B model via LM Studio.
