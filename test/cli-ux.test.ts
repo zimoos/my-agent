@@ -10,6 +10,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 
 test('CLI UX PTY: DeepSeek status bar uses provider capability instead of 33k fallback', async (t) => {
+  if (process.env.MA_RUN_PTY_TESTS !== '1') {
+    t.skip('PTY UI verification runs only in the explicit MA_RUN_PTY_TESTS E2E lane');
+    return;
+  }
   if (!canSpawnPty()) {
     t.skip('node-pty cannot spawn a basic /bin/echo process in this environment');
     return;

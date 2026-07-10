@@ -191,7 +191,6 @@ async function raceWithTimeout<T>(
       timeout = setTimeout(() => {
         reject(new ProviderRequestTimeoutError(timeoutMs));
       }, timeoutMs);
-      timeout.unref?.();
       onAbort = () => reject(signal?.reason ?? new DOMException('Aborted', 'AbortError'));
       signal?.addEventListener('abort', onAbort, { once: true });
       promise.then(resolve, reject);
