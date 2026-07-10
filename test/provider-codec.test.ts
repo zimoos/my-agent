@@ -65,3 +65,30 @@ test('provider codec: OpenAI-compatible default keeps data URI image_url values'
     'data:image/png;base64,iVBORw0KGgo='
   );
 });
+
+test('provider codec: Agora explicit provider uses OpenAI-compatible message shape', () => {
+  const codec = resolveProviderCodec({
+    provider: 'agora',
+    baseURL: 'http://127.0.0.1:8000/v1',
+    model: 'qwen3.6-35b-a3b-q4',
+    apiKey: 'lm-studio',
+  });
+
+  const encoded = codec.encodeMessages([
+    {
+      role: 'user',
+      content: [
+        {
+          type: 'image_url',
+          image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' },
+        },
+      ],
+    } as any,
+  ]);
+
+  assert.equal(codec.name, 'openai');
+  assert.equal(
+    (encoded[0] as any).content[0].image_url.url,
+    'data:image/png;base64,iVBORw0KGgo='
+  );
+});

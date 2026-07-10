@@ -6,6 +6,7 @@ import type {
   McpServerConfig,
   McpTool,
   McpCallResult,
+  McpProgressEvent,
 } from './types.js';
 
 const signalLimitApplied = new WeakSet<AbortSignal>();
@@ -51,6 +52,25 @@ interface Pending {
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
   method: string;
+  progressToken?: string | number;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  const n = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function withProgressToken(params: any, progressToken: string | number): any {
+  const out =
+    params && typeof params === 'object' && !Array.isArray(params)
+      ? { ...params }
+      : {};
+  const currentMeta =
+    out._meta && typeof out._meta === 'object' && !Array.isArray(out._meta)
+      ? out._meta
+      : {};
+  out._meta = { ...currentMeta, progressToken };
+  return out;
 }
 
 export class McpClient implements McpConnection {
@@ -60,12 +80,15 @@ export class McpClient implements McpConnection {
 
   private nextId = 1;
   private pending = new Map<number, Pending>();
+  private progressHandlers = new Map<string | number, (event: McpProgressEvent) => void>();
   private buffer = '';
   private closed = false;
+  private requestTimeoutMs: number;
 
-  constructor(name: string, proc: ChildProcess) {
+  constructor(name: string, proc: ChildProcess, requestTimeoutMs = REQUEST_TIMEOUT_MS) {
     this.name = name;
     this.process = proc;
+    this.requestTimeoutMs = requestTimeoutMs;
 
     proc.stdout!.setEncoding('utf-8');
     proc.stdout!.on('data', (chunk: string) => this.onStdout(chunk));
@@ -88,6 +111,7 @@ export class McpClient implements McpConnection {
         p.reject(err);
       }
       this.pending.clear();
+      this.progressHandlers.clear();
     });
 
     proc.on('error', (err) => {
@@ -107,27 +131,50 @@ export class McpClient implements McpConnection {
   }
 
   private handleLine(line: string) {
-    let msg: JsonRpcResponse;
+    let msg: JsonRpcResponse | JsonRpcNotification;
     try {
       msg = JSON.parse(line);
     } catch {
       process.stderr.write(`[mcp:${this.name}] invalid JSON line: ${line}\n`);
       return;
     }
-    if (typeof msg.id !== 'number') {
+    if (typeof (msg as JsonRpcResponse).id !== 'number') {
+      this.handleNotification(msg as JsonRpcNotification);
       return;
     }
-    const p = this.pending.get(msg.id);
+    const response = msg as JsonRpcResponse;
+    const p = this.pending.get(response.id);
     if (!p) return;
-    this.pending.delete(msg.id);
+    this.pending.delete(response.id);
     clearTimeout(p.timer);
-    if (msg.error) {
+    if (response.error) {
       p.reject(
-        new Error(`MCP '${this.name}' ${p.method} error: ${msg.error.message}`)
+        new Error(`MCP '${this.name}' ${p.method} error: ${response.error.message}`)
       );
     } else {
-      p.resolve(msg.result);
+      p.resolve(response.result);
     }
+  }
+
+  private handleNotification(msg: JsonRpcNotification): void {
+    if (
+      msg.method !== 'notifications/progress' &&
+      msg.method !== '$/progress'
+    ) {
+      return;
+    }
+    const params = msg.params && typeof msg.params === 'object' ? msg.params : {};
+    const progressToken = params.progressToken ?? params.progress_token ?? params.token;
+    if (typeof progressToken !== 'string' && typeof progressToken !== 'number') return;
+    const handler = this.progressHandlers.get(progressToken);
+    if (!handler) return;
+    handler({
+      progressToken,
+      progress: finiteNumber(params.progress),
+      total: finiteNumber(params.total),
+      message: typeof params.message === 'string' ? params.message : undefined,
+      raw: params,
+    });
   }
 
   private send(obj: JsonRpcRequest | JsonRpcNotification): void {
@@ -137,9 +184,20 @@ export class McpClient implements McpConnection {
     this.process.stdin.write(JSON.stringify(obj) + '\n');
   }
 
-  request(method: string, params?: any, signal?: AbortSignal): Promise<any> {
+  request(
+    method: string,
+    params?: any,
+    signal?: AbortSignal,
+    onProgress?: (event: McpProgressEvent) => void
+  ): Promise<any> {
     const id = this.nextId++;
-    const req: JsonRpcRequest = { jsonrpc: '2.0', id, method, params };
+    const progressToken = onProgress ? `${this.name}:${method}:${id}` : undefined;
+    const req: JsonRpcRequest = {
+      jsonrpc: '2.0',
+      id,
+      method,
+      params: progressToken === undefined ? params : withProgressToken(params, progressToken),
+    };
 
     return new Promise((resolve, reject) => {
       if (signal?.aborted) {
@@ -149,15 +207,18 @@ export class McpClient implements McpConnection {
 
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        if (progressToken !== undefined) this.progressHandlers.delete(progressToken);
         if (signal && onAbort) signal.removeEventListener('abort', onAbort);
-        reject(new Error(`MCP '${this.name}' ${method} timed out after ${REQUEST_TIMEOUT_MS}ms`));
-      }, REQUEST_TIMEOUT_MS);
+        reject(new Error(`MCP '${this.name}' ${method} timed out after ${this.requestTimeoutMs}ms`));
+      }, this.requestTimeoutMs);
 
       const wrappedResolve = (value: any) => {
+        if (progressToken !== undefined) this.progressHandlers.delete(progressToken);
         if (signal && onAbort) signal.removeEventListener('abort', onAbort);
         resolve(value);
       };
       const wrappedReject = (err: Error) => {
+        if (progressToken !== undefined) this.progressHandlers.delete(progressToken);
         if (signal && onAbort) signal.removeEventListener('abort', onAbort);
         reject(err);
       };
@@ -171,21 +232,27 @@ export class McpClient implements McpConnection {
         onAbort = () => {
           clearTimeout(timer);
           this.pending.delete(id);
+          if (progressToken !== undefined) this.progressHandlers.delete(progressToken);
           reject(new DOMException('aborted', 'AbortError'));
         };
         signal.addEventListener('abort', onAbort, { once: true });
       }
 
+      if (progressToken !== undefined && onProgress) {
+        this.progressHandlers.set(progressToken, onProgress);
+      }
       this.pending.set(id, {
         resolve: wrappedResolve,
         reject: wrappedReject,
         timer,
         method,
+        progressToken,
       });
       try {
         this.send(req);
       } catch (err) {
         this.pending.delete(id);
+        if (progressToken !== undefined) this.progressHandlers.delete(progressToken);
         clearTimeout(timer);
         if (signal && onAbort) signal.removeEventListener('abort', onAbort);
         reject(err as Error);
@@ -224,12 +291,14 @@ export class McpClient implements McpConnection {
   async call(
     toolName: string,
     args: Record<string, any>,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    onProgress?: (event: McpProgressEvent) => void
   ): Promise<McpCallResult> {
     const result = await this.request(
       'tools/call',
       { name: toolName, arguments: args ?? {} },
-      signal
+      signal,
+      onProgress
     );
     const contentArr = Array.isArray(result?.content) ? result.content : [];
     const text = contentArr
@@ -239,10 +308,17 @@ export class McpClient implements McpConnection {
         return JSON.stringify(c);
       })
       .join('\n');
-    return {
+    const callResult: McpCallResult = {
       content: text,
       isError: Boolean(result?.isError),
     };
+    if (Object.prototype.hasOwnProperty.call(result ?? {}, 'structuredContent')) {
+      callResult.structuredContent = result.structuredContent;
+    }
+    if (Object.prototype.hasOwnProperty.call(result ?? {}, '_meta')) {
+      callResult._meta = result._meta;
+    }
+    return callResult;
   }
 
   async close(): Promise<void> {
@@ -253,6 +329,7 @@ export class McpClient implements McpConnection {
       p.reject(new Error(`MCP '${this.name}' connection closing`));
     }
     this.pending.clear();
+    this.progressHandlers.clear();
     try {
       this.process.stdin?.end();
     } catch {

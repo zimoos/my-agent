@@ -22,3 +22,12 @@
 - New benchmark tasks should use real fixture code with an initial failing state, objective checks, and clear rubric points.
 
 See `test/benchmark/README.md` for benchmark-specific commands and evidence requirements.
+
+## Real E2E Work
+
+- `npm test` only proves unit-level behavior.
+- `npm run e2e` and `npm run e2e:real` run real CLI smoke through the built dist CLI; run `npm run build` first.
+- `ma run` smoke proves provider/main-loop/tool plumbing, not TUI behavior.
+- TUI PTY smoke proves startup/input/progress/completion/quit only; it is not a task-quality benchmark.
+- ZimoOS MCP e2e is real only when the local mteam backend is reachable. If it is skipped, say it was skipped; do not replace it with a mock OSFrame.
+- Report failures by layer: harness, provider, tool routing, context slot, TUI, ZimoOS backend, or task quality.

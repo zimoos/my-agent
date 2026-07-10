@@ -94,7 +94,7 @@ test('agent chat writes monotonic transcript index sidecar for visible messages'
   }
 });
 
-test('agent chat sends context-manager active context, not full transcript', async () => {
+test('agent chat sends append-only transcript, not context-manager active sidecar', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ma-agent-context-request-'));
   const sessionStore = createSessionStore(dir);
   const sessionId = sessionStore.create({
@@ -103,36 +103,52 @@ test('agent chat sends context-manager active context, not full transcript', asy
     model: 'stub-model',
   });
   const oldMessages = [
-    { role: 'user', content: 'old task that should stay out of request' },
-    { role: 'assistant', content: 'cold noisy assistant history' },
+    { role: 'user', content: 'resumed transcript user marker alpha' },
+    { role: 'assistant', content: 'resumed transcript assistant marker beta' },
   ] as any[];
   for (const msg of oldMessages) sessionStore.append(sessionId, msg);
   const contextManager = createContextManager(sessionId, dir);
   contextManager.ensureIndexed(oldMessages);
   contextManager.clearActive();
   contextManager.recordMessages([
-    { role: 'user', content: 'current active task' },
+    { role: 'user', content: 'sidecar poison marker must not reach provider' },
   ]);
 
   const calls: any[] = [];
-  const restore = installOpenAiMock('visible answer', calls);
+  const restore = installOpenAiMockTurns([
+    [{ choices: [{ delta: { content: 'visible answer one' } }] }],
+    [{ choices: [{ delta: { content: 'visible answer two' } }] }],
+  ], calls);
   try {
     const agent = await createAgent(config, [], {
       resumeMessages: oldMessages,
       sessionStore,
       sessionId,
     });
-    await drain(agent.chat('new task'));
+    await drain(agent.chat('new task one'));
 
     const firstRequest = calls[0].messages;
     const requestText = JSON.stringify(firstRequest);
 
-    assert.match(requestText, /current active task/);
-    assert.match(requestText, /new task/);
-    assert.doesNotMatch(requestText, /old task that should stay out of request/);
-    assert.doesNotMatch(requestText, /cold noisy assistant history/);
+    assert.match(requestText, /resumed transcript user marker alpha/);
+    assert.match(requestText, /resumed transcript assistant marker beta/);
+    assert.match(requestText, /new task one/);
+    assert.doesNotMatch(requestText, /sidecar poison marker must not reach provider/);
+
+    agent.clearActiveContext();
+    await drain(agent.chat('new task two after clearActiveContext'));
+
+    const secondRequest = calls[1].messages;
+    const secondText = JSON.stringify(secondRequest);
+    assert.match(secondText, /resumed transcript user marker alpha/);
+    assert.match(secondText, /resumed transcript assistant marker beta/);
+    assert.match(secondText, /new task one/);
+    assert.match(secondText, /visible answer one/);
+    assert.match(secondText, /new task two after clearActiveContext/);
+    assert.doesNotMatch(secondText, /sidecar poison marker must not reach provider/);
   } finally {
     restore();
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

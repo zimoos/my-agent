@@ -1,0 +1,48 @@
+name: Bug report
+description: Report a reproducible MA defect
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Please remove API keys, private paths, and sensitive prompts before submitting."
+  - type: input
+    id: version
+    attributes:
+      label: MA version
+      placeholder: "0.1.2-alpha.0"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Operating system and terminal
+      placeholder: "macOS 15, iTerm2"
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Provider and model
+      placeholder: "Agora / qwen3.6-35b-a3b-q4"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Include the smallest prompt or command that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and safe logs
+    validations:
+      required: true

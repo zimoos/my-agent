@@ -21,6 +21,16 @@ export interface McpServerConfig {
 export interface McpCallResult {
   content: string;
   isError: boolean;
+  structuredContent?: Record<string, unknown>;
+  _meta?: Record<string, unknown>;
+}
+
+export interface McpProgressEvent {
+  progressToken: string | number;
+  progress?: number;
+  total?: number;
+  message?: string;
+  raw: Record<string, any>;
 }
 
 export interface McpConnection {
@@ -30,7 +40,8 @@ export interface McpConnection {
   call(
     toolName: string,
     args: Record<string, any>,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    onProgress?: (event: McpProgressEvent) => void
   ): Promise<McpCallResult>;
   close(): Promise<void>;
 }
@@ -49,6 +60,7 @@ export interface ModelConfig {
   frequencyPenalty?: number;
   repeatPenalty?: number;
   contextWindow?: number;
+  requestBodyByteLimit?: number;
   maxTokens?: number;
   maxOutputChars?: number;
   repeatWindowChars?: number;
@@ -57,15 +69,22 @@ export interface ModelConfig {
   streamIdleTimeoutMs?: number;
   maxRetries?: number;
   contextWindowSource?: 'config' | 'lmstudio' | 'registry' | 'default';
+  requestBodyByteLimitSource?: 'config' | 'deepseek' | 'agora' | 'lmstudio' | 'openai' | 'default';
   extraParams?: Record<string, unknown>;
+  agoraMemory?: AgoraMemoryConfig;
+  agoraRuntime?: AgoraRuntimeConfig;
 }
 
 export interface CredentialConfig {
   provider: string;
-  baseURL: string;
+  baseURL?: string;
   secretRef?: string;
   apiKeyMode?: 'none' | 'secret';
   authPolicy?: 'session' | 'always';
+  command?: string;
+  args?: string[];
+  dataRoot?: string;
+  agoraRuntime?: AgoraRuntimeConfig;
   modelsCache?: {
     fetchedAt?: string;
     models: string[];
@@ -76,6 +95,38 @@ export interface ProfileConfig {
   credentialId: string;
   model: string;
   label?: string;
+  agoraMemory?: AgoraMemoryConfig;
+}
+
+export interface AgoraMemoryConfig {
+  userId?: string;
+  projectId?: string;
+  conversationId?: string;
+  memoryProfile?: string;
+  memoryEnabled?: boolean;
+}
+
+export interface AgoraRuntimeConfig {
+  command?: string;
+  args?: string[];
+  dataRoot?: string;
+  env?: Record<string, string>;
+  cwd?: string;
+}
+
+export interface ProviderSessionState {
+  provider_id: string;
+  agora_session_id?: string;
+  memory?: {
+    status?: string;
+    profile_id?: string;
+    binding_id?: string;
+    active_memory_patch_ids?: string[];
+    last_verified_at?: string;
+    [key: string]: unknown;
+  };
+  last_verified_at?: string;
+  [key: string]: unknown;
 }
 
 export interface DangerConfig {
@@ -118,6 +169,7 @@ export interface Agent {
   abortAll(): number;
   revertLastTurnContextOnly(): number;
   respondConfirm(requestId: string, approved: boolean): void;
+  getProviderState?(): ProviderSessionState | null;
   getContextUsage(): { used: number; total: number; compactThreshold: number; source: string };
   inspectContext(): string;
   searchContext(query: string): SessionPoolEntry[];
@@ -127,4 +179,5 @@ export interface Agent {
   poolContext(limit?: number): SessionPoolEntry[];
   dropContext(i: number): string;
   clearActiveContext(): string;
+  close(): Promise<void>;
 }

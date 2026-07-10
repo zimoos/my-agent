@@ -1,32 +1,73 @@
 import * as pty from 'node-pty';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const PROJECT_ROOT = path.resolve(__dirname, '../../..');
-const TSX = path.join(PROJECT_ROOT, 'node_modules/.bin/tsx');
-const CLI = path.join(PROJECT_ROOT, 'src/cli/index.tsx');
+import {
+  assertBuiltCli,
+  defaultE2ECwd,
+  DIST_CLI,
+  REPO_ROOT,
+  resolveE2EConfigPath,
+} from './real-env.js';
 
 export type IPty = pty.IPty;
 
-export function spawnMa(cwd: string): IPty {
+export interface SpawnMaOptions {
+  configPath?: string;
+  command?: 'chat' | 'dev';
+  cols?: number;
+  rows?: number;
+}
+
+export async function canSpawnPty(): Promise<{ ok: boolean; reason?: string }> {
+  let proc: pty.IPty;
+  try {
+    proc = pty.spawn('/bin/echo', ['ok'], {
+      name: 'xterm-256color',
+      cols: 80,
+      rows: 24,
+      cwd: defaultE2ECwd(),
+      env: { ...process.env },
+    });
+  } catch (err) {
+    return { ok: false, reason: (err as Error).message };
+  }
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      try { proc.kill(); } catch {}
+      resolve({ ok: false, reason: 'node-pty echo probe timed out' });
+    }, 5000);
+    proc.onExit((event) => {
+      clearTimeout(timer);
+      resolve(
+        event.exitCode === 0
+          ? { ok: true }
+          : { ok: false, reason: `/bin/echo exited ${event.exitCode}` }
+      );
+    });
+  });
+}
+
+export function spawnMa(cwd: string, opts: SpawnMaOptions = {}): IPty {
+  assertBuiltCli();
   try {
     fs.chmodSync(
       path.join(
-        PROJECT_ROOT,
+        REPO_ROOT,
         'node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper'
       ),
       0o755
     );
   } catch {}
-  return pty.spawn(TSX, [CLI], {
+  const configPath = opts.configPath ?? resolveE2EConfigPath();
+  const args = [DIST_CLI, opts.command ?? 'chat'];
+  if (configPath) args.push('--config', configPath);
+  return pty.spawn(process.execPath, args, {
     name: 'xterm-256color',
-    cols: 120,
-    rows: 30,
+    cols: opts.cols ?? 120,
+    rows: opts.rows ?? 30,
     cwd,
-    env: { ...process.env },
+    env: { ...process.env, NO_COLOR: '1', FORCE_COLOR: '0' },
   });
 }
 

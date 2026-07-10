@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import * as yaml from 'js-yaml';
 
 // ─── Types ───
@@ -32,6 +33,7 @@ const FINAL_ANSWER_END_MARKER = '===END===';
 const FINAL_ANSWER_TAIL_BYTES = 4 * 1024; // 4KB 兜底
 const SIGKILL_GRACE_MS = 5_000; // SIGTERM → 5s → SIGKILL
 const REPO_ROOT = path.resolve(import.meta.dirname, '..', '..', '..');
+const ADAPTER_RUN_MARKER_ENV = 'MY_AGENT_ADAPTER_RUN_ID';
 
 // ─── loadAdapter ───
 
@@ -132,12 +134,15 @@ export async function runAdapter(
       env[k] = substitute(v, vars);
     }
   }
+  const runMarker = randomUUID();
+  env[ADAPTER_RUN_MARKER_ENV] = runMarker;
 
   const startedAt = Date.now();
   const child = spawn(config.command, args, {
     cwd: workdir,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
+    detached: process.platform !== 'win32',
   });
 
   const stdoutChunks: Buffer[] = [];
@@ -149,19 +154,23 @@ export async function runAdapter(
   let sigkillTimer: NodeJS.Timeout | undefined;
   const timeoutTimer = setTimeout(() => {
     timedOut = true;
-    // SIGTERM 先给进程机会优雅退出
-    child.kill('SIGTERM');
+    signalAdapterProcesses(child, runMarker, 'SIGTERM');
     sigkillTimer = setTimeout(() => {
-      if (!child.killed) child.kill('SIGKILL');
+      signalAdapterProcesses(child, runMarker, 'SIGKILL');
     }, SIGKILL_GRACE_MS);
     if (sigkillTimer.unref) sigkillTimer.unref();
   }, config.timeoutSec * 1000);
   if (timeoutTimer.unref) timeoutTimer.unref();
 
   const exitCode = await new Promise<number>((resolve) => {
+    child.once('exit', () => {
+      // Descendants can escape their parent's session before it exits.
+      signalAdapterProcesses(child, runMarker, 'SIGKILL');
+    });
     // 用 close 而不是 exit,确保 stdio 流已读完
     child.once('close', (code, signal) => {
       clearTimeout(timeoutTimer);
+      signalAdapterProcesses(child, runMarker, 'SIGKILL');
       if (sigkillTimer) clearTimeout(sigkillTimer);
       if (code !== null) resolve(code);
       else if (signal) resolve(128 + signalToNumber(signal));
@@ -169,6 +178,7 @@ export async function runAdapter(
     });
     child.once('error', () => {
       clearTimeout(timeoutTimer);
+      signalAdapterProcesses(child, runMarker, 'SIGKILL');
       if (sigkillTimer) clearTimeout(sigkillTimer);
       resolve(-1);
     });
@@ -221,4 +231,74 @@ function signalToNumber(signal: NodeJS.Signals): number {
   if (signal === 'SIGTERM') return 15;
   if (signal === 'SIGKILL') return 9;
   return 1;
+}
+
+function signalAdapterProcesses(child: ChildProcess, marker: string, signal: NodeJS.Signals): void {
+  signalDirectChildAndGroup(child, signal);
+  signalMarkedAdapterProcesses(marker, signal);
+}
+
+function signalDirectChildAndGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (child.pid && process.platform !== 'win32') {
+    try {
+      // The detached child is its own process-group leader. This path must not
+      // depend on process enumeration, which can fail when PATH is restricted.
+      process.kill(-child.pid, signal);
+    } catch {
+      // It may have already exited or not established its group yet.
+    }
+  }
+
+  try {
+    child.kill(signal);
+  } catch {
+    // The direct child may exit between the group signal and this fallback.
+  }
+}
+
+function signalMarkedAdapterProcesses(marker: string, signal: NodeJS.Signals): void {
+  const markerAssignment = `${ADAPTER_RUN_MARKER_ENV}=${marker}`;
+  let argvByPid: Map<number, string>;
+  let environmentByPid: Map<number, string>;
+  try {
+    // Compare plain argv with `ps e` output. On macOS `ps e` appends the
+    // environment to the command text, so a simple substring would also match
+    // a marker supplied only as an argv argument.
+    argvByPid = readProcessCommands(['ww', '-axo', 'pid=,command=']);
+    environmentByPid = readProcessCommands(['eww', '-axo', 'pid=,command=']);
+  } catch {
+    return;
+  }
+
+  for (const [pid, commandWithEnvironment] of environmentByPid) {
+    const argv = argvByPid.get(pid);
+    if (!argv || !environmentContains(commandWithEnvironment, argv, markerAssignment)) continue;
+    if (pid === process.pid) continue;
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // Processes can exit between enumeration and signalling.
+    }
+  }
+}
+
+function readProcessCommands(args: string[]): Map<number, string> {
+  const output = execFileSync('ps', args, {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  const commands = new Map<number, string>();
+  for (const line of output.split('\n')) {
+    const match = line.match(/^\s*(\d+)\s+(.*)$/);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (Number.isSafeInteger(pid)) commands.set(pid, match[2]);
+  }
+  return commands;
+}
+
+function environmentContains(commandWithEnvironment: string, argv: string, markerAssignment: string): boolean {
+  if (!commandWithEnvironment.startsWith(argv)) return false;
+  const environment = commandWithEnvironment.slice(argv.length).trimStart();
+  return environment.split(/\s+/).includes(markerAssignment);
 }

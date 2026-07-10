@@ -1,0 +1,47 @@
+id: "L3-012"
+title: "Real scenario small: product docs for an existing CLI"
+level: "L3"
+category: "real-scenario-small"
+weight: 1.1
+
+fixture:
+  project: "undocumented"
+  setup: []
+
+prompt: |
+  这是一次真实交付测试。请把当前 todo CLI 当成一个要交给用户的小产品处理。
+  你需要先阅读项目，再交付：
+  1. 在根目录创建 PRD.md，写清楚目标用户、核心使用场景、命令能力、非目标、验收标准。
+  2. 在根目录创建 TECH_ARCHITECTURE.md，写清楚模块分层、数据流、关键文件路径和风险边界。
+  3. 用真实命令验证 CLI 至少能 add/list/done/rm，最后在回复里总结验证结果。
+  不要修改 src/ 下任何代码。不要创建真实远程 GitHub 仓库，这个 benchmark 会使用临时 workspace 并自动清理 demo。
+
+rubric_points:
+  - "PRD.md 清楚描述目标用户、场景、命令能力、非目标和验收标准"
+  - "TECH_ARCHITECTURE.md 清楚描述模块分层、数据流和真实文件路径"
+  - "验证过程真实运行 CLI 命令，而不是只口头声称"
+  - "未修改 src/ 下任何代码"
+  - "最终回复说明交付物和测试结果"
+
+no_modify_files:
+  - "src/cli.js"
+  - "src/args.js"
+  - "src/store.js"
+  - "src/commands.js"
+  - "src/render.js"
+
+objective_checks:
+  - command: "test -f PRD.md"
+    weight_into: "TaskCompletion"
+  - command: "test -f TECH_ARCHITECTURE.md"
+    weight_into: "TaskCompletion"
+  - command: "grep -q 'src/cli.js' TECH_ARCHITECTURE.md"
+    weight_into: "Correctness"
+  - command: "grep -q '验收' PRD.md"
+    weight_into: "Correctness"
+  - command: "git diff --quiet HEAD -- src/"
+    weight_into: "NoRegression"
+
+runtime:
+  timeout_sec: 420
+  runs: 2

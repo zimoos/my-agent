@@ -1,7 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import OpenAI from 'openai';
 import { createAgent } from '../src/agent.js';
+import {
+  DEEPSEEK_REQUEST_BODY_BYTE_LIMIT,
+} from '../src/provider/capabilities.js';
+import { createSessionStore } from '../src/session/store.js';
 import type {
   AgentConfig,
   AgentEvent,
@@ -12,6 +19,7 @@ import type {
 
 type MockStreamChunk = {
   choices: Array<{
+    finish_reason?: string | null;
     delta: {
       content?: string;
       reasoning_content?: string;
@@ -91,6 +99,7 @@ function installOpenAiMock(state: MockState) {
 function streamChunks(opts: {
   content?: string;
   reasoningContent?: string;
+  finishReason?: string;
   toolCalls?: Array<{
     index?: number;
     id: string;
@@ -128,6 +137,9 @@ function streamChunks(opts: {
         ],
       });
     }
+  }
+  if (opts.finishReason) {
+    out.push({ choices: [{ finish_reason: opts.finishReason, delta: {} }] });
   }
   if (out.length === 0) {
     out.push({ choices: [{ delta: { content: '' } }] });
@@ -182,6 +194,30 @@ function assertToolCallPaired(messages: any[]): void {
   }
 }
 
+function assertHasToolProtocolPair(messages: any[], expectedId?: string): void {
+  const assistantIds = new Set<string>();
+  const toolIds = new Set<string>();
+  for (const m of messages) {
+    if (m?.role === 'assistant' && Array.isArray(m.tool_calls)) {
+      for (const tc of m.tool_calls) {
+        if (typeof tc?.id === 'string') assistantIds.add(tc.id);
+      }
+    }
+    if (m?.role === 'tool' && typeof m.tool_call_id === 'string') {
+      toolIds.add(m.tool_call_id);
+    }
+  }
+
+  if (expectedId) {
+    assert.ok(assistantIds.has(expectedId), `missing assistant tool_call ${expectedId}`);
+    assert.ok(toolIds.has(expectedId), `missing tool result ${expectedId}`);
+  } else {
+    assert.ok(assistantIds.size > 0, 'expected at least one assistant tool_call');
+    assert.ok(toolIds.size > 0, 'expected at least one tool result');
+  }
+  assertToolCallPaired(messages);
+}
+
 function assertNoEmptyAssistant(messages: any[]): void {
   for (const m of messages) {
     if (!m || m.role !== 'assistant') continue;
@@ -222,6 +258,169 @@ function makeConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
 
 function makeConnections(): McpConnection[] {
   return [];
+}
+
+function makeZimoosFrame(overrides: Record<string, unknown> = {}) {
+  return {
+    protocol: 'zimoos/os-frame',
+    version: '0.1',
+    frameId: 'frame-1',
+    frameCursor: 'cursor-1',
+    osInstanceId: 'os-1',
+    agentId: 'agent-1',
+    status: 'idle',
+    title: 'ZimoOS Home',
+    summary: 'Current virtual desktop state',
+    breadcrumb: [{ label: 'Home' }],
+    visibleContent: [
+      { itemId: 'home', kind: 'panel', title: 'Home Panel', content: 'Home content', priority: 1 },
+    ],
+    shortcuts: [
+      { id: 's1', cmd: 'sys.refresh', label: 'Refresh', effectPreview: 'Refresh current frame', riskLevel: 'safe', requiresConfirmation: false },
+    ],
+    handles: [
+      { id: 'h1', label: 'Details', effectPreview: 'Expand details', tokenEstimate: 200 },
+    ],
+    recoveryActions: [],
+    notifications: [],
+    tokenBudget: { max: 4000, used: 200, truncated: false },
+    updatedAt: '2026-07-02T10:00:00.000Z',
+    ...overrides,
+  };
+}
+
+function makeZimoosConnection(results: Array<{ content: string; isError?: boolean }>): McpConnection[] {
+  let idx = 0;
+  return [
+    {
+      name: 'renamed-mteam',
+      process: {} as any,
+      tools: [
+        {
+          name: 'zimoos.current',
+          description: 'Current ZimoOS frame',
+          inputSchema: { type: 'object', properties: {} },
+        },
+        {
+          name: 'zimoos.act',
+          description: 'Act on current ZimoOS frame',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              frameCursor: { type: 'string' },
+              cmd: { type: 'string' },
+            },
+            required: ['frameCursor', 'cmd'],
+          },
+        },
+        {
+          name: 'zimoos.search',
+          description: 'Search ZimoOS surface',
+          inputSchema: {
+            type: 'object',
+            properties: { query: { type: 'string' } },
+            required: ['query'],
+          },
+        },
+      ],
+      call: async () => {
+        const result = results[idx++] ?? { content: 'Error: no fake result', isError: true };
+        return { content: result.content, isError: Boolean(result.isError) };
+      },
+      close: async () => {},
+    },
+  ];
+}
+
+function messagesText(messages: any[]): string {
+  return messages
+    .map((m) => {
+      const content = m?.content;
+      if (typeof content === 'string') return content;
+      if (Array.isArray(content)) return JSON.stringify(content);
+      return '';
+    })
+    .join('\n');
+}
+
+const ZIMOOS_STATE_RE =
+  /<zimoos\b|\[ZimoOS Current Frame\]|["']?protocol["']?\s*:\s*["']zimoos\/os-frame["']|zimoos\/os-frame/;
+
+function mktmp(prefix: string): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+function messageContentText(message: any): string {
+  const content = message?.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return JSON.stringify(content);
+  return '';
+}
+
+function assertNoZimoosStateMarkers(messages: any[], label: string): void {
+  for (let i = 0; i < messages.length; i++) {
+    assert.doesNotMatch(
+      messageContentText(messages[i]),
+      ZIMOOS_STATE_RE,
+      `${label} message[${i}] must not contain persisted/current ZimoOS state`
+    );
+  }
+}
+
+function assertNoSystemZimoosState(messages: any[]): void {
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i]?.role !== 'system') continue;
+    assert.doesNotMatch(
+      messageContentText(messages[i]),
+      /<zimoos\b|\[ZimoOS Current Frame\]/,
+      `role=system request message[${i}] must not contain ZimoOS current state`
+    );
+  }
+}
+
+function assertOnlyLatestZimoosCarrier(messages: any[]): string {
+  const carrierIndexes = messages
+    .map((m, index) => ({ index, text: messageContentText(m) }))
+    .filter(({ text }) => /<zimoos\b/.test(text))
+    .map(({ index }) => index);
+
+  assert.deepEqual(
+    carrierIndexes,
+    [messages.length - 1],
+    'only the latest request message may contain <zimoos>'
+  );
+  assert.equal(
+    messages[messages.length - 1]?.role,
+    'user',
+    'latest ZimoOS request-only carrier must be role=user'
+  );
+  assertNoSystemZimoosState(messages);
+  assertNoZimoosStateMarkers(messages.slice(0, -1), 'historical request prefix');
+  assert.doesNotMatch(
+    messagesText(messages),
+    /["']?protocol["']?\s*:\s*["']zimoos\/os-frame["']|zimoos\/os-frame/,
+    'provider request must not contain raw ZimoOS OSFrame protocol JSON'
+  );
+  return messageContentText(messages[messages.length - 1]);
+}
+
+function assertZimoosActionSummaryHistory(messages: any[]): void {
+  const historyText = messagesText(messages.slice(0, -1));
+  for (const toolName of ['zimoos.current', 'zimoos.act', 'zimoos.search']) {
+    const encoded = toolName.replace('.', '_x2e_');
+    assert.match(
+      historyText,
+      new RegExp(`Action:\\s*(?:renamed-mteam__)?(?:${toolName.replace('.', '\\.')}|${encoded})`),
+      `history must keep Action for ${toolName}`
+    );
+  }
+  for (const summary of [
+    'Summary: current frame showed Frame One.',
+    'Summary: action opened Frame Two.',
+    'Summary: search showed Frame Three.',
+  ]) {
+    assert.match(historyText, new RegExp(summary.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  }
 }
 
 async function drain(gen: AsyncGenerator<AgentEvent, void, unknown>): Promise<AgentEvent[]> {
@@ -288,7 +487,7 @@ test('messages: chat() pushes user message before first model call', async () =>
   }
 });
 
-test('messages: tool results are textualized in active context', async () => {
+test('messages: append-only transcript sends paired tool protocol to provider', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);
   try {
@@ -316,26 +515,212 @@ test('messages: tool results are textualized in active context', async () => {
 
     await drain(agent.chat('please plan'));
 
-    // Second model call reads ContextManager active context, not raw tool protocol history.
+    // Second model call must replay the append-only assistant(tool_calls)+tool pair.
     assert.ok(state.calls.length >= 2, 'expected at least 2 model calls');
     const round2 = state.calls[1].messages;
 
     assertQwen3Safe(round2);
+    assertHasToolProtocolPair(round2, 'call_todo_1');
     assert.ok(
       round2.some((m: any) => m.role === 'user' && m.content === 'please plan'),
-      'original user request must remain active'
+      'original user request must remain in transcript'
     );
-    assert.ok(
-      round2.some((m: any) => m.role === 'assistant' && String(m.content).includes('added')),
-      'tool result must be represented as active-context text'
-    );
-    assert.ok(!round2.some((m: any) => m.role === 'tool'), 'raw tool messages must not be sent');
+    const toolResult = round2.find((m: any) => m.role === 'tool' && m.tool_call_id === 'call_todo_1');
+    assert.match(String(toolResult?.content ?? ''), /item one|added/i);
   } finally {
     restore();
   }
 });
 
-test('messages: tool-heavy active context still sends user message', async () => {
+test('zimoos request context: current frame is latest-message only and history keeps Action + Summary', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    const frame1 = makeZimoosFrame({
+      frameId: 'frame-one',
+      frameCursor: 'cursor-one',
+      title: 'Frame One Title',
+      summary: 'Frame one summary should not remain as old live state',
+      visibleContent: [
+        { itemId: 'one', kind: 'panel', title: 'Frame One Visible', content: 'old visible text', priority: 1 },
+      ],
+      shortcuts: [
+        { id: 's1', cmd: 'open app:one', label: 'Open One', effectPreview: 'open one', riskLevel: 'safe', requiresConfirmation: false },
+      ],
+    });
+    const frame2 = makeZimoosFrame({
+      frameId: 'frame-two',
+      frameCursor: 'cursor-two',
+      title: 'Frame Two Title',
+      summary: 'Frame two summary should be replaced by third frame',
+      visibleContent: [
+        { itemId: 'two', kind: 'panel', title: 'Frame Two Visible', content: 'intermediate visible text', priority: 1 },
+      ],
+      shortcuts: [
+        { id: 's2', cmd: 'open app:two', label: 'Open Two', effectPreview: 'open two', riskLevel: 'safe', requiresConfirmation: false },
+      ],
+    });
+    const frame3 = makeZimoosFrame({
+      frameId: 'frame-three',
+      frameCursor: 'cursor-three',
+      title: 'Frame Three Title',
+      summary: 'Frame three summary is the current live state',
+      visibleContent: [
+        { itemId: 'three', kind: 'panel', title: 'Frame Three Visible', content: 'latest visible text', priority: 1 },
+      ],
+      shortcuts: [
+        { id: 's3', cmd: 'open app:three', label: 'Open Three', effectPreview: 'open three', riskLevel: 'safe', requiresConfirmation: false },
+      ],
+    });
+    const sessionDir = mktmp('ma-zimoos-session-');
+    const sessionStore = createSessionStore(sessionDir);
+    const sessionId = sessionStore.create({
+      createdAt: Date.now(),
+      cwd: process.cwd(),
+      model: 'stub-model',
+    });
+    const agent = await createAgent(
+      makeConfig(),
+      makeZimoosConnection([
+        { content: JSON.stringify(frame1) },
+        { content: JSON.stringify(frame2) },
+        { content: JSON.stringify(frame3) },
+      ]),
+      { sessionStore, sessionId }
+    );
+
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({
+        toolCalls: [
+          {
+            id: 'call_current',
+            name: 'renamed-mteam__zimoos_x2e_current',
+            arguments: '{}',
+          },
+        ],
+      }),
+    });
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({
+        content: 'Summary: current frame showed Frame One.',
+        toolCalls: [
+          {
+            id: 'call_act',
+            name: 'renamed-mteam__zimoos_x2e_act',
+            arguments: JSON.stringify({ frameCursor: 'cursor-one', cmd: 'open app:two' }),
+          },
+        ],
+      }),
+    });
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({
+        content: 'Summary: action opened Frame Two.',
+        toolCalls: [
+          {
+            id: 'call_search',
+            name: 'renamed-mteam__zimoos_x2e_search',
+            arguments: JSON.stringify({ query: 'open app three' }),
+          },
+        ],
+      }),
+    });
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({ content: 'Summary: search showed Frame Three.' }),
+    });
+
+    const events = await drain(agent.chat('inspect zimoos live slot'));
+
+    assert.ok(state.calls.length >= 4, 'expected initial call plus three post-frame calls');
+    const finalRequest = state.calls[3].messages;
+    assertToolCallPaired(finalRequest);
+    assertSystemFirst(finalRequest);
+    const finalCarrier = assertOnlyLatestZimoosCarrier(finalRequest);
+    assert.match(finalCarrier, /frameCursor:\s*cursor-three/);
+    assert.match(finalCarrier, /Frame Three Title/);
+    assert.match(finalCarrier, /Frame Three Visible/);
+    assert.match(finalCarrier, /open app:three/);
+    assert.doesNotMatch(finalCarrier, /cursor-one|cursor-two|Frame One Title|Frame Two Title/);
+
+    const persistedAfterFirstTurn = sessionStore.load(sessionId);
+    assertNoZimoosStateMarkers(
+      persistedAfterFirstTurn,
+      'session JSONL after zimoos current/act/search'
+    );
+
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({ content: 'follow-up done' }),
+    });
+    await drain(agent.chat('verify zimoos operation history'));
+
+    const followUpRequest = state.calls[state.calls.length - 1].messages;
+    assertToolCallPaired(followUpRequest);
+    const followUpCarrier = assertOnlyLatestZimoosCarrier(followUpRequest);
+    assert.match(followUpCarrier, /frameCursor:\s*cursor-three/);
+    assertZimoosActionSummaryHistory(followUpRequest);
+    assertNoZimoosStateMarkers(
+      sessionStore.load(sessionId),
+      'session JSONL after follow-up'
+    );
+
+    const toolResults = events.filter((ev) => ev.type === 'tool:result');
+    assert.ok(toolResults.some((ev) => ev.type === 'tool:result' && /live slot zimoos\.currentFrame/.test(ev.content)));
+    const usage = events.filter((ev) => ev.type === 'context:usage');
+    assert.ok(usage.length >= 3, 'context usage should be emitted for each request loop');
+  } finally {
+    restore();
+  }
+});
+
+test('zimoos live slot: error and malformed results do not replace previous frame', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    const agent = await createAgent(
+      makeConfig(),
+      makeZimoosConnection([
+        { content: JSON.stringify(makeZimoosFrame({ frameCursor: 'cursor-good', title: 'Good Frame' })) },
+        { content: 'Error: stale frame cursor', isError: true },
+        { content: JSON.stringify({ protocol: 'zimoos/os-frame', version: '0.1' }) },
+      ])
+    );
+
+    for (const [id, name, args] of [
+      ['call_good', 'renamed-mteam__zimoos_x2e_current', '{}'],
+      ['call_error', 'renamed-mteam__zimoos_x2e_act', JSON.stringify({ frameCursor: 'cursor-good', cmd: 'bad' })],
+      ['call_bad', 'renamed-mteam__zimoos_x2e_search', JSON.stringify({ query: 'bad-frame' })],
+    ] as const) {
+      state.responses.push({
+        kind: 'stream',
+        chunks: streamChunks({
+          toolCalls: [{ id, name, arguments: args }],
+        }),
+      });
+    }
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({ content: 'done' }),
+    });
+
+    await drain(agent.chat('check zimoos error handling'));
+
+    assert.ok(state.calls.length >= 4, 'expected final provider request after three tool calls');
+    const finalRequest = state.calls[3].messages;
+    const carrier = assertOnlyLatestZimoosCarrier(finalRequest);
+    assert.match(carrier, /frameCursor:\s*cursor-good/);
+    assert.match(carrier, /Good Frame/);
+    assert.doesNotMatch(carrier, /cursor-error/);
+    assert.doesNotMatch(carrier, /bad-frame title/);
+  } finally {
+    restore();
+  }
+});
+
+test('messages: tool-heavy append-only transcript still sends user message and paired tools', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);
   try {
@@ -374,17 +759,18 @@ test('messages: tool-heavy active context still sends user message', async () =>
 
     assertQwen3Safe(last);
     assertNoEmptyAssistant(last);
+    assertHasToolProtocolPair(last);
     const nonSystem = last.filter((m: any) => m.role !== 'system');
     assert.ok(
       nonSystem.length > 0,
-      'active context request must not collapse to only system'
+      'append-only request must not collapse to only system'
     );
   } finally {
     restore();
   }
 });
 
-test('messages: follow-up context preserves root user and textualized tool result', async () => {
+test('messages: follow-up transcript preserves root user and paired tool result', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);
   try {
@@ -427,13 +813,11 @@ test('messages: follow-up context preserves root user and textualized tool resul
 
     assert.ok(
       last.some((m: any) => m.role === 'user' && m.content === 'second ask'),
-      'current root user message must remain in active context'
+      'current root user message must remain in transcript'
     );
-    assert.ok(
-      last.some((m: any) => m.role === 'assistant' && String(m.content).includes('added')),
-      'prior tool result must be textualized in active context'
-    );
-    assert.ok(!last.some((m: any) => m.role === 'tool'), 'raw tool protocol messages must not be sent');
+    assertHasToolProtocolPair(last, 'call_a');
+    const toolResult = last.find((m: any) => m.role === 'tool' && m.tool_call_id === 'call_a');
+    assert.match(String(toolResult?.content ?? ''), /step 1|added/i);
   } finally {
     restore();
   }
@@ -548,7 +932,7 @@ test('messages: thinking tokens are stripped from assistant content', async () =
         typeof m.content === 'string' &&
         m.content.includes('real-visible-answer')
     );
-    assert.ok(asst, 'assistant visible content must exist in active context');
+    assert.ok(asst, 'assistant visible content must exist in provider transcript');
 
     const content =
       typeof asst.content === 'string'
@@ -579,7 +963,7 @@ test('messages: thinking tokens are stripped from assistant content', async () =
   }
 });
 
-test('messages: deepseek active context does not replay reasoning protocol fields', async () => {
+test('messages: deepseek provider transcript does not replay reasoning protocol fields', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);
   try {
@@ -624,7 +1008,7 @@ test('messages: deepseek active context does not replay reasoning protocol field
     assertQwen3Safe(round2);
     assert.ok(
       !round2.some((m: any) => m.reasoning_content !== undefined),
-      'active context requests must not replay reasoning_content'
+      'provider transcript requests must not replay reasoning_content'
     );
   } finally {
     restore();
@@ -1083,7 +1467,7 @@ test('messages: user message exists with assistant+tool-heavy context', async ()
     const hasUserMsg = lastCall.some((m: any) => m.role === 'user');
     assert.ok(
       hasUserMsg,
-      'active context must keep a user message in model context'
+      'append-only request must keep a user message in model context'
     );
 
     // The user message should contain the task prompt (truncated to 200 chars)
@@ -1134,6 +1518,127 @@ test('agent UX: compact failure emits actionable user summary before task failed
     assert.match(failed.error, /context|上下文|compact/i);
   } finally {
     restore();
+  }
+});
+
+test('messages: large image tool results are never truncated and full provider body stays below byte gate', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    const firstImage = `data:image/png;base64,${Buffer.alloc(100_000, 3).toString('base64')}`;
+    const secondImage = `data:image/png;base64,${Buffer.alloc(100_000, 4).toString('base64')}`;
+    let captureIndex = 0;
+    const connection: McpConnection = {
+      name: 'screen',
+      process: {} as any,
+      tools: [{
+        name: 'capture',
+        description: 'capture a screenshot',
+        inputSchema: { type: 'object', properties: {} },
+      }],
+      call: async () => ({
+        content: captureIndex++ === 0 ? firstImage : secondImage,
+        isError: false,
+      }),
+      close: async () => {},
+    };
+    const resumeMessages: ChatCompletionMessageParam[] = [];
+    for (let i = 0; i < 12; i++) {
+      resumeMessages.push(
+        { role: 'user', content: `historical-${i}:` + 'h'.repeat(15_000) },
+        { role: 'assistant', content: `historical answer ${i}` }
+      );
+    }
+    const agent = await createAgent(makeConfig({
+      model: {
+        provider: 'deepseek',
+        baseURL: 'https://api.deepseek.com',
+        model: 'deepseek-v4-flash',
+        apiKey: 'stub-key',
+        contextWindow: 1_000_000,
+        contextWindowSource: 'registry',
+      },
+    }), [connection], { resumeMessages });
+
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({
+        toolCalls: [
+          { index: 0, id: 'call_image_1', name: 'screen__capture', arguments: '{}' },
+          { index: 1, id: 'call_image_2', name: 'screen__capture', arguments: '{}' },
+        ],
+      }),
+    });
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({ content: 'image inspection completed' }),
+    });
+
+    const events = await drain(agent.chat('capture and inspect both images'));
+
+    assert.equal(state.calls.length, 2);
+    const secondBody = state.calls[1].body;
+    for (const [index, call] of state.calls.entries()) {
+      assert.ok(
+        Buffer.byteLength(JSON.stringify(call.body), 'utf8') <= DEEPSEEK_REQUEST_BODY_BYTE_LIMIT,
+        `serialized DeepSeek provider request ${index} must stay below the hard body limit`
+      );
+    }
+    assertToolCallPaired(secondBody.messages);
+    const serialized = JSON.stringify(secondBody.messages);
+    assert.equal((serialized.match(/"type":"image_url"/g) ?? []).length, 1);
+    assert.match(serialized, /current-turn image omitted because request byte budget was exceeded/);
+    assert.doesNotMatch(serialized, /\[\.\.\.truncated \d+ chars\.\.\.\]/);
+    assert.ok(events.some((event) =>
+      event.type === 'warning' && /model did not receive those pixels/i.test(event.message)
+    ));
+  } finally {
+    restore();
+  }
+});
+
+test('messages: OpenAI and LM Studio requests above DeepSeek limit are not prematurely windowed', async () => {
+  for (const model of [
+    {
+      provider: 'openai',
+      baseURL: 'https://api.openai.com/v1',
+      model: 'gpt-4.1',
+      apiKey: 'stub-key',
+    },
+    {
+      provider: 'lmstudio',
+      baseURL: 'http://127.0.0.1:1234/v1',
+      model: 'local-model',
+      apiKey: 'lm-studio',
+    },
+  ]) {
+    const state: MockState = { responses: [], calls: [] };
+    const restore = installOpenAiMock(state);
+    try {
+      const agent = await createAgent(makeConfig({
+        model: {
+          ...model,
+          contextWindow: 262_144,
+        },
+      }), makeConnections());
+      state.responses.push({
+        kind: 'stream',
+        chunks: streamChunks({ content: 'accepted long request' }),
+      });
+
+      const events = await drain(agent.chat('x'.repeat(300_000)));
+
+      assert.equal(state.calls.length, 1, `${model.provider} should reach provider`);
+      const bodyBytes = Buffer.byteLength(JSON.stringify(state.calls[0].body), 'utf8');
+      assert.ok(bodyBytes > DEEPSEEK_REQUEST_BODY_BYTE_LIMIT);
+      assert.equal(
+        events.some((event) => event.type === 'compact:done'),
+        false,
+        `${model.provider} must not inherit DeepSeek's 240 KiB cap`
+      );
+    } finally {
+      restore();
+    }
   }
 });
 
@@ -1674,6 +2179,69 @@ test('local model params: chat request includes qwen/lm-studio sampling controls
     assert.equal(body.max_tokens, 4096);
     assert.equal(body.seed, 123);
     assert.equal(body.maxOutputChars, undefined);
+  } finally {
+    restore();
+  }
+});
+
+test('messages: truncated output appends an internal continuation nudge on the next request', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    const agent = await createAgent(makeConfig(), makeConnections());
+    const firstPart = '第一段产品文档内容，需要继续展开架构、边界、验收和风险。'.repeat(4);
+    state.responses.push(
+      {
+        kind: 'stream',
+        chunks: streamChunks({ content: firstPart, finishReason: 'length' }),
+      },
+      {
+        kind: 'stream',
+        chunks: streamChunks({ content: '从断点继续补完剩余验收标准。', finishReason: 'stop' }),
+      }
+    );
+
+    const events = await drain(agent.chat('写一份较长的产品文档'));
+
+    assert.equal(state.calls.length, 2);
+    assert.ok(
+      events.some((ev) => ev.type === 'warning' && /token limit reached/.test(ev.message)),
+      'expected truncation warning'
+    );
+    const secondRequestText = messagesText(state.calls[1].messages);
+    assert.match(secondRequestText, /\[MA internal continuation request\]/);
+    assert.match(secondRequestText, /Continue exactly from the cutoff point/);
+    assert.match(secondRequestText, /Do not repeat earlier sentences/);
+    assert.match(secondRequestText, /第一段产品文档内容/);
+  } finally {
+    restore();
+  }
+});
+
+test('messages: repeated continuation output is not persisted or continued again', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    const agent = await createAgent(makeConfig(), makeConnections());
+    const repeated = '好的，现在开始创建产品文档。让我先创建 PRD 文档，并继续基于这些结果推进。'.repeat(5);
+    state.responses.push(
+      {
+        kind: 'stream',
+        chunks: streamChunks({ content: repeated, finishReason: 'length' }),
+      },
+      {
+        kind: 'stream',
+        chunks: streamChunks({ content: repeated, finishReason: 'stop' }),
+      }
+    );
+
+    const events = await drain(agent.chat('创建产品文档'));
+
+    assert.equal(state.calls.length, 2);
+    assert.ok(
+      events.some((ev) => ev.type === 'warning' && /repeated prior truncated output/.test(ev.message)),
+      'expected repeated continuation warning'
+    );
   } finally {
     restore();
   }

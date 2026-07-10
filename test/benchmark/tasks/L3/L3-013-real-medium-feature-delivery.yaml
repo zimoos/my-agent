@@ -1,0 +1,45 @@
+id: "L3-013"
+title: "Real scenario medium: ship note search with product docs"
+level: "L3"
+category: "real-scenario-medium"
+weight: 1.25
+
+fixture:
+  project: "feature-small-notes"
+  setup: []
+
+prompt: |
+  这是一次真实交付测试。请把这个 notes 模块当成一个小功能发布。
+  你需要完成：
+  1. 实现 searchNotes(notes, query)，支持按 title/body 大小写不敏感搜索，query 需要 trim。
+  2. 保持 listNotes 现有 API 不破坏。
+  3. 创建 PRD.md，说明用户问题、功能范围、验收标准。
+  4. 创建 TECH_ARCHITECTURE.md，说明实现方案、数据流、测试边界。
+  5. 运行 npm test，并在最终回复里说明测试结果。
+  不要修改 tests/ 下已有测试。benchmark 会在临时 workspace 运行并清理 demo。
+
+rubric_points:
+  - "searchNotes 正确实现 title/body 大小写不敏感搜索"
+  - "listNotes API 未破坏"
+  - "PRD.md 和 TECH_ARCHITECTURE.md 都已创建且内容贴合功能"
+  - "npm test 通过"
+  - "未修改 tests/notes.test.js"
+
+no_modify_files:
+  - "tests/notes.test.js"
+
+objective_checks:
+  - command: "npm test"
+    weight_into: "Correctness"
+  - command: "test -f PRD.md"
+    weight_into: "TaskCompletion"
+  - command: "test -f TECH_ARCHITECTURE.md"
+    weight_into: "TaskCompletion"
+  - command: "node -e \"const {searchNotes}=require('./src/notes'); if (typeof searchNotes !== 'function') process.exit(1)\""
+    weight_into: "Correctness"
+  - command: "git diff --quiet HEAD -- tests/notes.test.js"
+    weight_into: "NoRegression"
+
+runtime:
+  timeout_sec: 540
+  runs: 2

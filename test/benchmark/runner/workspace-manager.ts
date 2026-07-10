@@ -1,4 +1,4 @@
-import { cpSync, existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { appendFileSync, cpSync, existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, execSync } from 'node:child_process';
@@ -21,6 +21,9 @@ export interface WorkspaceDiff {
   summary: string;
 }
 
+const DEPENDENCY_CACHE_EXCLUDE = ':(exclude,glob)**/node_modules/**';
+const WORKSPACE_DIFF_PATHS = ['.', DEPENDENCY_CACHE_EXCLUDE];
+
 function runGit(args: string[], cwd: string): string {
   return execFileSync('git', args, {
     cwd,
@@ -30,12 +33,25 @@ function runGit(args: string[], cwd: string): string {
   });
 }
 
+function stageWorkspaceChanges(workdir: string): void {
+  runGit(['add', '-A', '--', ...WORKSPACE_DIFF_PATHS], workdir);
+}
+
+function addDependencyCacheIgnore(workdir: string): void {
+  appendFileSync(
+    join(workdir, '.git', 'info', 'exclude'),
+    '\n# Benchmark dependency caches are never submission evidence.\nnode_modules/\n',
+    'utf-8',
+  );
+}
+
 function gitInitWithBaseline(workdir: string): void {
   runGit(['init', '--quiet', '--initial-branch=main'], workdir);
   runGit(['config', 'user.email', 'bench@local'], workdir);
   runGit(['config', 'user.name', 'bench'], workdir);
   runGit(['config', 'commit.gpgsign', 'false'], workdir);
-  runGit(['add', '-A'], workdir);
+  addDependencyCacheIgnore(workdir);
+  stageWorkspaceChanges(workdir);
   // 允许空目录也能提交，setup 可能还会再改
   runGit(['commit', '--quiet', '--allow-empty', '-m', 'initial'], workdir);
 }
@@ -49,28 +65,35 @@ export async function prepareWorkspace(
   }
 
   const workdir = mkdtempSync(join(tmpdir(), 'ma-bench-workspace-'));
-
-  cpSync(fixtureDir, workdir, { recursive: true });
-
-  gitInitWithBaseline(workdir);
-
-  if (setup && setup.length > 0) {
-    for (const cmd of setup) {
-      execSync(cmd, { cwd: workdir, stdio: 'pipe' });
-    }
-    // setup 产物进入基线：后续 agent 的 diff 才只反映 agent 改动
-    runGit(['add', '-A'], workdir);
-    const status = runGit(['status', '--porcelain'], workdir);
-    if (status.trim().length > 0) {
-      runGit(['commit', '--quiet', '-m', 'setup'], workdir);
-    }
-  }
-
   const cleanup = async (): Promise<void> => {
     rmSync(workdir, { recursive: true, force: true });
   };
 
-  return { workdir, cleanup };
+  try {
+    cpSync(fixtureDir, workdir, { recursive: true });
+
+    gitInitWithBaseline(workdir);
+
+    if (setup && setup.length > 0) {
+      for (const cmd of setup) {
+        execSync(cmd, { cwd: workdir, stdio: 'pipe' });
+      }
+      // setup 产物进入基线：后续 agent 的 diff 才只反映 agent 改动
+      stageWorkspaceChanges(workdir);
+      const staged = runGit(
+        ['diff', '--cached', '--name-only', '--', ...WORKSPACE_DIFF_PATHS],
+        workdir,
+      );
+      if (staged.trim().length > 0) {
+        runGit(['commit', '--quiet', '-m', 'setup'], workdir);
+      }
+    }
+
+    return { workdir, cleanup };
+  } catch (err) {
+    await cleanup();
+    throw err;
+  }
 }
 
 function parseNameStatus(raw: string): Array<{ path: string; status: WorkspaceFileStatus }> {
@@ -130,15 +153,21 @@ export async function collectDiff(workdir: string): Promise<WorkspaceDiff> {
     throw new Error(`workdir not found: ${workdir}`);
   }
 
-  runGit(['add', '-A'], workdir);
+  stageWorkspaceChanges(workdir);
 
-  const nameStatusRaw = runGit(['diff', '--cached', '--name-status'], workdir);
+  const nameStatusRaw = runGit(
+    ['diff', '--cached', '--name-status', '--', ...WORKSPACE_DIFF_PATHS],
+    workdir,
+  );
   const entries = parseNameStatus(nameStatusRaw);
 
-  const diffRaw = runGit(['diff', '--cached'], workdir);
+  const diffRaw = runGit(['diff', '--cached', '--', ...WORKSPACE_DIFF_PATHS], workdir);
   const diffByFile = splitDiffByFile(diffRaw);
 
-  const summary = runGit(['diff', '--cached', '--stat'], workdir).trimEnd();
+  const summary = runGit(
+    ['diff', '--cached', '--stat', '--', ...WORKSPACE_DIFF_PATHS],
+    workdir,
+  ).trimEnd();
 
   const files: WorkspaceFileDiff[] = entries.map((e) => ({
     path: e.path,

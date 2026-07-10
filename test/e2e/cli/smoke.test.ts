@@ -1,16 +1,42 @@
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import assert from 'node:assert';
-import { spawnMa, sendLine, waitFor, stripAnsi, killMa } from '../helpers/pty.js';
+import {
+  canSpawnPty,
+  spawnMa,
+  sendLine,
+  waitFor,
+  stripAnsi,
+  killMa,
+} from '../helpers/pty.js';
+import {
+  defaultE2ECwd,
+  e2eConfigSkipReason,
+  resolveE2EConfigPath,
+} from '../helpers/real-env.js';
 
-const SUPERCELL = '/Users/zhuqingyu/project/supercell';
+function requireConfig(t: TestContext): string | null {
+  const configPath = resolveE2EConfigPath();
+  if (!configPath) {
+    t.skip(e2eConfigSkipReason());
+    return null;
+  }
+  return configPath;
+}
 
 async function waitReady(proc: ReturnType<typeof spawnMa>): Promise<void> {
   await waitFor(proc, (out) => stripAnsi(out).includes('session'), 20000);
   await new Promise((r) => setTimeout(r, 12000));
 }
 
-test('L3 smoke: banner shows session/MA/exec/fs', { timeout: 60000 }, async () => {
-  const proc = spawnMa(SUPERCELL);
+test('L3 smoke: banner shows session/MA/exec/fs', { timeout: 60000 }, async (t) => {
+  const ptyProbe = await canSpawnPty();
+  if (!ptyProbe.ok) {
+    t.skip(`node-pty unavailable: ${ptyProbe.reason}`);
+    return;
+  }
+  const configPath = requireConfig(t);
+  if (!configPath) return;
+  const proc = spawnMa(defaultE2ECwd(), { configPath });
   try {
     const banner = await waitFor(
       proc,
@@ -34,8 +60,15 @@ test('L3 smoke: banner shows session/MA/exec/fs', { timeout: 60000 }, async () =
   await new Promise((r) => setTimeout(r, 3000));
 });
 
-test('L3 smoke: /tools lists tools', { timeout: 60000 }, async () => {
-  const proc = spawnMa(SUPERCELL);
+test('L3 smoke: /tools lists tools', { timeout: 60000 }, async (t) => {
+  const ptyProbe = await canSpawnPty();
+  if (!ptyProbe.ok) {
+    t.skip(`node-pty unavailable: ${ptyProbe.reason}`);
+    return;
+  }
+  const configPath = requireConfig(t);
+  if (!configPath) return;
+  const proc = spawnMa(defaultE2ECwd(), { configPath });
   try {
     await waitReady(proc);
     await sendLine(proc, '/tools');
@@ -58,8 +91,15 @@ test('L3 smoke: /tools lists tools', { timeout: 60000 }, async () => {
   await new Promise((r) => setTimeout(r, 3000));
 });
 
-test('L3 smoke: /quit exits cleanly', { timeout: 60000 }, async () => {
-  const proc = spawnMa(SUPERCELL);
+test('L3 smoke: /quit exits cleanly', { timeout: 60000 }, async (t) => {
+  const ptyProbe = await canSpawnPty();
+  if (!ptyProbe.ok) {
+    t.skip(`node-pty unavailable: ${ptyProbe.reason}`);
+    return;
+  }
+  const configPath = requireConfig(t);
+  if (!configPath) return;
+  const proc = spawnMa(defaultE2ECwd(), { configPath });
   let exited = false;
   let exitCode: number | undefined;
   proc.onExit((e) => {

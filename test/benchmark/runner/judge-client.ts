@@ -60,6 +60,9 @@ const SYSTEM_INSTRUCTION = `你是严格的资深 code reviewer，对一份 agen
 const GPT_JUDGE_MODEL = 'gpt-4o';
 const CLAUDE_JUDGE_MODEL = 'claude-sonnet-4-6';
 
+export const MAX_WORKSPACE_DIFF_CHARS = 120_000;
+const MIN_STRUCTURED_FILE_BUDGET = 160;
+
 // ─── Pure helpers (exported for unit tests) ───
 
 export function selectJudgeModel(underlyingModel: string): string {
@@ -67,6 +70,81 @@ export function selectJudgeModel(underlyingModel: string): string {
     return GPT_JUDGE_MODEL;
   }
   return CLAUDE_JUDGE_MODEL;
+}
+
+function splitWorkspaceDiffByFile(diff: string): string[] {
+  const starts = Array.from(diff.matchAll(/^diff --git /gm), (match) => match.index ?? 0);
+  if (starts.length === 0) return [];
+  if (starts[0] !== 0) starts[0] = 0;
+  return starts.map((start, index) => diff.slice(start, starts[index + 1] ?? diff.length));
+}
+
+function allocateFairBudgets(lengths: number[], total: number): number[] {
+  const budgets = lengths.map(() => 0);
+  let remaining = total;
+  let active = lengths.map((_, index) => index);
+
+  while (active.length > 0) {
+    const share = Math.floor(remaining / active.length);
+    const small = active.filter((index) => lengths[index] <= share);
+    if (small.length === 0) {
+      const remainder = remaining - share * active.length;
+      active.forEach((index, position) => {
+        budgets[index] = share + (position < remainder ? 1 : 0);
+      });
+      break;
+    }
+
+    for (const index of small) {
+      budgets[index] = lengths[index];
+      remaining -= lengths[index];
+    }
+    const smallSet = new Set(small);
+    active = active.filter((index) => !smallSet.has(index));
+  }
+
+  return budgets;
+}
+
+function truncateMiddle(text: string, budget: number): string {
+  if (text.length <= budget) return text;
+
+  let marker = '';
+  for (let iteration = 0; iteration < 10; iteration++) {
+    const retained = Math.max(0, budget - marker.length);
+    const next = `\n... [WORKSPACE DIFF OMITTED: ${text.length - retained} chars from middle] ...\n`;
+    if (next === marker) break;
+    marker = next;
+  }
+
+  const retained = Math.max(0, budget - marker.length);
+  const headLength = Math.ceil(retained / 2);
+  const tailLength = retained - headLength;
+  return text.slice(0, headLength) + marker + text.slice(text.length - tailLength);
+}
+
+function limitWorkspaceDiff(diff: string): string {
+  if (diff.length <= MAX_WORKSPACE_DIFF_CHARS) return diff;
+
+  const sections = splitWorkspaceDiffByFile(diff);
+  const structured = sections.length > 0;
+  const canAllocatePerFile = structured
+    && Math.floor((MAX_WORKSPACE_DIFF_CHARS - 200) / sections.length) >= MIN_STRUCTURED_FILE_BUDGET;
+  const mode = canAllocatePerFile
+    ? 'per-file fair allocation; every truncated file keeps head and tail'
+    : 'global head/tail fallback because file count prevents useful per-file allocation';
+  const notice = `[WORKSPACE DIFF TRUNCATED: original=${diff.length} chars; limit=${MAX_WORKSPACE_DIFF_CHARS} chars; ${mode}]\n`;
+  const available = MAX_WORKSPACE_DIFF_CHARS - notice.length;
+
+  if (!canAllocatePerFile) {
+    return notice + truncateMiddle(diff, available);
+  }
+
+  const budgets = allocateFairBudgets(
+    sections.map((section) => section.length),
+    available,
+  );
+  return notice + sections.map((section, index) => truncateMiddle(section, budgets[index])).join('');
 }
 
 export function buildJudgePrompt(input: JudgeInput): string {
@@ -87,6 +165,10 @@ export function buildJudgePrompt(input: JudgeInput): string {
         .join('\n')
     : '  （无客观检查）';
 
+  const workspaceDiff = input.workspaceDiff
+    ? limitWorkspaceDiff(input.workspaceDiff)
+    : '（空 diff）';
+
   return [
     `## 任务描述`,
     input.taskDescription,
@@ -99,7 +181,7 @@ export function buildJudgePrompt(input: JudgeInput): string {
     ref,
     `## 被测提交：工作区 diff`,
     '```diff',
-    input.workspaceDiff || '（空 diff）',
+    workspaceDiff,
     '```',
     ``,
     `## 被测提交：最终回复`,

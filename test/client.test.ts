@@ -198,6 +198,103 @@ test('McpClient.call: parses content array into joined text', async () => {
   assert.equal(r.isError, false);
 });
 
+test('McpClient.call: preserves namespaced structured evidence and raw _meta', async () => {
+  const proc = fakeProc();
+  const client = new McpClient('fs', proc);
+  const structuredContent = {
+    'my-agent/evidence': {
+      operation: 'write_file',
+      status: 'verified',
+      artifacts: [{ type: 'file', path: '/tmp/result.txt' }],
+    },
+  };
+  const meta = {
+    'my-agent/evidence-source': {
+      server: 'fs',
+      tool: 'write_file',
+    },
+    traceId: 'trace-structured-evidence-1',
+  };
+
+  proc.stdin.on('data', (chunk: Buffer) => {
+    for (const line of chunk.toString('utf-8').split('\n')) {
+      if (!line.trim()) continue;
+      const message = JSON.parse(line);
+      if (message.method !== 'tools/call') continue;
+      proc.stdout.write(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: message.id,
+          result: {
+            content: [{ type: 'text', text: 'wrote /tmp/result.txt' }],
+            structuredContent,
+            _meta: meta,
+            isError: false,
+          },
+        }) + '\n'
+      );
+    }
+  });
+
+  const result = await client.call('write_file', {
+    path: '/tmp/result.txt',
+    content: 'done\n',
+  });
+
+  assert.equal(result.content, 'wrote /tmp/result.txt');
+  assert.equal(result.isError, false);
+  assert.deepEqual((result as any).structuredContent, structuredContent);
+  assert.deepEqual((result as any)._meta, meta);
+});
+
+test('McpClient.call: sends progress token and dispatches progress notifications', async () => {
+  const proc = fakeProc();
+  const client = new McpClient('agora', proc);
+  const progress: any[] = [];
+
+  proc.stdin.on('data', (chunk: Buffer) => {
+    for (const line of chunk.toString('utf-8').split('\n')) {
+      if (!line.trim()) continue;
+      const m = JSON.parse(line);
+      if (m.method !== 'tools/call') continue;
+      const token = m.params?._meta?.progressToken;
+      assert.equal(typeof token, 'string');
+      proc.stdout.write(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'notifications/progress',
+          params: {
+            progressToken: token,
+            progress: 40,
+            total: 100,
+            message: '{"kind":"event","event":{"phase":"model_load"}}',
+          },
+        }) + '\n'
+      );
+      proc.stdout.write(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: m.id,
+          result: {
+            content: [{ type: 'text', text: '{"ok":true}' }],
+            isError: false,
+          },
+        }) + '\n'
+      );
+    }
+  });
+
+  const result = await client.call('chat_complete', { model: 'qwen' }, undefined, (event) => {
+    progress.push(event);
+  });
+
+  assert.equal(result.content, '{"ok":true}');
+  assert.equal(progress.length, 1);
+  assert.equal(progress[0].progress, 40);
+  assert.equal(progress[0].total, 100);
+  assert.match(progress[0].message, /model_load/);
+});
+
 test('McpClient: exit rejects pending requests', async () => {
   const proc = fakeProc();
   const client = new McpClient('exec', proc);

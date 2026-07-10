@@ -6,10 +6,13 @@ DeepSeek in minutes. Local small models turned into real productivity.
 
 MA is a terminal coding agent built around two practical promises: remote setup should be brainless, and local small models should become useful production tools. DeepSeek config is interactive and direct. LM Studio/Qwen gets long-context handling, tool hardening, model switching, and benchmark-driven fixes so small models can do real repo work.
 
-`v0.1.2-alpha` supports LM Studio local models and DeepSeek official API today. More OpenAI-compatible providers are next.
+`v0.1.2-alpha` supports LM Studio local models, DeepSeek official API, and Agora through MCP stdio. Agora is MA's local-first provider integration: it exposes real model-loading and MemoryPatch state instead of pretending memory was added to a prompt.
 
-Website: https://zhuqingyv.github.io/my-agent/  
-Release: https://github.com/zhuqingyv/my-agent/releases/tag/v0.1.2-alpha
+Website: https://zimoos.github.io/my-agent/
+
+Release: https://github.com/zimoos/my-agent/releases/tag/v0.1.2-alpha
+
+[Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Discussions](https://github.com/zimoos/my-agent/discussions)
 
 ![MA terminal UI preview](website/assets/tui-preview.svg)
 
@@ -80,7 +83,7 @@ The portable bundle includes Node.js and production dependencies. No global Node
 ### From source
 
 ```bash
-git clone https://github.com/zhuqingyv/my-agent.git
+git clone https://github.com/zimoos/my-agent.git
 cd my-agent
 npm install
 npm run build
@@ -161,6 +164,12 @@ DeepSeek/deepseek-v4-flash
 
 `/model` aggregates models from configured providers, prefixes them by credential/provider name, and remembers the last selected profile.
 
+## Agora: Native Local Runtime and Memory
+
+MA can run Agora as a provider-owned MCP stdio subprocess instead of asking users to manage a local HTTP server. The TUI reports real provider stages such as local-model loading, memory mounting, and generation.
+
+When the active provider is Agora, MA can expose verified MemoryPatch operations: mount, disable, internalize, roll back, and inspect state. MA treats a memory module as active only after Agora returns matching response metadata; it never fakes memory by injecting facts into a prompt.
+
 ## Built-In Tools
 
 MA starts with built-in MCP servers:
@@ -236,6 +245,14 @@ npm run build
 npm run release:check
 ```
 
+See [CHANGELOG.md](CHANGELOG.md) for unreleased reliability work and [ROADMAP.md](ROADMAP.md) for the public product direction.
+
+## Community
+
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+- Report vulnerabilities privately under [SECURITY.md](SECURITY.md), not in a public issue.
+- Discussions are enabled for questions, ideas, and model/runtime reports.
+
 ## License
 
-MIT
+MA is released under the [MIT License](LICENSE). You may use, modify, distribute, sublicense, and sell copies of MA, provided that the copyright and license notice are retained.

@@ -13,7 +13,7 @@ import { deleteSecret, maskSecret, readSecret, repairSecretAccess } from '../sec
 import { createSessionStore } from '../session/store.js';
 import { runInit } from '../init.js';
 import type { BootstrapResult } from '../index.js';
-import type { McpConnection } from '../mcp/types.js';
+import type { Agent, McpConnection } from '../mcp/types.js';
 import { App } from './App.js';
 import { VERSION } from './version.js';
 import { assertInteractiveInput, TerminalInputError } from './terminal.js';
@@ -21,6 +21,7 @@ import { runContextWatch } from './watch.js';
 import { createContextManager } from '../agent/context-manager.js';
 
 let activeConnections: McpConnection[] = [];
+let activeAgent: Agent | undefined;
 
 function parseResume(raw: string | boolean | undefined): string | true | undefined {
   if (raw === undefined) return undefined;
@@ -74,6 +75,7 @@ async function runChat(configPath: string | undefined, runOpts: RunChatOptions):
     const sessionStore = createSessionStore();
     let nextSessionId: string | null = null;
     activeConnections = connections;
+    activeAgent = agent;
 
     if (createdDefault) {
       console.log(pc.yellow(`Created ~/.my-agent/config.json — edit model settings there.`));
@@ -103,7 +105,7 @@ async function runChat(configPath: string | undefined, runOpts: RunChatOptions):
 
     const onSigint = (): void => {
       void (async () => {
-        await shutdown(connections);
+        await shutdown(connections, agent);
         process.exit(0);
       })();
     };
@@ -113,8 +115,9 @@ async function runChat(configPath: string | undefined, runOpts: RunChatOptions):
       await waitUntilExit();
     } finally {
       process.off('SIGINT', onSigint);
-      await shutdown(connections);
+      await shutdown(connections, agent);
       activeConnections = [];
+      activeAgent = undefined;
     }
 
     if (!nextSessionId) break;
@@ -133,6 +136,7 @@ async function runPrompt(configPath: string | undefined, prompt: string): Promis
 
   const { connections, agent } = boot;
   activeConnections = connections;
+  activeAgent = agent;
   let finalText = '';
 
   try {
@@ -164,8 +168,9 @@ async function runPrompt(configPath: string | undefined, prompt: string): Promis
     if (!finalText.endsWith('\n')) process.stdout.write('\n');
     process.stdout.write(`\n===FINAL_ANSWER===\n${finalText.trim()}\n===END===\n`);
   } finally {
-    await shutdown(connections);
+    await shutdown(connections, agent);
     activeConnections = [];
+    activeAgent = undefined;
   }
 }
 
@@ -249,11 +254,11 @@ async function main(): Promise<void> {
 
   const ctx = program
     .command('ctx')
-    .description('Manage MA active context');
+    .description('Inspect MA context index (debug/compat)');
 
   ctx
     .command('list')
-    .description('List active context items')
+    .description('List context sidecar items')
     .option('--session <id>', 'session id')
     .action((opts: { session?: string }) => {
       const sid = opts.session;
@@ -276,7 +281,7 @@ async function main(): Promise<void> {
 
   ctx
     .command('rm')
-    .description('Remove an active context item (moves to pool)')
+    .description('Move a context sidecar item to pool')
     .argument('<i>', 'context index')
     .option('--session <id>', 'session id')
     .action((i: string, opts: { session?: string }) => {
@@ -317,7 +322,7 @@ async function main(): Promise<void> {
 
   ctx
     .command('recall')
-    .description('Recall an entry from pool to active context')
+    .description('Recall a pool entry to the context sidecar')
     .argument('<id>', 'pool entry id or index')
     .option('--session <id>', 'session id')
     .action((id: string, opts: { session?: string }) => {
@@ -334,7 +339,7 @@ async function main(): Promise<void> {
 
   ctx
     .command('pin')
-    .description('Pin text into active context')
+    .description('Pin text into the context sidecar')
     .argument('<text>', 'text to pin')
     .option('--session <id>', 'session id')
     .action((text: string, opts: { session?: string }) => {
@@ -360,7 +365,7 @@ async function main(): Promise<void> {
 
   ctx
     .command('clear')
-    .description('Clear all active context')
+    .description('Clear context sidecar items')
     .option('--session <id>', 'session id')
     .action((opts: { session?: string }) => {
       const sid = opts.session;
@@ -525,7 +530,7 @@ main().catch(async (err) => {
   const error = err as Error;
   console.error(pc.red(`[fatal] ${error instanceof TerminalInputError ? error.message : error.stack ?? error.message}`));
   try {
-    await shutdown(activeConnections);
+    await shutdown(activeConnections, activeAgent);
   } catch {
     /* ignore shutdown errors during fatal cleanup */
   }

@@ -183,3 +183,62 @@ test('loadConfigDetailed: defaultProfile resolves model through env secretRef wi
     assert.equal(config.model.secretRef, 'env:MA_TEST_DEEPSEEK_KEY');
   });
 });
+
+test('loadConfigDetailed: defaultProfile maps Agora memory profile to MCP stdio provider config', () => {
+  const home = mktmp('my-agent-home-');
+  const proj = mktmp('my-agent-proj-');
+  fs.mkdirSync(path.join(home, '.my-agent'), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, '.my-agent', 'config.json'),
+    JSON.stringify({
+      defaultProfile: 'agora/qwen3.6-35b-a3b-q4',
+      model: {
+        extraParams: {
+          seed: 123,
+          metadata: { trace_id: 'keep-me' },
+        },
+      },
+      credentials: {
+        agora: {
+          provider: 'agora',
+          baseURL: 'http://127.0.0.1:8000/v1',
+          apiKeyMode: 'none',
+        },
+      },
+      profiles: {
+        'agora/qwen3.6-35b-a3b-q4': {
+          credentialId: 'agora',
+          model: 'qwen3.6-35b-a3b-q4',
+          agoraMemory: {
+            userId: 'agent-user',
+            projectId: 'my-agent',
+            conversationId: 'conv-001',
+            memoryProfile: 'profile-agora-demo',
+          },
+        },
+      },
+    })
+  );
+
+  withEnv({ HOME: home }, () => {
+    process.chdir(proj);
+    const { config } = loadConfigDetailed();
+    assert.equal(config.model.provider, 'agora');
+    assert.equal(config.model.baseURL, 'mcp-stdio://agora');
+    assert.equal(config.model.model, 'qwen3.6-35b-a3b-q4');
+    assert.equal(config.model.apiKey, 'agora-mcp');
+    assert.deepEqual(config.model.agoraMemory, {
+      userId: 'agent-user',
+      projectId: 'my-agent',
+      conversationId: 'conv-001',
+      memoryProfile: 'profile-agora-demo',
+      memoryEnabled: true,
+    });
+    assert.deepEqual(config.model.extraParams, {
+      seed: 123,
+      metadata: {
+        trace_id: 'keep-me',
+      },
+    });
+  });
+});

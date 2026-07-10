@@ -1,0 +1,101 @@
+id: "L3-015"
+title: "Real scenario extreme: Minecraft-like open world prototype"
+level: "L3"
+category: "real-scenario-extreme"
+weight: 1.8
+
+fixture:
+  project: "open-world-3d-product"
+  setup: []
+
+prompt: |
+  这是一次真实交付测试，难度必须高于“创建一个 GitHub 仓库，设计我的世界风格 3D 开放世界游戏的产品文档、技术架构并测试”。
+  你不能创建真实远程 GitHub 仓库；benchmark 会在临时 workspace 运行并清理 demo。请在本地 workspace 内完成完整交付：
+  1. 创建 PRD.md：定义一个 Minecraft-like 3D 开放世界游戏原型，包含目标用户、核心玩法、MVP 范围、非目标、验收标准、风险。
+  2. 创建 TECH_ARCHITECTURE.md：说明渲染层、世界生成、chunk 管理、玩家控制、碰撞、存档、测试策略，给出具体文件路径。
+  3. 实现可测试核心模块：
+     - src/world.js：createWorld({ seed, radius })、generateChunkKey(x,z)、getBlock(world,x,y,z)
+     - src/player.js：createPlayer(pos)、movePlayer(world, player, delta)
+     - src/save.js：serializeGame({ world, player })、deserializeGame(text)
+  4. 创建 public/index.html 作为可打开的浏览器 demo，展示可交互的 3D/伪 3D 开放世界；可以使用 Canvas/CSS/原生 JS，不要求联网依赖。demo 必须支持键盘输入和可观察的玩家移动、命中反馈、碰撞阻挡、保存后刷新恢复。
+  5. 用真实浏览器运行 demo 并提交机器可验证证据：Canvas 非空渲染、键盘事件、移动前后坐标、命中前后状态、碰撞前后状态、刷新前后持久化状态、桌面和移动 viewport 截图，以及空 console error/page error。仅写“已验证”或返回布尔值不算证据。
+  6. 运行 npm test，确保核心世界生成、玩家移动、存档恢复通过。
+  7. 最终回复要像交付汇报：列出交付物、测试命令、真实浏览器验证结果、剩余风险。
+  8. 为 runner 暴露固定的最小只读测试钩子 schema：
+     `window.__MA_BENCHMARK__ = { version: 1, snapshot: () => ({ player: { x: number, y: number, z: number }, target: { id: string, health: number }, collision: { blocked: boolean, obstacleId: string, attempted: { x: number, y: number, z: number }, before: { x: number, y: number, z: number }, after: { x: number, y: number, z: number } } }) }`。
+     snapshot() 必须返回当前运行时状态；player 必须提供 x/y/z，target 必须提供 id/health，collision 必须提供 blocked。runner 点击前，target.id 必须是非空字符串且 target.health > 0；真实点击后必须仍是同一个 target.id，且该目标的 health 必须严格小于点击前（允许降到 0）。不能删除当前目标后切换到另一个目标，也不能通过重算最近目标来伪装 health 下降；点击还必须造成 Canvas 像素变化。
+     KeyW 移动完成后，runner 会通过 Playwright 点击页面中的第一个 canvas，且不指定点击位置，因此实际点击该 canvas 的几何中心。demo 必须使这个真实中心点击命中 snapshot() 当前返回的 target；例如让目标或准星位于中心，或者让中心点击通过真实射线判定命中该目标。命中必须来自 canvas 的真实点击事件处理和命中测试，不能通过伪造 hook 状态制造成功。
+     runner 的交互顺序固定为：先发送 KeyW 验证移动，再执行上述第一个 canvas 几何中心点击验证命中，随后发送 KeyD 验证碰撞，最后发送 KeyP 保存并刷新验证恢复。因此 demo 必须保证完成 KeyW 移动和 canvas 命中后，KeyD 会尝试进入真实障碍。
+     KeyD 处理完成后的 snapshot() 必须满足：collision.blocked === true、collision.obstacleId 是非空字符串、collision.before 与 collision.after 的 x/y/z 严格相等、collision.attempted 与 collision.after 不同。这些字段必须来自真实 KeyD 按键处理后的运行时碰撞状态，不能硬编码、预填或伪造。
+     钩子只能读状态，不能执行移动、命中、碰撞或伪造输入；这些动作必须由 runner 通过真实键盘和点击触发。
+     存档只能使用精确的 localStorage key `ma-open-world-save`。KeyP 的真实按键处理必须同步写入可由 JSON.parse 解析的 JSON object；该 object 顶层必须包含 player、target、collision，并且这三个字段分别与 KeyP 当时只读 snapshot() 返回的 player、target、collision 深度一致，所有数值和字段都必须一致。
+     页面刷新初始化必须从这个 payload 恢复真实运行时状态；刷新后的 snapshot() 中 player、target、collision 必须分别与已保存 payload 的同名顶层字段深度一致。不能硬编码存档或刷新快照，不能使用 dummy key、sessionStorage、内存缓存或其他持久化通道绕过该 payload。刷新后 Canvas 必须按恢复状态真实渲染且保持非空，console error 和 page error 必须为空。
+     runner 会分别以 desktop 1280x720 和 mobile 390x844 viewport 检查响应式结果。在两个 viewport 中，document.documentElement.scrollWidth 和 document.body.scrollWidth 都不得超过 viewport 宽度；页面中的第一个 canvas 和整体布局必须响应式缩放，不能被裁出屏幕或造成横向溢出。两个 viewport 下第一个 canvas 都必须保持真实非空渲染，console error 和 page error 都必须为空。
+  不要修改 tests/ 下已有测试。
+
+rubric_points:
+  - "PRD.md 覆盖目标用户、玩法、MVP、非目标、验收、风险"
+  - "TECH_ARCHITECTURE.md 覆盖渲染、世界生成、chunk、玩家、碰撞、存档、测试策略和真实路径"
+  - "src/world.js 提供确定性的 seed/chunk/block 能力"
+  - "src/player.js 提供可测试玩家移动和碰撞/边界处理"
+  - "src/save.js 提供可恢复的序列化/反序列化"
+  - "public/index.html 存在并提供本地可打开 demo 入口"
+  - "真实浏览器证据证明 Canvas 非空、键盘输入驱动移动、命中反馈和碰撞阻挡有效"
+  - "真实浏览器证据证明刷新后状态恢复、桌面/移动 viewport 无横向溢出、console/page error 为空"
+  - "npm test 通过且未修改 tests/world.test.js"
+  - "最终回复给出交付汇报和剩余风险"
+
+no_modify_files:
+  - "tests/world.test.js"
+
+objective_checks:
+  - command: "npm test"
+    weight_into: "Correctness"
+  - command: "test -f PRD.md"
+    weight_into: "TaskCompletion"
+  - command: "test -f TECH_ARCHITECTURE.md"
+    weight_into: "TaskCompletion"
+  - command: "test -f public/index.html"
+    weight_into: "TaskCompletion"
+  - command: "node -e \"const w=require('./src/world'); const p=require('./src/player'); const s=require('./src/save'); if (!w.createWorld || !w.generateChunkKey || !w.getBlock || !p.createPlayer || !p.movePlayer || !s.serializeGame || !s.deserializeGame) process.exit(1)\""
+    weight_into: "Correctness"
+  - command: "git diff --quiet HEAD -- tests/world.test.js"
+    weight_into: "NoRegression"
+
+browser_verification:
+  entrypoint: "public/index.html"
+  controls:
+    movement_key: "KeyW"
+    collision_key: "KeyD"
+    save_key: "KeyP"
+    hit_selector: "canvas"
+  hook:
+    global: "__MA_BENCHMARK__"
+    version: 1
+    snapshot_method: "snapshot"
+  persistence:
+    storage_key: "ma-open-world-save"
+    observed_state_paths:
+      - "player"
+      - "target"
+      - "collision"
+  required_evidence:
+    - "canvas_render"
+    - "keyboard_input"
+    - "movement"
+    - "hit"
+    - "collision"
+    - "persistence"
+    - "responsive"
+    - "console_clean"
+  viewports:
+    - name: "desktop"
+      width: 1280
+      height: 720
+    - name: "mobile"
+      width: 390
+      height: 844
+
+runtime:
+  timeout_sec: 1200
+  runs: 2

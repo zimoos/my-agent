@@ -26,32 +26,35 @@ export async function bootstrap(
 ): Promise<BootstrapResult> {
   const { config, sources, createdDefault } = loadConfigDetailed(configPath);
   const resolved = resolveConfigPath(configPath);
+  const isAgoraProvider = config.model.provider?.toLowerCase() === 'agora';
 
   // Auto-detect model from server
-  try {
-    const res = await fetch(`${config.model.baseURL}/models`);
-    const data = await res.json() as { data: Array<{ id: string }> };
-    const available = data.data.map(m => m.id);
-    if (available.length > 0) {
-      const configured = config.model.model;
-      if (available.includes(configured)) {
-        // configured model available, keep it
-      } else if (available.length === 1) {
-        config.model.model = available[0];
-        process.stderr.write(`\x1b[33m[info] auto-selected model: ${available[0]}\x1b[0m\n`);
-      } else {
-        config.model.model = available[0];
-        process.stderr.write(`\x1b[33m[info] "${configured}" not found, using: ${available[0]}\x1b[0m\n`);
+  if (!isAgoraProvider) {
+    try {
+      const res = await fetch(`${config.model.baseURL}/models`);
+      const data = await res.json() as { data: Array<{ id: string }> };
+      const available = data.data.map(m => m.id);
+      if (available.length > 0) {
+        const configured = config.model.model;
+        if (available.includes(configured)) {
+          // configured model available, keep it
+        } else if (available.length === 1) {
+          config.model.model = available[0];
+          process.stderr.write(`\x1b[33m[info] auto-selected model: ${available[0]}\x1b[0m\n`);
+        } else {
+          config.model.model = available[0];
+          process.stderr.write(`\x1b[33m[info] "${configured}" not found, using: ${available[0]}\x1b[0m\n`);
+        }
       }
+    } catch {
+      // server unreachable, keep config as-is
     }
-  } catch {
-    // server unreachable, keep config as-is
   }
 
   let lmStudioContextWindow: number | undefined;
 
   // Auto-detect context window from LM Studio native API
-  if (!config.model.contextWindow) {
+  if (!config.model.contextWindow && !isAgoraProvider) {
     try {
       const base = config.model.baseURL.replace(/\/v1\/?$/, '');
       const res = await fetch(`${base}/api/v0/models`);
@@ -73,6 +76,8 @@ export async function bootstrap(
   const capabilities = resolveModelCapabilities(config.model, { lmStudioContextWindow });
   config.model.contextWindow = capabilities.contextWindow;
   config.model.contextWindowSource = capabilities.contextWindowSource;
+  config.model.requestBodyByteLimit = capabilities.requestBodyByteLimit;
+  config.model.requestBodyByteLimitSource = capabilities.requestBodyByteLimitSource;
 
   const entries = Object.entries(config.mcpServers ?? {}) as Array<[string, McpServerConfig]>;
   const connections: McpConnection[] = [];
@@ -139,7 +144,12 @@ export async function bootstrap(
   };
 }
 
-export async function shutdown(connections: McpConnection[]): Promise<void> {
+export async function shutdown(connections: McpConnection[], agent?: Agent): Promise<void> {
+  try {
+    await agent?.close();
+  } catch {
+    /* ignore */
+  }
   for (const conn of connections) {
     try {
       await conn.close();

@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 
 type Id = string | number | null;
@@ -6,6 +6,9 @@ interface Req { jsonrpc: '2.0'; id?: Id; method: string; params?: unknown }
 interface Res { jsonrpc: '2.0'; id: Id; result?: unknown; error?: { code: number; message: string } }
 
 const MAX_LINES = 100;
+const MAX_CAPTURE_CHARS = 512 * 1024;
+const MAX_STDERR_CHARS = 16 * 1024;
+const GREP_TIMEOUT_MS = 20000;
 
 const TOOLS = [
   { name: 'grep',
@@ -22,30 +25,105 @@ const log = (...a: unknown[]) => process.stderr.write('[grep-mcp] ' + a.map(Stri
 const ok = (text: string, isError = false) => ({ content: [{ type: 'text', text }], isError });
 const rec = (v: unknown): Record<string, unknown> => (v && typeof v === 'object' && !Array.isArray(v)) ? v as Record<string, unknown> : {};
 const errMsg = (e: unknown) => e instanceof Error ? e.message : String(e);
+let pendingRequests = 0;
+let inputClosed = false;
 
-function handleGrep(args: Record<string, unknown>) {
+function maybeExit() {
+  if (inputClosed && pendingRequests === 0) process.exit(0);
+}
+
+async function handleGrep(args: Record<string, unknown>): Promise<ReturnType<typeof ok>> {
   const pattern = args.pattern;
   const path = args.path;
   if (typeof pattern !== 'string' || !pattern) return ok('grep: "pattern" must be a non-empty string', true);
   if (typeof path !== 'string' || !path) return ok('grep: "path" must be a non-empty string', true);
   const flags = ['-rn', '-E', '--'];
-  try {
-    const out = execFileSync('grep', [...flags, pattern, path], {
-      encoding: 'utf-8', maxBuffer: 4 * 1024 * 1024, timeout: 20000,
-    });
-    const lines = out.split('\n').filter((l) => l.length > 0);
-    const head = lines.slice(0, MAX_LINES);
-    const truncated = lines.length > MAX_LINES;
-    const body = head.join('\n');
-    return ok(truncated ? `${body}\n[...truncated, ${lines.length - MAX_LINES} more matches]` : (body || '（无匹配）'));
-  } catch (e) {
-    const status = (e as { status?: number }).status;
-    if (status === 1) return ok('（无匹配）');
-    return ok(`grep failed: ${errMsg(e)}`, true);
+  const result = await runGrep([...flags, pattern, path]);
+  if (result.status === 1 && result.lines.length === 0) return ok('（无匹配）');
+  if (result.status !== 0 && !result.truncated) {
+    return ok(`grep failed: ${result.stderr || result.error || `exit ${result.status}`}`, true);
   }
+  const body = result.lines.join('\n');
+  if (!body) return ok('（无匹配）');
+  return ok(result.truncated ? `${body}\n[...truncated]` : body);
 }
 
-function handleRequest(req: Req): void {
+function runGrep(args: string[]): Promise<{
+  status: number | null;
+  lines: string[];
+  stderr: string;
+  truncated: boolean;
+  error?: string;
+}> {
+  return new Promise((resolve) => {
+    const child = spawn('grep', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const lines: string[] = [];
+    let pending = '';
+    let stderr = '';
+    let capturedChars = 0;
+    let truncated = false;
+    let settled = false;
+
+    const finish = (status: number | null, error?: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const tail = pending.trimEnd();
+      if (tail && lines.length < MAX_LINES && capturedChars < MAX_CAPTURE_CHARS) {
+        lines.push(tail);
+      }
+      resolve({ status, lines, stderr: stderr.trim(), truncated, error });
+    };
+
+    const stopEarly = () => {
+      truncated = true;
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        /* ignore */
+      }
+    };
+
+    const timer = setTimeout(() => {
+      truncated = true;
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        /* ignore */
+      }
+    }, GREP_TIMEOUT_MS);
+    timer.unref?.();
+
+    child.stdout.setEncoding('utf-8');
+    child.stdout.on('data', (chunk: string) => {
+      if (truncated) return;
+      pending += chunk;
+      let idx: number;
+      while ((idx = pending.indexOf('\n')) !== -1) {
+        const line = pending.slice(0, idx);
+        pending = pending.slice(idx + 1);
+        if (!line) continue;
+        lines.push(line);
+        capturedChars += line.length + 1;
+        if (lines.length >= MAX_LINES || capturedChars >= MAX_CAPTURE_CHARS) {
+          stopEarly();
+          return;
+        }
+      }
+    });
+
+    child.stderr.setEncoding('utf-8');
+    child.stderr.on('data', (chunk: string) => {
+      if (stderr.length >= MAX_STDERR_CHARS) return;
+      stderr = (stderr + chunk).slice(0, MAX_STDERR_CHARS);
+    });
+
+    child.on('error', (error) => finish(null, error.message));
+    child.on('close', (status) => finish(status));
+  });
+}
+
+async function handleRequest(req: Req): Promise<void> {
   const id = req.id ?? null;
   try {
     if (req.method === 'initialize') {
@@ -57,7 +135,7 @@ function handleRequest(req: Req): void {
     if (req.method === 'tools/call') {
       const p = rec(req.params);
       const name = typeof p.name === 'string' ? p.name : '';
-      const result = name === 'grep' ? handleGrep(rec(p.arguments)) : ok(`unknown tool: ${name}`, true);
+      const result = name === 'grep' ? await handleGrep(rec(p.arguments)) : ok(`unknown tool: ${name}`, true);
       send({ jsonrpc: '2.0', id, result });
       return;
     }
@@ -79,6 +157,16 @@ rl.on('line', (line) => {
     send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: `parse error: ${errMsg(e)}` } });
     return;
   }
-  handleRequest(msg);
+  pendingRequests += 1;
+  handleRequest(msg).catch((e) => {
+    log('request handler error:', errMsg(e));
+    send({ jsonrpc: '2.0', id: msg.id ?? null, error: { code: -32603, message: errMsg(e) } });
+  }).finally(() => {
+    pendingRequests -= 1;
+    maybeExit();
+  });
 });
-rl.on('close', () => process.exit(0));
+rl.on('close', () => {
+  inputClosed = true;
+  maybeExit();
+});

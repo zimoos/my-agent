@@ -5,10 +5,13 @@ DeepSeek 无脑配置，本地小模型也能变生产力。
 
 MA 的核心不是“又接了一个模型”，而是两件事：远程模型配置必须无脑，本地小模型必须能做真实项目。DeepSeek 走交互式配置，LM Studio/Qwen 则通过长上下文、工具调用加固、模型切换和 benchmark 驱动修复，把小模型转化成能持续工作的生产力。
 
-`v0.1.2-alpha` 当前支持 LM Studio 本地模型和 DeepSeek 官方 API。后续会继续扩展 GLM、Qwen、Kimi、MiniMax 等 OpenAI-compatible provider。
+`v0.1.2-alpha` 当前支持 LM Studio 本地模型、DeepSeek 官方 API，以及通过 MCP stdio 接入的 Agora。Agora 是 MA 的本地优先深度适配：它展示真实的模型加载和 MemoryPatch 状态，不会把记忆伪装成一段 prompt。
 
-官网：https://zhuqingyv.github.io/my-agent/  
-发布页：https://github.com/zhuqingyv/my-agent/releases/tag/v0.1.2-alpha
+官网：https://zimoos.github.io/my-agent/
+
+发布页：https://github.com/zimoos/my-agent/releases/tag/v0.1.2-alpha
+
+[路线图](ROADMAP.md) · [变更记录](CHANGELOG.md) · [参与贡献](CONTRIBUTING.md) · [Discussions](https://github.com/zimoos/my-agent/discussions)
 
 ![MA 终端界面预览](website/assets/tui-preview.svg)
 
@@ -79,7 +82,7 @@ portable 包内置 Node.js 和生产依赖，不要求用户提前安装全局 N
 ### 从源码安装
 
 ```bash
-git clone https://github.com/zhuqingyv/my-agent.git
+git clone https://github.com/zimoos/my-agent.git
 cd my-agent
 npm install
 npm run build
@@ -160,6 +163,12 @@ DeepSeek/deepseek-v4-flash
 
 `/model` 会聚合所有配置 provider 下的模型，用 credential/provider 前缀区分同名模型，并记住上一次选择。
 
+## Agora：本地运行时和原生记忆
+
+MA 可以把 Agora 作为 provider 自己管理的 MCP stdio 子进程运行，不要求用户维护本地 HTTP 服务。TUI 会展示真实的本地模型加载、记忆挂载和生成阶段。
+
+当 Agora 是当前 provider 时，MA 会提供经过验证的 MemoryPatch 操作：挂载、停用、内化、回滚和状态查看。只有 Agora 响应 metadata 返回匹配的状态，MA 才会说明记忆已生效；不会把一段事实塞进 prompt 伪装成记忆。
+
 ## 内置工具
 
 MA 默认启动以下 MCP server：
@@ -235,6 +244,14 @@ npm run build
 npm run release:check
 ```
 
-## License
+正式功能变更见 [CHANGELOG.md](CHANGELOG.md)，公开产品方向见 [ROADMAP.md](ROADMAP.md)。
 
-MIT
+## 社区参与
+
+- 提交 PR 前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+- 安全问题请按 [SECURITY.md](SECURITY.md) 私下披露，不要公开提交 Issue。
+- 仓库已启用 Discussions，用于提问、产品建议和模型/运行时反馈。
+
+## 许可证
+
+MA 使用 [MIT License](LICENSE) 开源。你可以使用、修改、分发、再授权和商业化 MA，只需保留版权与许可证声明。

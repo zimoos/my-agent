@@ -262,7 +262,7 @@ function render(snapshot){
     const tags = [pill('i='+x.i), pill(x.role), pill(x.mode, x.mode), x.changed ? pill('changed','compressed') : ''].join('');
     const orig = x.original ? '<div class="orig"><b>original:</b> '+esc(x.original)+'</div>' : '';
     return '<article class="'+itemClass(x.role,x.mode === 'summary' ? 'compressed' : '')+'"><div class="meta">'+tags+'</div><div class="text">'+esc(x.text)+'</div>'+orig+'</article>';
-  }).join('') || '<div class="status">no active context</div>';
+  }).join('') || '<div class="status">no context sidecar items</div>';
   document.getElementById('pool').innerHTML = snapshot.pool.map(x => {
     const labelClass = x.archivedReason === 'superseded' ? 'compressed' : x.archivedReason === 'demoted' ? 'moved' : '';
     const tags = [pill('i='+(x.i ?? '?')), pill(x.role), pill(x.label,labelClass)].join('');

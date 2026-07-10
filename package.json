@@ -2,11 +2,18 @@
   "name": "my-agent",
   "version": "0.1.2-alpha.0",
   "description": "Local-first multi-model terminal coding agent",
-  "homepage": "https://zhuqingyv.github.io/my-agent/",
+  "homepage": "https://zimoos.github.io/my-agent/",
   "type": "module",
   "bin": {
     "ma": "./bin/ma"
   },
+  "files": [
+    "dist",
+    "bin",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "tsx src/cli/index.tsx",
     "build": "tsc && chmod +x dist/src/cli/index.js bin/ma scripts/package-portable.mjs",
@@ -15,7 +22,8 @@
     "dev": "tsx watch src/cli/index.tsx",
     "test": "tsx --test test/*.test.ts",
     "e2e": "bash test/e2e.sh",
-    "e2e:real": "tsx --test test/e2e-real.ts",
+    "e2e:real": "tsx --test test/e2e-real.ts test/e2e/zimoos.test.ts",
+    "e2e:zimoos": "tsx --test test/e2e/zimoos.test.ts",
     "init": "tsx src/init.ts",
     "visual": "playwright test --config test/visual/playwright.config.ts",
     "visual:server": "tsx test/visual/server.ts",
@@ -57,5 +65,5 @@
     "typescript": "^5.7.2",
     "ws": "^8.20.0"
   },
-  "license": "CC-BY-NC-SA-4.0"
+  "license": "MIT"
 }

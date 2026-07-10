@@ -2,6 +2,15 @@ node_modules/
 dist/
 release/
 .ma/
+.my-agent/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
 .DS_Store
 *.tgz
 test/visual/screenshots/

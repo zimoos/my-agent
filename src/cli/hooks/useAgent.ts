@@ -17,6 +17,14 @@ function seconds(ms: number): number {
   return Math.max(1, Math.round(ms / 1000));
 }
 
+function progressLabel(message: string, progress?: number, total?: number): string {
+  if (typeof progress !== 'number' || !Number.isFinite(progress)) return message;
+  if (typeof total === 'number' && Number.isFinite(total) && total > 0) {
+    return `${message} · ${Math.round((progress / total) * 100)}%`;
+  }
+  return message;
+}
+
 export interface PendingConfirm {
   requestId: string;
   cmd: string;
@@ -71,6 +79,13 @@ export function applyAgentEvent(
       });
       store.updateThinking({
         event: `准备重试 ${event.attempt}/${event.maxRetries}`,
+      });
+      break;
+    case 'provider:progress':
+      store.updateThinking({
+        event: progressLabel(event.message, event.progress, event.total),
+        isThinking: false,
+        thoughtDurationMs: null,
       });
       break;
     case 'progress': {

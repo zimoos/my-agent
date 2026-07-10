@@ -46,8 +46,58 @@ npm run benchmark -- --level L3 --task L3-009 --adapter test/benchmark/adapters/
 - Dry-run only proves YAML/schema validity.
 - Unit tests only prove the runner implementation.
 - `echo-mock.yaml` only proves adapter plumbing.
+- `ma run` smoke only proves provider/main-loop/tool plumbing.
+- TUI PTY smoke only proves interactive startup/input/progress/completion/quit.
+- ZimoOS MCP e2e only counts when it reaches the real local mteam backend; an unavailable backend must be reported as skipped, not mocked.
 - A real L3 claim requires `summary.md`, per-task reports, and `l3-details.json` under `test/benchmark/reports/<run-id>/`.
 - Report the tested adapter, underlying model, judge model, task IDs, objective check failures, and judge reasoning.
+- Report real-user failures by layer: harness, provider, tool routing, context slot, TUI, ZimoOS backend, or task quality.
+
+## Real Scenario E2E Rules
+
+When validating user-facing agent quality, use prompt-driven real scenarios rather
+than only unit scripts. A real scenario task is one user prompt that asks the
+agent to deliver a product result end to end: inspect the workspace, design docs,
+implementation when needed, validation, and final handoff.
+
+Required ladder:
+
+- Start with a small real case that is easy to pass but still requires the LLM to
+  decide what to inspect and what to write.
+- Add medium and hard cases that require real implementation plus docs and tests.
+- Include at least one extreme case that is harder than the latest reported
+  user failure. For the Agora timeout/regression case, the reference extreme task
+  is `L3-015-real-extreme-open-world-game.yaml`.
+
+Execution rules:
+
+- The agent under test must be a real CLI adapter, not a mocked in-process model.
+- A judge model or human reviewer acts as the judge after the run and evaluates
+  the final answer, workspace diff, and objective check results.
+- Demo workspaces must be temporary and cleaned up after the run. If a live test
+  intentionally creates an external demo resource, such as a GitHub repository,
+  the test owner must delete that resource after scoring.
+- Passing `npm test` or dry-run alone is not enough to claim real user readiness.
+
+## Real E2E Commands
+
+Run the built CLI smoke suite:
+
+```bash
+npm run build
+npm run e2e
+npm run e2e:real
+```
+
+`npm run e2e:real` uses `MA_E2E_CONFIG`, then `MA_BENCH_MA_CONFIG`, then `~/.my-agent/benchmark.env`, then `~/.my-agent/benchmark-ma-config.json`.
+
+Run the optional ZimoOS integration directly:
+
+```bash
+npm run e2e:zimoos
+```
+
+Set `MTEAM_HUB_URL` and `MTEAM_BACKEND_DIR` when the mteam backend is not at the local defaults.
 
 ## Task Authoring Rules
 

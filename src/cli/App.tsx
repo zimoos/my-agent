@@ -68,6 +68,10 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
 
   const state = useSyncExternalStore(store.subscribe, store.getState);
   const { messages, thinking, inFlightText } = state;
+  const providerState =
+    agent.getProviderState?.() ??
+    sessionStore.list(100).find((session) => session.id === currentSessionId)?.providerState ??
+    null;
 
   const [pendingImages, setPendingImages] = useState<UiImage[]>([]);
   const [sessionPickerSessions, setSessionPickerSessions] = useState<SessionPickerSession[] | null>(null);
@@ -331,6 +335,8 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
 
       <StatusBar
         model={config.model.model}
+        provider={config.model.provider}
+        providerState={providerState}
         taskCount={taskCount}
         debug={debug}
         contextUsed={contextUsage.used}

@@ -1,8 +1,11 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import type { AgentConfig, ModelConfig } from './mcp/types.js';
+import type { AgentConfig, AgoraMemoryConfig, AgoraRuntimeConfig, ModelConfig } from './mcp/types.js';
 import { readSecret } from './secrets/keychain.js';
+
+export const AGORA_MCP_BASE_URL = 'mcp-stdio://agora';
+export const AGORA_MCP_API_KEY = 'agora-mcp';
 
 const DEFAULT_MODEL: ModelConfig = {
   baseURL: 'http://localhost:1234/v1',
@@ -84,6 +87,133 @@ export function writeGlobalConfig(model: { baseURL: string; model: string; apiKe
   fs.writeFileSync(file, JSON.stringify(existing, null, 2) + '\n', 'utf-8');
 }
 
+function stringField(source: Record<string, any>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === 'string' && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function booleanField(source: Record<string, any>, ...keys: string[]): boolean | undefined {
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === 'boolean') return value;
+  }
+  return undefined;
+}
+
+function agoraMemoryConfig(source: unknown): AgoraMemoryConfig | null {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return null;
+  const memory = source as Record<string, any>;
+  const config: AgoraMemoryConfig = {};
+
+  const userId = stringField(memory, 'userId', 'user_id');
+  const projectId = stringField(memory, 'projectId', 'project_id');
+  const conversationId = stringField(memory, 'conversationId', 'conversation_id');
+  const memoryProfile = stringField(memory, 'memoryProfile', 'memory_profile');
+  const memoryEnabled = booleanField(memory, 'memoryEnabled', 'memory_enabled');
+
+  if (userId) config.userId = userId;
+  if (projectId) config.projectId = projectId;
+  if (conversationId) config.conversationId = conversationId;
+  if (memoryProfile) config.memoryProfile = memoryProfile;
+  if (memoryEnabled !== undefined) {
+    config.memoryEnabled = memoryEnabled;
+  } else if (memoryProfile) {
+    config.memoryEnabled = true;
+  }
+
+  return Object.keys(config).length > 0 ? config : null;
+}
+
+function agoraMemoryMetadata(source: unknown): Record<string, unknown> | null {
+  const memory = agoraMemoryConfig(source);
+  if (!memory) return null;
+  const metadata: Record<string, unknown> = {};
+
+  if (memory.userId) metadata.user_id = memory.userId;
+  if (memory.projectId) metadata.project_id = memory.projectId;
+  if (memory.conversationId) metadata.conversation_id = memory.conversationId;
+  if (memory.memoryProfile) metadata.memory_profile = memory.memoryProfile;
+  if (memory.memoryEnabled !== undefined) metadata.memory_enabled = memory.memoryEnabled;
+  return Object.keys(metadata).length > 0 ? metadata : null;
+}
+
+function applyAgoraMemory(model: Record<string, any>, source: unknown): void {
+  const provider = typeof model.provider === 'string' ? model.provider.toLowerCase() : '';
+  if (provider === 'agora') {
+    const memory = agoraMemoryConfig(source);
+    if (memory) {
+      model.agoraMemory = {
+        ...(model.agoraMemory && typeof model.agoraMemory === 'object' ? model.agoraMemory : {}),
+        ...memory,
+      };
+    }
+    return;
+  }
+  const metadata = agoraMemoryMetadata(source);
+  if (!metadata) return;
+  const extraParams =
+    model.extraParams && typeof model.extraParams === 'object' && !Array.isArray(model.extraParams)
+      ? { ...model.extraParams }
+      : {};
+  const existingMetadata =
+    extraParams.metadata && typeof extraParams.metadata === 'object' && !Array.isArray(extraParams.metadata)
+      ? { ...(extraParams.metadata as Record<string, unknown>) }
+      : {};
+  extraParams.metadata = { ...existingMetadata, ...metadata };
+  model.extraParams = extraParams;
+}
+
+function credentialAgoraRuntime(credential: Record<string, any>): AgoraRuntimeConfig | undefined {
+  const runtime =
+    credential.agoraRuntime && typeof credential.agoraRuntime === 'object' && !Array.isArray(credential.agoraRuntime)
+      ? { ...credential.agoraRuntime }
+      : {};
+  if (typeof credential.command === 'string' && credential.command.trim()) runtime.command = credential.command.trim();
+  if (Array.isArray(credential.args) && credential.args.every((item) => typeof item === 'string')) {
+    runtime.args = [...credential.args];
+  }
+  if (typeof credential.dataRoot === 'string' && credential.dataRoot.trim()) runtime.dataRoot = credential.dataRoot.trim();
+  return Object.keys(runtime).length > 0 ? runtime : undefined;
+}
+
+function normalizeAgoraModel(model: Record<string, any>): void {
+  const provider = typeof model.provider === 'string' ? model.provider.toLowerCase() : '';
+  if (provider !== 'agora') return;
+
+  const extraParams =
+    model.extraParams && typeof model.extraParams === 'object' && !Array.isArray(model.extraParams)
+      ? { ...model.extraParams }
+      : null;
+  const existingMetadata =
+    extraParams?.metadata && typeof extraParams.metadata === 'object' && !Array.isArray(extraParams.metadata)
+      ? { ...(extraParams.metadata as Record<string, unknown>) }
+      : null;
+  const memoryFromLegacyMetadata = agoraMemoryConfig(existingMetadata);
+  if (memoryFromLegacyMetadata) {
+    model.agoraMemory = {
+      ...memoryFromLegacyMetadata,
+      ...(model.agoraMemory && typeof model.agoraMemory === 'object' ? model.agoraMemory : {}),
+    };
+    for (const key of ['user_id', 'project_id', 'conversation_id', 'memory_profile', 'memory_enabled']) {
+      delete existingMetadata?.[key];
+    }
+    if (extraParams && existingMetadata) {
+      if (Object.keys(existingMetadata).length > 0) extraParams.metadata = existingMetadata;
+      else delete extraParams.metadata;
+      if (Object.keys(extraParams).length > 0) model.extraParams = extraParams;
+      else delete model.extraParams;
+    }
+  }
+
+  model.baseURL = AGORA_MCP_BASE_URL;
+  model.apiKey = AGORA_MCP_API_KEY;
+}
+
 function resolveDefaultProfile(merged: Record<string, any>): void {
   const defaultProfile =
     typeof merged.defaultProfile === 'string' ? merged.defaultProfile : '';
@@ -95,16 +225,23 @@ function resolveDefaultProfile(merged: Record<string, any>): void {
   if (typeof credentialId !== 'string') return;
   const credential = merged.credentials?.[credentialId];
   if (!credential || typeof credential !== 'object') return;
-  if (typeof credential.baseURL !== 'string' || typeof profile.model !== 'string') return;
+  const provider = typeof credential.provider === 'string' ? credential.provider : undefined;
+  const isAgora = provider?.toLowerCase() === 'agora';
+  if (!isAgora && typeof credential.baseURL !== 'string') return;
+  if (typeof profile.model !== 'string') return;
 
   const model: Record<string, any> = {
     ...(merged.model && typeof merged.model === 'object' ? merged.model : {}),
     provider: credential.provider,
-    baseURL: credential.baseURL,
+    baseURL: isAgora ? (credential.baseURL ?? AGORA_MCP_BASE_URL) : credential.baseURL,
     model: profile.model,
   };
 
-  if (typeof credential.secretRef === 'string') {
+  if (isAgora) {
+    model.apiKey = AGORA_MCP_API_KEY;
+    const runtime = credentialAgoraRuntime(credential);
+    if (runtime) model.agoraRuntime = runtime;
+  } else if (typeof credential.secretRef === 'string') {
     model.secretRef = credential.secretRef;
     model.apiKey = readSecret(
       credential.secretRef,
@@ -114,6 +251,8 @@ function resolveDefaultProfile(merged: Record<string, any>): void {
     model.apiKey = 'lm-studio';
   }
 
+  applyAgoraMemory(model, profile.agoraMemory);
+  normalizeAgoraModel(model);
   merged.model = model;
 }
 
@@ -151,6 +290,8 @@ export function loadConfigDetailed(configPath?: string): ConfigLoadResult {
   } else {
     merged.model = { ...DEFAULT_MODEL, ...merged.model };
   }
+  applyAgoraMemory(merged.model, merged.model.agoraMemory);
+  normalizeAgoraModel(merged.model);
   if (!merged.mcpServers || typeof merged.mcpServers !== 'object') {
     merged.mcpServers = {};
   }

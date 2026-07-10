@@ -34,6 +34,19 @@ test('mcpToolsToOpenAI: prefixes tool names with server name', () => {
   assert.equal(out[0].function.description, 'desc of run');
 });
 
+test('mcpToolsToOpenAI: encodes MCP tool names for OpenAI function-name schema', () => {
+  const conns = [fakeConn('mteam-primary', ['zimoos.current', 'zimoos.act'])];
+  const out = mcpToolsToOpenAI(conns);
+  const names = out.map((t) => t.function.name);
+  assert.deepEqual(names, [
+    'mteam-primary__zimoos_x2e_current',
+    'mteam-primary__zimoos_x2e_act',
+  ]);
+  for (const name of names) {
+    assert.match(name, /^[A-Za-z0-9_-]+$/);
+  }
+});
+
 test('mcpToolsToOpenAI: uses tool name as fallback description', () => {
   const conn: McpConnection = {
     name: 's',
@@ -74,6 +87,14 @@ test('routeToolCall: handles tool name containing separator', () => {
   const r = routeToolCall(conns, 'srv__a__b');
   assert.ok(r);
   assert.equal(r!.toolName, 'a__b');
+});
+
+test('routeToolCall: decodes encoded OpenAI-safe MCP function names', () => {
+  const conns = [fakeConn('mteam-primary', ['zimoos.current'])];
+  const r = routeToolCall(conns, 'mteam-primary__zimoos_x2e_current');
+  assert.ok(r);
+  assert.equal(r!.conn.name, 'mteam-primary');
+  assert.equal(r!.toolName, 'zimoos.current');
 });
 
 test('normalizeArguments: parses JSON string', () => {
