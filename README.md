@@ -6,11 +6,11 @@ DeepSeek in minutes. Local small models turned into real productivity.
 
 MA is a terminal coding agent built around two practical promises: remote setup should be brainless, and local small models should become useful production tools. DeepSeek config is interactive and direct. LM Studio/Qwen gets long-context handling, tool hardening, model switching, and benchmark-driven fixes so small models can do real repo work.
 
-`v0.1.2-alpha` supports LM Studio local models, DeepSeek official API, and Agora through MCP stdio. Agora is MA's local-first provider integration: it exposes real model-loading and MemoryPatch state instead of pretending memory was added to a prompt.
+`v0.2.0-alpha.0` supports LM Studio local models, DeepSeek official API, and Agora through MCP stdio. Agora is MA's local-first provider integration: it exposes real model-loading and MemoryPatch state instead of pretending memory was added to a prompt.
 
 Website: https://zimoos.github.io/my-agent/
 
-Release: https://github.com/zimoos/my-agent/releases/tag/v0.1.2-alpha
+Release: https://github.com/zimoos/my-agent/releases/tag/v0.2.0-alpha.0
 
 [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Discussions](https://github.com/zimoos/my-agent/discussions)
 

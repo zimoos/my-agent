@@ -1,6 +1,6 @@
 {
   "name": "my-agent",
-  "version": "0.1.2-alpha.0",
+  "version": "0.2.0-alpha.0",
   "description": "Local-first multi-model terminal coding agent",
   "homepage": "https://zimoos.github.io/my-agent/",
   "type": "module",

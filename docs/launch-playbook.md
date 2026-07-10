@@ -32,7 +32,7 @@ Avoid:
 
 ## Release Name
 
-`v0.1.2-alpha`
+`v0.2.0-alpha.0`
 
 Tagline:
 
@@ -61,8 +61,8 @@ Tagline:
 - [ ] Create GitHub repo description:
   - `Local-first multi-model terminal coding agent. LM Studio + DeepSeek, Keychain secrets, MCP tools, sessions, skills.`
 - [ ] Tag release:
-- `git tag v0.1.2-alpha`
-- `git push origin v0.1.2-alpha`
+- `git tag v0.2.0-alpha.0`
+- `git push origin v0.2.0-alpha.0`
 
 ## Launch Copy
 
@@ -74,7 +74,7 @@ Long:
 
 > Most terminal AI tools look powerful in a README but feel rough once you actually configure models, switch providers, or work in a local repo. MA is my attempt to make that loop feel good: interactive `ma init`, DeepSeek + LM Studio profiles, secure key storage, `/model` switching, slash-command completion, session switching, revert, skills, and built-in file/shell/search/web tools.
 >
-> This is `v0.1.2-alpha`: sharp enough to dogfood, honest about rough edges, and shipping with portable binaries so you can try it without a Node setup. On MA's internal alpha benchmark, local Qwen3-30B through LM Studio passes L0-L2 with 100% / 98.7% / 95.3%.
+> This is `v0.2.0-alpha.0`: sharp enough to dogfood, honest about rough edges, and shipping with portable binaries so you can try it without a Node setup. On MA's internal alpha benchmark, local Qwen3-30B through LM Studio passes L0-L2 with 100% / 98.7% / 95.3%.
 
 ## First Posts
 
