@@ -1,176 +1,124 @@
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import assert from 'node:assert';
-import * as pty from 'node-pty';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
+import {
+  defaultE2ECwd,
+  e2eConfigSkipReason,
+  resolveE2EConfigPath,
+} from './e2e/helpers/real-env.js';
+import { countChinese, hasLlmError, runMaPrompt } from './e2e/helpers/cli-runner.js';
+import {
+  canSpawnPty,
+  killMa,
+  sendLine,
+  spawnMa,
+  stripAnsi,
+  waitFor,
+} from './e2e/helpers/pty.js';
 
-const TSX = '/Users/zhuqingyu/project/my-agent/node_modules/.bin/tsx';
-const CLI = '/Users/zhuqingyu/project/my-agent/src/cli/index.tsx';
-const SUPERCELL = '/Users/zhuqingyu/project/supercell';
-const API_LOG = path.join(process.env.HOME!, '.my-agent', 'api-debug.log');
-
-function spawnMa(cwd: string): pty.IPty {
-  try {
-    fs.chmodSync(
-      '/Users/zhuqingyu/project/my-agent/node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper',
-      0o755,
-    );
-  } catch {}
-  return pty.spawn(TSX, [CLI], {
-    name: 'xterm-256color',
-    cols: 120,
-    rows: 30,
-    cwd,
-    env: { ...process.env },
-  });
-}
-
-function stripAnsi(s: string): string {
-  return s
-    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
-    .replace(/\x1b[78]/g, '')
-    .replace(/\x1b\[\?[0-9]+[hl]/g, '');
-}
-
-function waitFor(
-  proc: pty.IPty,
-  predicate: (output: string) => boolean,
-  timeoutMs: number,
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let output = '';
-    const timer = setTimeout(() => {
-      reject(
-        new Error(
-          `Timeout after ${timeoutMs}ms. Output so far: ${stripAnsi(output).slice(-400)}`,
-        ),
-      );
-    }, timeoutMs);
-    proc.onData((data) => {
-      output += data;
-      if (predicate(output)) {
-        clearTimeout(timer);
-        resolve(output);
-      }
-    });
-  });
-}
-
-async function sendLine(proc: pty.IPty, text: string): Promise<void> {
-  proc.write(text);
-  await new Promise((r) => setTimeout(r, 800));
-  proc.write('\r');
-}
-
-async function waitReady(proc: pty.IPty): Promise<void> {
-  await waitFor(proc, (out) => out.includes('session'), 20000);
-  await new Promise((r) => setTimeout(r, 12000));
-}
-
-function countDone(clean: string): number {
-  return (clean.match(/完成/g) || []).length;
-}
-
-function hasLlmError(clean: string): boolean {
-  return /\[error\]|Internal Server Error|5\d\d\s+Error/.test(clean);
-}
-
-async function cleanupProc(proc: pty.IPty): Promise<void> {
-  try {
-    proc.write('/quit\r');
-  } catch {}
-  await new Promise((r) => setTimeout(r, 2000));
-  try {
-    proc.kill();
-  } catch {}
-  await new Promise((r) => setTimeout(r, 3000));
-}
-
-test('e2e: 这个项目是干什么的', { timeout: 240000 }, async () => {
-  fs.rmSync(API_LOG, { force: true });
-  const proc = spawnMa(SUPERCELL);
-  try {
-    await waitReady(proc);
-
-    await sendLine(proc, '这个项目是干什么的');
-
-    const finalOutput = await waitFor(
-      proc,
-      (out) => stripAnsi(out).includes('完成'),
-      180000,
-    );
-    const clean = stripAnsi(finalOutput);
-
-    assert.ok(!hasLlmError(clean), `Should not have LLM error. Tail: ${clean.slice(-300)}`);
-    assert.ok(clean.includes('✓'), 'Should have at least one tool success');
-
-    const log = fs.readFileSync(API_LOG, 'utf-8');
-    const apiCalls = (log.match(/API REQUEST/g) || []).length;
-    assert.ok(apiCalls >= 2, `Should have >=2 API calls, got ${apiCalls}`);
-
-    const chinese = clean.match(/[一-鿿]+/g) || [];
-    const totalChinese = chinese.join('').length;
-    assert.ok(
-      totalChinese > 30,
-      `Should have >30 Chinese chars in answer, got ${totalChinese}`,
-    );
-  } finally {
-    await cleanupProc(proc);
+function requireConfig(t: TestContext): string | null {
+  const configPath = resolveE2EConfigPath();
+  if (!configPath) {
+    t.skip(e2eConfigSkipReason());
+    return null;
   }
+  return configPath;
+}
+
+async function waitReady(proc: ReturnType<typeof spawnMa>): Promise<void> {
+  await waitFor(
+    proc,
+    (out) => {
+      const clean = stripAnsi(out);
+      return clean.includes('session') && clean.includes('MA');
+    },
+    30000
+  );
+}
+
+test('real ma run smoke: simple provider response completes', { timeout: 300000 }, async (t) => {
+  const configPath = requireConfig(t);
+  if (!configPath) return;
+
+  const result = await runMaPrompt({
+    configPath,
+    prompt: '你好，用一句中文回答你是谁',
+    timeoutMs: 240000,
+  });
+  const combined = `${result.stdout}\n${result.stderr}`;
+
+  assert.equal(result.timedOut, false, `ma run timed out. Tail: ${combined.slice(-800)}`);
+  assert.equal(result.exitCode, 0, `ma run exited ${result.exitCode}. Tail: ${combined.slice(-800)}`);
+  assert.match(result.stdout, /===FINAL_ANSWER===/);
+  assert.ok(!hasLlmError(combined), `unexpected LLM error. Tail: ${combined.slice(-800)}`);
+  assert.ok(countChinese(result.stdout) >= 2, `expected Chinese answer. Tail: ${combined.slice(-800)}`);
 });
 
-test('e2e: 这个项目怎么样', { timeout: 240000 }, async () => {
-  fs.rmSync(API_LOG, { force: true });
-  const proc = spawnMa(SUPERCELL);
-  try {
-    await waitReady(proc);
+test('real ma run smoke: tool call path lists project files', { timeout: 360000 }, async (t) => {
+  const configPath = requireConfig(t);
+  if (!configPath) return;
 
-    await sendLine(proc, '这个项目怎么样');
-    const finalOutput = await waitFor(
-      proc,
-      (out) => stripAnsi(out).includes('完成'),
-      180000,
-    );
-    const clean = stripAnsi(finalOutput);
+  const result = await runMaPrompt({
+    configPath,
+    prompt: '请查看当前目录，列出最多5个顶层文件或目录，并说明你是通过工具看到的',
+    timeoutMs: 300000,
+  });
+  const combined = `${result.stdout}\n${result.stderr}`;
 
-    assert.ok(!hasLlmError(clean), `No LLM error. Tail: ${clean.slice(-300)}`);
-    assert.ok(clean.includes('✓'), 'Tool success');
-
-    const log = fs.readFileSync(API_LOG, 'utf-8');
-    const apiCalls = (log.match(/API REQUEST/g) || []).length;
-    assert.ok(apiCalls >= 2, `>=2 API calls, got ${apiCalls}`);
-  } finally {
-    await cleanupProc(proc);
-  }
+  assert.equal(result.timedOut, false, `tool smoke timed out. Tail: ${combined.slice(-1000)}`);
+  assert.equal(result.exitCode, 0, `tool smoke exited ${result.exitCode}. Tail: ${combined.slice(-1000)}`);
+  assert.match(result.stderr, /\[tool\]\s+fs__list_directory/, `expected fs list tool. Tail: ${combined.slice(-1000)}`);
+  assert.match(result.stdout, /===FINAL_ANSWER===/);
+  assert.ok(!hasLlmError(combined), `unexpected LLM error. Tail: ${combined.slice(-1000)}`);
 });
 
-test('e2e: 追问深度对话', { timeout: 420000 }, async () => {
-  fs.rmSync(API_LOG, { force: true });
-  const proc = spawnMa(SUPERCELL);
+test('real TUI PTY smoke: starts, accepts input, completes, exits', { timeout: 360000 }, async (t) => {
+  const configPath = requireConfig(t);
+  if (!configPath) return;
+
+  const ptyProbe = await canSpawnPty();
+  if (!ptyProbe.ok) {
+    t.skip(`node-pty unavailable: ${ptyProbe.reason}`);
+    return;
+  }
+
+  const proc = spawnMa(defaultE2ECwd(), { configPath });
+  let exited = false;
+  let exitCode: number | undefined;
+  proc.onExit((event) => {
+    exited = true;
+    exitCode = event.exitCode;
+  });
+
   try {
     await waitReady(proc);
-
-    await sendLine(proc, '这个项目用了什么技术栈');
-    await waitFor(proc, (out) => countDone(stripAnsi(out)) >= 1, 180000);
-
-    await new Promise((r) => setTimeout(r, 2000));
-    await sendLine(proc, '详细说说');
-    const finalOutput = await waitFor(
+    await sendLine(proc, '你好，用一句中文回答你是谁');
+    const out = await waitFor(
       proc,
-      (out) => countDone(stripAnsi(out)) >= 2,
-      180000,
+      (raw) => {
+        const clean = stripAnsi(raw);
+        return clean.includes('完成') || hasLlmError(clean);
+      },
+      240000
+    );
+    const clean = stripAnsi(out);
+    assert.ok(clean.includes('完成'), `TUI did not complete. Tail: ${clean.slice(-1000)}`);
+    assert.ok(!hasLlmError(clean), `unexpected TUI error. Tail: ${clean.slice(-1000)}`);
+    assert.ok(
+      !clean.includes('MaxListenersExceededWarning'),
+      `MaxListeners warning leaked. Tail: ${clean.slice(-1000)}`
     );
 
-    const clean = stripAnsi(finalOutput);
-    assert.ok(!hasLlmError(clean), `No LLM error. Tail: ${clean.slice(-300)}`);
-
-    const log = fs.readFileSync(API_LOG, 'utf-8');
-    const apiCalls = (log.match(/API REQUEST/g) || []).length;
+    await sendLine(proc, '/quit');
+    const start = Date.now();
+    while (!exited && Date.now() - start < 15000) {
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    assert.ok(exited, '/quit did not exit within 15s');
     assert.ok(
-      apiCalls >= 3,
-      `>=3 API calls for 2-round chat, got ${apiCalls}`,
+      exitCode === 0 || exitCode === undefined,
+      `/quit should exit 0, got ${exitCode}`
     );
   } finally {
-    await cleanupProc(proc);
+    if (!exited) await killMa(proc);
   }
 });

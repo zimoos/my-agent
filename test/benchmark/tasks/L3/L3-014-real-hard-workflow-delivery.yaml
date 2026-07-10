@@ -1,0 +1,46 @@
+id: "L3-014"
+title: "Real scenario hard: project workflow feature delivery"
+level: "L3"
+category: "real-scenario-hard"
+weight: 1.45
+
+fixture:
+  project: "feature-medium-projects"
+  setup: []
+
+prompt: |
+  这是一次真实交付测试。请把当前 project workspace 模块当成一个工作流产品能力交付。
+  你需要完成：
+  1. 实现 moveTask(workspace, taskId, targetProjectId)，跨 project 移动任务，找不到 task/project 时要报稳定错误，失败时不能改变 workspace。
+  2. 实现 projectSummary(workspace)，返回每个 project 的 total/open/done 统计。
+  3. 保持 createWorkspace/findTask/addTask 现有能力不破坏。
+  4. 创建 PRD.md，说明功能价值、用户流程、错误边界和验收标准。
+  5. 创建 TECH_ARCHITECTURE.md，说明模块职责、状态变更策略、不可部分更新的设计。
+  6. 运行 npm test，并在最终回复里说明验证结果。
+  不要修改 tests/ 下已有测试。benchmark 会在临时 workspace 运行并清理 demo。
+
+rubric_points:
+  - "moveTask 正确跨项目移动任务并保持任务数据"
+  - "缺失 task/project 时抛出稳定错误且不产生部分更新"
+  - "projectSummary 正确计算 total/open/done"
+  - "PRD.md 和 TECH_ARCHITECTURE.md 说明真实产品/架构边界"
+  - "npm test 通过且未修改 tests/projects.test.js"
+
+no_modify_files:
+  - "tests/projects.test.js"
+
+objective_checks:
+  - command: "npm test"
+    weight_into: "Correctness"
+  - command: "test -f PRD.md"
+    weight_into: "TaskCompletion"
+  - command: "test -f TECH_ARCHITECTURE.md"
+    weight_into: "TaskCompletion"
+  - command: "node -e \"const m=require('./src/projects'); if (typeof m.moveTask !== 'function' || typeof m.projectSummary !== 'function') process.exit(1)\""
+    weight_into: "Correctness"
+  - command: "git diff --quiet HEAD -- tests/projects.test.js"
+    weight_into: "NoRegression"
+
+runtime:
+  timeout_sec: 720
+  runs: 2

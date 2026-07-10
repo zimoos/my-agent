@@ -3,6 +3,10 @@ import type {
   ChatCompletionMessageToolCall,
 } from 'openai/resources/chat/completions';
 import type { ChatContent } from '../mcp/types.js';
+import {
+  completeZimoosToolAuditSummary,
+  sanitizeZimoosToolResultForHistory,
+} from './runtime-context-slots.js';
 
 /**
  * Centralized, encapsulated store for the agent's conversation messages.
@@ -88,18 +92,66 @@ export class MessageStore {
   /** Append a tool result message (handles both text and inline images). */
   appendToolResult(toolCallId: string, content: string): void {
     if (content.startsWith('data:image/')) {
-      this.messages.push({
-        role: 'tool',
-        tool_call_id: toolCallId,
-        content: [{ type: 'image_url', image_url: { url: content } }] as any,
-      });
+      const match = /^data:(image\/[^;,]+);base64,([A-Za-z0-9+/]*={0,2})$/i.exec(content);
+      const payload = match?.[2] ?? '';
+      const validBase64 = Boolean(
+        match &&
+        payload.length > 0 &&
+        payload.length % 4 !== 1 &&
+        !content.includes('[...truncated')
+      );
+      if (validBase64) {
+        this.messages.push({
+          role: 'tool',
+          tool_call_id: toolCallId,
+          content: [{ type: 'image_url', image_url: { url: content } }] as any,
+        });
+      } else {
+        this.messages.push({
+          role: 'tool',
+          tool_call_id: toolCallId,
+          content: '[invalid image data URL omitted: model did not receive pixels; rerun the tool to capture a valid image]',
+        });
+      }
     } else {
+      const sanitized = sanitizeZimoosToolResultForHistory({
+        rawResult: content,
+        sourceTool: 'unknown',
+      });
       this.messages.push({
         role: 'tool',
         tool_call_id: toolCallId,
-        content,
+        content: sanitized ?? content,
       });
     }
+  }
+
+  /**
+   * Replace pending ZimoOS operation placeholders with the next assistant
+   * summary. This mutates only tool result content, so tool_call/tool_result
+   * pairing remains unchanged.
+   */
+  completePendingZimoosOperationSummaries(summary: string): {
+    updated: number;
+    firstUpdatedIndex: number | null;
+  } {
+    let updated = 0;
+    let firstUpdatedIndex: number | null = null;
+    for (let i = 1; i < this.messages.length; i++) {
+      const message = this.messages[i] as any;
+      if (message.role !== 'tool' || typeof message.content !== 'string') {
+        continue;
+      }
+      const corrected = completeZimoosToolAuditSummary(message.content, summary);
+      if (!corrected || corrected === message.content) continue;
+      this.messages[i] = {
+        ...message,
+        content: corrected,
+      } as ChatCompletionMessageParam;
+      updated += 1;
+      firstUpdatedIndex ??= i;
+    }
+    return { updated, firstUpdatedIndex };
   }
 
   /** Append a plain system message. */
@@ -192,11 +244,12 @@ export class MessageStore {
     body: ChatCompletionMessageParam[]
   ): ChatCompletionMessageParam[] {
     const system = this.messages[0];
-    const patchedSystem: ChatCompletionMessageParam = {
-      role: 'system',
-      content: (system.content as string) + (suffix ? '\n' + suffix : ''),
-    } as any;
-    return [patchedSystem, ...body];
+    const base = [system, ...body];
+    if (!suffix) return base;
+    return [
+      ...base,
+      { role: 'system', content: suffix },
+    ];
   }
 
   /** Get messages that have not yet been persisted (system excluded). */

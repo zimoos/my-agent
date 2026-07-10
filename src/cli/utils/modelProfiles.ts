@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { AgentConfig } from '../../mcp/types.js';
-import { globalConfigPath } from '../../config.js';
+import { AGORA_MCP_API_KEY, AGORA_MCP_BASE_URL, globalConfigPath } from '../../config.js';
 import { readSecret } from '../../secrets/keychain.js';
 
 export interface ModelChoice {
@@ -36,12 +36,20 @@ function writeGlobalConfigJson(config: Record<string, any>): void {
 }
 
 function credentialLabel(provider: string, credentialId: string): string {
+  if (provider === 'agora') return credentialId || 'Agora-local';
   if (provider === 'lmstudio') return credentialId || 'LMStudio-local';
   if (provider === 'deepseek') return credentialId || 'DeepSeek';
   return credentialId || provider || 'Model';
 }
 
 async function fetchCredentialModels(credentialId: string, credential: any): Promise<{ models: string[]; source: ModelChoice['source'] }> {
+  const provider = typeof credential?.provider === 'string' ? credential.provider : '';
+  if (provider === 'agora') {
+    const cached = Array.isArray(credential?.modelsCache?.models)
+      ? unique(credential.modelsCache.models)
+      : [];
+    return { models: cached, source: cached.length > 0 ? 'cache' : 'config' };
+  }
   const baseURL = typeof credential?.baseURL === 'string' ? credential.baseURL : '';
   if (!baseURL) return { models: [], source: 'config' };
   let apiKey = credential.apiKeyMode === 'none' ? 'lm-studio' : '';
@@ -86,7 +94,11 @@ export async function listModelChoices(config: AgentConfig): Promise<ModelChoice
 
   for (const [credentialId, credential] of Object.entries(credentials) as Array<[string, any]>) {
     const provider = typeof credential?.provider === 'string' ? credential.provider : 'openai';
-    const baseURL = typeof credential?.baseURL === 'string' ? credential.baseURL : '';
+    const baseURL = provider === 'agora'
+      ? AGORA_MCP_BASE_URL
+      : typeof credential?.baseURL === 'string'
+        ? credential.baseURL
+        : '';
     const labelPrefix = credentialLabel(provider, credentialId);
     const fetched = await fetchCredentialModels(credentialId, credential);
     const profileModels = Object.values(profiles)
@@ -133,12 +145,22 @@ export function saveDefaultModelChoice(choice: ModelChoice): void {
   const profiles = cfg.profiles && typeof cfg.profiles === 'object' ? cfg.profiles : {};
   const credential = credentials[choice.credentialId] ?? {
     provider: choice.provider,
-    baseURL: choice.baseURL,
-    apiKeyMode: choice.provider === 'lmstudio' ? 'none' : undefined,
+    baseURL: choice.provider === 'agora' ? AGORA_MCP_BASE_URL : choice.baseURL,
+    apiKeyMode: choice.provider === 'lmstudio' || choice.provider === 'agora' ? 'none' : undefined,
   };
+  if ((credential.provider ?? choice.provider) === 'agora') {
+    credential.provider = 'agora';
+    credential.baseURL = AGORA_MCP_BASE_URL;
+    credential.apiKeyMode = 'none';
+  }
 
   credentials[choice.credentialId] = credential;
+  const existingProfile =
+    profiles[choice.id] && typeof profiles[choice.id] === 'object'
+      ? profiles[choice.id]
+      : {};
   profiles[choice.id] = {
+    ...existingProfile,
     credentialId: choice.credentialId,
     model: choice.model,
     label: choice.label,
@@ -149,12 +171,29 @@ export function saveDefaultModelChoice(choice: ModelChoice): void {
   cfg.model = {
     ...(cfg.model && typeof cfg.model === 'object' ? cfg.model : {}),
     provider: credential.provider ?? choice.provider,
-    baseURL: credential.baseURL ?? choice.baseURL,
+    baseURL: (credential.provider ?? choice.provider) === 'agora'
+      ? AGORA_MCP_BASE_URL
+      : credential.baseURL ?? choice.baseURL,
     model: choice.model,
     ...(credential.secretRef
       ? { secretRef: credential.secretRef }
-      : { apiKey: credential.apiKeyMode === 'none' ? 'lm-studio' : cfg.model?.apiKey }),
+      : {
+          apiKey:
+            (credential.provider ?? choice.provider) === 'agora'
+              ? AGORA_MCP_API_KEY
+              : credential.apiKeyMode === 'none'
+                ? 'lm-studio'
+                : cfg.model?.apiKey,
+        }),
   };
+  if ((credential.provider ?? choice.provider) === 'agora') {
+    const selectedProfile = profiles[choice.id];
+    if (selectedProfile?.agoraMemory) cfg.model.agoraMemory = selectedProfile.agoraMemory;
+    if (credential.agoraRuntime) cfg.model.agoraRuntime = credential.agoraRuntime;
+    if (credential.command) cfg.model.agoraRuntime = { ...(cfg.model.agoraRuntime ?? {}), command: credential.command };
+    if (credential.args) cfg.model.agoraRuntime = { ...(cfg.model.agoraRuntime ?? {}), args: credential.args };
+    if (credential.dataRoot) cfg.model.agoraRuntime = { ...(cfg.model.agoraRuntime ?? {}), dataRoot: credential.dataRoot };
+  }
   if (cfg.model.apiKey === undefined) delete cfg.model.apiKey;
   writeGlobalConfigJson(cfg);
 }

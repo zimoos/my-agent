@@ -3,6 +3,14 @@ import type { ChatCompletionMessageParam } from 'openai/resources/chat/completio
 export const CHARS_PER_TOKEN = 3.5;
 export const IMAGE_TOKEN_COST = 1000;
 
+export function estimateSerializedBytes(value: unknown): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(value), 'utf8');
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
 function partLength(part: unknown): number {
   if (!part || typeof part !== 'object') return 0;
   const p = part as any;

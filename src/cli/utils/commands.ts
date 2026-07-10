@@ -98,14 +98,14 @@ commands.set('/archive', {
 });
 
 commands.set('/context', {
-  description: 'Inspect/search/recall active context',
+  description: 'Inspect/search/recall context index (debug/compat)',
   handler: (args, ctx) => {
     const trimmed = args.trim();
     if (!trimmed) return ctx.agent.inspectContext();
 
     if (trimmed === 'active') {
       const items = ctx.agent.activeContext();
-      if (items.length === 0) return 'Active context is empty';
+      if (items.length === 0) return 'Context sidecar is empty';
       return items
         .map((item) => {
           const text = (item.content || item.reason || '').replace(/\s+/g, ' ').slice(0, 200);

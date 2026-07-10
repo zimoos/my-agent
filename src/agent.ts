@@ -25,20 +25,26 @@ import {
   renderStackState,
 } from './agent/stack-render.js';
 import { MessageStore } from './agent/message-store.js';
+import {
+  DEFAULT_REQUEST_ENVELOPE_RESERVE_BYTES,
+  RequestContextBuilder,
+  RequestContextOverflowError,
+  type RequestContextBuildResult,
+} from './agent/request-context-builder.js';
+import { estimateSerializedBytes } from './agent/tokenCount.js';
 import { ErrorTracker } from './agent/error-tracker.js';
 import { StreamParser } from './agent/stream-parser.js';
 import { ToolCallRepair } from './agent/tool-repair.js';
 import { ToolExecutor } from './agent/tool-executor.js';
-import { findToolSchema, routeToolCall } from './agent/tool-router.js';
+import { findToolSchema, mcpToolFunctionName, routeToolCall } from './agent/tool-router.js';
 import { resolveProviderCodec } from './provider/detect.js';
 import {
   createProviderRuntime,
-  type ProviderAttemptEvent,
+  type ProviderRuntimeEvent,
 } from './provider/runtime.js';
+import type { AgoraMemoryController } from './provider/agora.js';
 import { DEFAULT_CONTEXT_WINDOW, resolveModelCapabilities } from './provider/capabilities.js';
 import { loadAgentMd } from './agent/memdir.js';
-import { estimateTokens } from './agent/tokenCount.js';
-import { summarizeContextItems } from './agent/summarize.js';
 import { createTodoList } from './agent/todo.js';
 import {
   collectWorkspaceSnapshot,
@@ -50,6 +56,8 @@ import {
   createContextManager,
   type ContextManager,
 } from './agent/context-manager.js';
+import { RuntimeContextSlotStore } from './agent/runtime-context-slots.js';
+import { CompletionObligationAudit } from './agent/completion-obligations.js';
 
 export interface CreateAgentOptions {
   resumeMessages?: ChatCompletionMessageParam[];
@@ -57,7 +65,6 @@ export interface CreateAgentOptions {
   sessionId?: string;
 }
 
-const TOOL_NAME_SEP = '__';
 const DEFAULT_MAX_LOOPS = 500;
 const CREATE_TASK_TOOL_NAME = 'create_task';
 const DANGER_EXEC_TOOLS = new Set<string>([
@@ -77,11 +84,10 @@ function isTtyInteractive(): boolean {
 }
 
 const COMPACT_TRIGGER_RATIO = 0.75;
-const COMPACT_MAX_FAILURES = 2;
-const COMPACT_MIN_SUMMARY_CHARS = 50;
-const COMPACT_BATCH_SIZE = 4;
 const PROGRESS_TOOL_STREAK = 4;
 const PROGRESS_IDLE_MS = 10_000;
+const MAX_AUTOMATIC_LENGTH_CONTINUATIONS = 8;
+const CONTINUATION_NUDGE_PREFIX = '[MA internal continuation request]';
 
 interface ContextUsageSnapshot {
   used: number;
@@ -103,6 +109,32 @@ interface TaskDiagnostics {
   lastContext?: ContextUsageSnapshot;
 }
 
+interface MissingActionEvidence {
+  tool: string;
+  toolCallId: string;
+  operation: string;
+  status: 'missing' | 'failed';
+}
+
+interface TaskRunResult {
+  text: string;
+  hitMaxLoops: boolean;
+  missingEvidence?: MissingActionEvidence[];
+  completionObligationFailure?: string;
+}
+
+function buildMissingEvidenceFailure(items: MissingActionEvidence[]): string {
+  const calls = items
+    .map((item) =>
+      `${item.tool} (${item.toolCallId}, operation=${item.operation}, final=${item.status})`
+    )
+    .join(', ');
+  return [
+    `missing_evidence: cannot complete this action task because the latest attempt for ${calls} did not produce a successful verified result.`,
+    'Re-run the action with an MCP tool that returns structuredContent["my-agent/evidence"] containing a non-empty operation and status="verified".',
+  ].join(' ');
+}
+
 function cleanErrorMessage(msg: string): string {
   let clean = msg.replace(/<[^>]*>/g, '').trim();
   clean = clean.replace(/\s+/g, ' ');
@@ -118,6 +150,43 @@ function compactArgSummary(args: Record<string, unknown>): string {
     }
   }
   return '';
+}
+
+function normalizeContinuationText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+function commonPrefixLength(a: string, b: string): number {
+  const max = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < max && a[i] === b[i]) i++;
+  return i;
+}
+
+function isLikelyContinuationRepeat(previous: string, current: string): boolean {
+  const prev = normalizeContinuationText(previous);
+  const cur = normalizeContinuationText(current);
+  if (prev.length < 48 || cur.length < 48) return false;
+
+  const curPrefix = cur.slice(0, Math.min(180, cur.length));
+  if (curPrefix.length >= 48 && prev.includes(curPrefix)) return true;
+
+  const prevPrefix = prev.slice(0, Math.min(180, prev.length));
+  const shared = commonPrefixLength(prevPrefix, curPrefix);
+  return shared >= Math.min(100, Math.floor(Math.min(prevPrefix.length, curPrefix.length) * 0.8));
+}
+
+function buildContinuationNudge(previous: string): string {
+  const normalized = previous.trim();
+  const tail = normalized.slice(Math.max(0, normalized.length - 800));
+  return [
+    CONTINUATION_NUDGE_PREFIX,
+    'The previous assistant response was cut off by the output token limit.',
+    'Continue exactly from the cutoff point. Do not repeat earlier sentences, headings, preambles, plans, or tool results.',
+    'If the task is complete, finish with the remaining concise conclusion only.',
+    'Last visible tail:',
+    tail,
+  ].join('\n');
 }
 
 function compactResultPreview(content: string): string {
@@ -137,6 +206,9 @@ function buildProgressMessage(records: ToolProgressRecord[], totalTools: number)
 }
 
 function failureNextStep(error: string): string {
+  if (/request context is too large|request body|bytes|images?/i.test(error)) {
+    return '请减少本轮图片数量，或压缩图片后重试；已完成的工具结果和历史记录仍会保留。';
+  }
   if (/context|compact|compaction|上下文/i.test(error)) {
     return '建议先减少本轮活跃上下文、扩大模型 contextWindow，或检查压缩策略是否能移出非关键工具结果。';
   }
@@ -167,7 +239,17 @@ function buildFailureSummary(
   ].filter(Boolean).join('\n');
 }
 
-function providerEventToAgentEvent(event: ProviderAttemptEvent): AgentEvent {
+function providerEventToAgentEvent(event: ProviderRuntimeEvent): AgentEvent {
+  if (event.type === 'progress') {
+    return {
+      type: 'provider:progress',
+      provider: event.provider,
+      phase: event.phase,
+      message: event.message,
+      progress: event.progress,
+      total: event.total,
+    };
+  }
   if (event.type === 'attempt') {
     return {
       type: 'provider:attempt',
@@ -191,7 +273,7 @@ function providerEventToAgentEvent(event: ProviderAttemptEvent): AgentEvent {
 
 async function* drainProviderEvents<T>(
   factory: (
-    onProviderEvent: (event: ProviderAttemptEvent) => void
+    onProviderEvent: (event: ProviderRuntimeEvent) => void
   ) => AsyncGenerator<AgentEvent, T, unknown>
 ): AsyncGenerator<AgentEvent, T, unknown> {
   type QueueItem =
@@ -241,6 +323,18 @@ async function* drainProviderEvents<T>(
     }
     if (item.kind === 'done') return item.value;
     throw item.error;
+  }
+}
+
+async function appendDebugLog(content: string): Promise<void> {
+  try {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const logFile = process.env.MA_DEBUG || path.join(os.homedir(), '.my-agent', 'api-debug.log');
+    fs.appendFileSync(logFile, `[${new Date().toISOString()}] ${content}\n`);
+  } catch {
+    /* ignore debug log failures */
   }
 }
 
@@ -336,6 +430,13 @@ function missingRequiredArgs(
   });
 }
 
+function shouldRetryEmptyArguments(
+  tools: ChatCompletionTool[],
+  name: string
+): boolean {
+  return getRequiredArgs(tools, name).length > 0;
+}
+
 const CREATE_TASK_TOOL: ChatCompletionTool = {
   type: 'function',
   function: {
@@ -372,7 +473,7 @@ interface BuiltinTool {
   handler: (
     args: Record<string, any>,
     ctx: BuiltinToolContext
-  ) => { content: string; isError: boolean };
+  ) => { content: string; isError: boolean } | Promise<{ content: string; isError: boolean }>;
 }
 
 const builtinTools = new Map<string, BuiltinTool>();
@@ -521,6 +622,109 @@ builtinTools.set('enter_plan_mode', {
   },
 });
 
+function agoraMemoryTool(
+  name: string,
+  description: string,
+  parameters: Record<string, any>,
+  handler: (args: Record<string, any>) => Promise<{ content: string; isError: boolean }>
+): BuiltinTool {
+  return {
+    definition: {
+      type: 'function',
+      function: {
+        name,
+        description,
+        parameters,
+      },
+    },
+    handler,
+  };
+}
+
+function registerAgoraMemoryTools(
+  tools: Map<string, BuiltinTool>,
+  controller: AgoraMemoryController
+): void {
+  const profilePatchParameters = {
+    type: 'object',
+    properties: {
+      profile_id: { type: 'string', description: 'Agora MemoryProfile id' },
+      patch_id: { type: 'string', description: 'MemoryPatch id to select' },
+      active_memory_patch_ids: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'MemoryPatch ids to select',
+      },
+    },
+    additionalProperties: false,
+  };
+  tools.set(
+    'agora_memory_status',
+    agoraMemoryTool(
+      'agora_memory_status',
+      '查看当前 Agora provider 的真实 MemoryPatch 状态。状态来自最近一次 Agora chat_complete metadata。',
+      { type: 'object', properties: {}, additionalProperties: false },
+      (args) => controller.status(args)
+    )
+  );
+  tools.set(
+    'agora_memory_mount',
+    agoraMemoryTool(
+      'agora_memory_mount',
+      '挂载或切换 Agora MemoryProfile/MemoryPatch，并通过一次 Agora chat_complete metadata 验证成功。',
+      profilePatchParameters,
+      (args) => controller.mount(args)
+    )
+  );
+  tools.set(
+    'agora_memory_disable',
+    agoraMemoryTool(
+      'agora_memory_disable',
+      '禁用 Agora MemoryProfile，并通过一次 Agora chat_complete metadata 验证禁用状态。',
+      {
+        type: 'object',
+        properties: {
+          profile_id: { type: 'string', description: 'Agora MemoryProfile id' },
+        },
+        additionalProperties: false,
+      },
+      (args) => controller.disable(args)
+    )
+  );
+  tools.set(
+    'agora_memory_internalize',
+    agoraMemoryTool(
+      'agora_memory_internalize',
+      '将当前 Agora runtime session 的新增对话提交 memory_intake_run，产出 MemoryPatch 后挂载并验证。',
+      {
+        type: 'object',
+        properties: {
+          profile_id: { type: 'string', description: 'Agora MemoryProfile id' },
+        },
+        additionalProperties: false,
+      },
+      (args) => controller.internalize(args)
+    )
+  );
+  tools.set(
+    'agora_memory_rollback',
+    agoraMemoryTool(
+      'agora_memory_rollback',
+      '回滚 Agora MemoryProfile 到指定或唯一上一版 MemoryPatch，并通过 chat_complete metadata 验证。',
+      {
+        type: 'object',
+        properties: {
+          profile_id: { type: 'string', description: 'Agora MemoryProfile id' },
+          patch_id: { type: 'string', description: 'target MemoryPatch id' },
+          target_patch_id: { type: 'string', description: 'target MemoryPatch id' },
+        },
+        additionalProperties: false,
+      },
+      (args) => controller.rollback(args)
+    )
+  );
+}
+
 function isMutatingTool(name: string): boolean {
   // Exec commands and write/edit/delete tools should never be storm-suppressed
   if (DANGER_EXEC_TOOLS.has(name)) return true;
@@ -540,7 +744,7 @@ function mcpToolsToOpenAI(connections: McpConnection[]): ChatCompletionTool[] {
       out.push({
         type: 'function',
         function: {
-          name: `${conn.name}${TOOL_NAME_SEP}${tool.name}`,
+          name: mcpToolFunctionName(conn.name, tool.name),
           description: tool.description || tool.name,
           parameters:
             tool.inputSchema && typeof tool.inputSchema === 'object'
@@ -558,13 +762,23 @@ export async function createAgent(
   connections: McpConnection[],
   options: CreateAgentOptions = {}
 ): Promise<Agent> {
-  const providerRuntime = createProviderRuntime(config.model);
+  const cwd = process.cwd();
+  const providerRuntime = createProviderRuntime(config.model, undefined, {
+    sessionId: options.sessionId,
+    cwd,
+  });
+  await providerRuntime.ready?.();
   const providerCodec = resolveProviderCodec(config.model);
 
+  const agoraMemoryController = providerRuntime.getMemoryController?.() ?? null;
+  const activeBuiltinTools = new Map(builtinTools);
+  if (agoraMemoryController) {
+    registerAgoraMemoryTools(activeBuiltinTools, agoraMemoryController);
+  }
   const mcpTools = mcpToolsToOpenAI(connections);
   const tools: ChatCompletionTool[] = [
     ...mcpTools,
-    ...[...builtinTools.values()].map((b) => b.definition),
+    ...[...activeBuiltinTools.values()].map((b) => b.definition),
   ];
   const allowedToolNames = new Set(tools.map((t) => t.function.name));
   const toolRepair = new ToolCallRepair(
@@ -596,7 +810,7 @@ export async function createAgent(
       '- Always provide complete parameters: read_file needs path (e.g. ./package.json), list_directory uses . for cwd.',
       '- Call multiple independent tools in parallel for efficiency.',
       '- On tool error: read the error, try a different approach.',
-      '- Internal CLI: use execute_command to call ma ctx rm/search/recall/pin/clear to manage context, and ma say "text" to output messages in parallel with other tool calls.',
+      '- Internal CLI: ma ctx commands are debug/compat context inspection only; they do not control the provider request transcript. Use ma say "text" to output messages in parallel with other tool calls.',
       '',
       '# Output style',
       '- After using tools, give a complete answer based on results. Never call tools then stay silent.',
@@ -615,21 +829,41 @@ export async function createAgent(
       '- Do not write code with security vulnerabilities (injection, XSS, etc.).',
       '- Do not expose internal state (task stack, system messages) to the user.',
     ].join('\n');
-  const cwd = process.cwd();
+  const providerPrompt = config.model.provider?.toLowerCase() === 'agora'
+    ? agoraMemoryController
+      ? [
+          '',
+          '# Agora Memory',
+          '- Agora memory is provider-scoped. Use agora_memory_status/mount/disable/internalize/rollback only when the user asks to inspect or change Agora MemoryPatch state.',
+          '- Treat Agora memory as mounted only when agora_memory_status or a memory action reports providerState from Agora chat_complete metadata.',
+          '- Do not simulate memory by inserting facts into the prompt.',
+        ].join('\n')
+      : [
+          '',
+          '# Agora Memory',
+          '- Agora provider is active, but Agora MCP memory tools are not all available. Tell the user memory operations require a complete Agora MCP runtime.',
+        ].join('\n')
+    : [
+        '',
+        '# Agora Memory',
+        '- Agora MemoryPatch operations require switching to provider: agora. Do not claim mount/internalize/rollback is available under other providers.',
+      ].join('\n');
   const agentMd = loadAgentMd(cwd);
   const envInfo = `\n\n# Environment\n当前工作目录: ${cwd}\n平台: ${process.platform}\nNode: ${process.version}`;
   const systemPrompt = agentMd
-    ? `${baseSystemPrompt}${envInfo}\n\n# Project Context\n${agentMd}`
-    : `${baseSystemPrompt}${envInfo}`;
+    ? `${baseSystemPrompt}${providerPrompt}${envInfo}\n\n# Project Context\n${agentMd}`
+    : `${baseSystemPrompt}${providerPrompt}${envInfo}`;
 
   const store = new MessageStore();
   store.init(systemPrompt, options.resumeMessages);
+  const requestContextBuilder = new RequestContextBuilder();
   const sessionStore = options.sessionStore;
   const sessionId = options.sessionId;
   const contextManager = createContextManager(
     sessionId,
     sessionStore?.getSessionDir()
   );
+  const runtimeSlots = new RuntimeContextSlotStore();
   if (options.resumeMessages) {
     contextManager.ensureIndexed(
       options.resumeMessages.filter((m) => m.role !== 'system')
@@ -637,6 +871,16 @@ export async function createAgent(
   }
 
   const rootTranscriptAnchors: number[] = [];
+
+  function persistProviderState(): void {
+    const providerState = providerRuntime.getProviderState?.();
+    if (!providerState || !sessionStore || !sessionId) return;
+    try {
+      sessionStore.updateProviderState(sessionId, providerState);
+    } catch {
+      /* provider state is best-effort session metadata */
+    }
+  }
 
   function persistPending(): ReturnType<typeof contextManager.recordMessages> {
     const pending = store.getPendingForPersist();
@@ -659,6 +903,34 @@ export async function createAgent(
     return indexed;
   }
 
+  function rewritePersistedHistoryFrom(storeIndex: number): void {
+    if (!sessionStore || !sessionId || storeIndex <= 0) return;
+    const snapshot = store.snapshot();
+    const keepMessages = snapshot
+      .slice(1, storeIndex)
+      .filter((m) => m.role !== 'system').length;
+    try {
+      sessionStore.truncate(sessionId, keepMessages);
+      for (const message of snapshot.slice(storeIndex)) {
+        if (message.role !== 'system') {
+          sessionStore.append(sessionId, message);
+        }
+      }
+      store.markPersisted();
+    } catch {
+      /* keep in-memory correction even if session rewrite fails */
+    }
+  }
+
+  async function completePendingZimoosOperationSummaries(summary: string): Promise<void> {
+    const result = store.completePendingZimoosOperationSummaries(summary);
+    if (result.updated === 0 || result.firstUpdatedIndex === null) return;
+    rewritePersistedHistoryFrom(result.firstUpdatedIndex);
+    await appendDebugLog(
+      `zimoos operation summaries corrected: updated=${result.updated} firstIndex=${result.firstUpdatedIndex}`
+    );
+  }
+
   const stack = createTaskStack();
   const todoList = createTodoList();
   const taskArchive = new Map<string, ChatCompletionMessageParam[]>();
@@ -671,6 +943,10 @@ export async function createAgent(
     if (!resolver) return;
     pendingConfirms.delete(requestId);
     resolver(approved);
+  }
+
+  function getProviderState() {
+    return providerRuntime.getProviderState?.() ?? null;
   }
 
   function awaitConfirm(
@@ -693,119 +969,90 @@ export async function createAgent(
   const contextWindowSource = capabilities.contextWindowSource;
   config.model.contextWindow = contextWindow;
   config.model.contextWindowSource = contextWindowSource;
+  const requestBodyByteLimit = capabilities.requestBodyByteLimit;
+  if (
+    !Number.isSafeInteger(requestBodyByteLimit) ||
+    requestBodyByteLimit <= 0
+  ) {
+    throw new Error(
+      `invalid provider request body byte limit: ${String(requestBodyByteLimit)}`
+    );
+  }
+  config.model.requestBodyByteLimit = requestBodyByteLimit;
+  config.model.requestBodyByteLimitSource = capabilities.requestBodyByteLimitSource;
   const compactThreshold = Math.floor(contextWindow * COMPACT_TRIGGER_RATIO);
-  let compactFailures = 0;
+  const requestEnvelopeBytes = estimateSerializedBytes({
+    model: config.model.model,
+    messages: [],
+    stream: true,
+    temperature: config.model.temperature ?? 0.6,
+    ...(config.model.topP !== undefined ? { top_p: config.model.topP } : {}),
+    ...(config.model.presencePenalty !== undefined
+      ? { presence_penalty: config.model.presencePenalty }
+      : {}),
+    frequency_penalty: config.model.frequencyPenalty ?? 1.1,
+    ...(config.model.maxTokens != null && config.model.maxTokens > 0
+      ? { max_tokens: config.model.maxTokens }
+      : {}),
+    ...(config.model.topK !== undefined ? { top_k: config.model.topK } : {}),
+    ...(config.model.minP !== undefined ? { min_p: config.model.minP } : {}),
+    ...(config.model.repeatPenalty !== undefined
+      ? { repeat_penalty: config.model.repeatPenalty }
+      : {}),
+    ...(config.model.extraParams ?? {}),
+    ...(tools.length > 0 ? { tools, tool_choice: 'auto' } : {}),
+  });
+  const requestMessageByteBudget = Math.max(
+    1,
+    requestBodyByteLimit -
+      requestEnvelopeBytes -
+      DEFAULT_REQUEST_ENVELOPE_RESERVE_BYTES
+  );
   let lastTaskDiagnostics: TaskDiagnostics = { recentTools: [], totalTools: 0 };
 
   function buildRequestSuffix(loopWarning = ''): string {
     const stateStr = renderStackState(stack);
     return [
-      contextManager.formatRequestInstructions(),
       stateStr || '',
       loopWarning,
     ].filter(Boolean).join('\n\n');
   }
 
-  function activeContextTokens(suffix: string): number {
-    return estimateTokens(
-      store.buildContextRequestMessages(suffix, contextManager.buildLlmContext())
-    );
+  function buildRequestContext(
+    suffix: string,
+    protectedMessageIndex?: number
+  ): RequestContextBuildResult {
+    return requestContextBuilder.build(store.snapshot(), {
+      suffix,
+      maxTokens: compactThreshold,
+      maxBytes: requestMessageByteBudget,
+      protectedMessageIndexes: protectedMessageIndex === undefined
+        ? undefined
+        : [protectedMessageIndex],
+      requestOnlyAttachment: runtimeSlots.renderRequestOnlyAttachment(),
+    });
   }
 
-  function contextUsageSnapshot(suffix = buildRequestSuffix()): ContextUsageSnapshot {
+  function contextUsageSnapshotFromBuild(
+    result: RequestContextBuildResult
+  ): ContextUsageSnapshot {
     return {
-      used: activeContextTokens(suffix),
+      used: result.requestTokens,
       total: contextWindow,
       compactThreshold,
       source: contextWindowSource,
     };
   }
 
-  function oldestCompressibleActiveItems(): Array<{ i: number; role: string; content: string }> {
-    return contextManager.active()
-      .filter((item) =>
-        item.role !== 'user' &&
-        item.mode !== 'protected' &&
-        typeof item.i === 'number' &&
-        (item.content ?? '').trim().length > 0
-      )
-      .sort((a, b) => a.i - b.i)
-      .slice(0, COMPACT_BATCH_SIZE)
-      .map((item) => ({
-        i: item.i,
-        role: item.role,
-        content: item.content ?? '',
-      }));
-  }
-
-  async function compactActiveContext(
-    suffix: string,
-    signal?: AbortSignal,
-  ): Promise<{ compacted: boolean; freed: number }> {
-    const before = activeContextTokens(suffix);
-    if (before <= compactThreshold) return { compacted: false, freed: 0 };
-
-    let anyCompacted = false;
-    let lastTokens = before;
-    for (let attempt = 0; attempt < 20 && lastTokens > compactThreshold; attempt++) {
-      const candidates = oldestCompressibleActiveItems();
-      if (candidates.length === 0) {
-        throw new Error('active context is too large and has no compressible non-user items');
-      }
-
-      let summaries: Awaited<ReturnType<typeof summarizeContextItems>> = [];
-      try {
-        summaries = await summarizeContextItems(
-          providerRuntime,
-          config.model.model,
-          candidates,
-          signal
-        );
-      } catch {
-        summaries = [];
-      }
-
-      const byId = new Map(summaries.map((item) => [item.i, item.summary]));
-      const ops = candidates.map((item) => {
-        const summary = byId.get(item.i);
-        if (summary && summary.length >= COMPACT_MIN_SUMMARY_CHARS) {
-          return {
-            i: item.i,
-            act: 'edit',
-            res: summary,
-            reason: 'active context overflow compact',
-          };
-        }
-        return {
-          i: item.i,
-          act: 'rm',
-          reason: 'active context overflow compact fallback',
-        };
-      });
-
-      contextManager.applyPatch(JSON.stringify({ ops }));
-      anyCompacted = true;
-      compactFailures = summaries.length === 0 ? compactFailures + 1 : 0;
-      lastTokens = activeContextTokens(suffix);
-
-      if (compactFailures >= COMPACT_MAX_FAILURES && lastTokens > compactThreshold) {
-        const fallback = oldestCompressibleActiveItems();
-        if (fallback.length === 0) break;
-        contextManager.applyPatch(JSON.stringify({
-          ops: fallback.map((item) => ({
-            i: item.i,
-            act: 'rm',
-            reason: 'active context overflow after compact failures',
-          })),
-        }));
-        lastTokens = activeContextTokens(suffix);
-      }
-    }
-
-    if (lastTokens > compactThreshold) {
-      throw new Error(`active context still too large after compaction (${lastTokens}/${compactThreshold} tokens)`);
-    }
-    return { compacted: anyCompacted, freed: Math.max(0, before - lastTokens) };
+  function usageSnapshotForOverflow(
+    err: RequestContextOverflowError
+  ): ContextUsageSnapshot {
+    return {
+      used: err.protectedTokens,
+      total: contextWindow,
+      compactThreshold,
+      source: contextWindowSource,
+    };
   }
 
   function foldMessages(anchor: number, taskId: string, summary: string): void {
@@ -828,8 +1075,9 @@ export async function createAgent(
   async function* runTask(
     task: Task,
     rootUserMessage: ChatContent,
+    completionAudit: CompletionObligationAudit,
     signal?: AbortSignal
-  ): AsyncGenerator<AgentEvent, { text: string; hitMaxLoops: boolean }, unknown> {
+  ): AsyncGenerator<AgentEvent, TaskRunResult, unknown> {
     const errorTracker = new ErrorTracker();
     const effectiveMaxTokens = config.model.maxTokens;
     const streamParser = new StreamParser({
@@ -841,7 +1089,7 @@ export async function createAgent(
     const toolExecutor = new ToolExecutor(
       config,
       connections,
-      builtinTools,
+      activeBuiltinTools,
       { nextId: nextConfirmId, awaitApproval: awaitConfirm }
     );
 
@@ -881,7 +1129,26 @@ export async function createAgent(
     let verbalIntentRetries = 0;
     let silentToolResults = 0;
     let lastVisibleAt = Date.now();
+    let lengthContinuationCount = 0;
+    let lastLengthContinuationContent = '';
+    const incompleteActionEvidence = new Map<string, MissingActionEvidence>();
     lastTaskDiagnostics = { recentTools: [], totalTools: 0 };
+
+    const taskResult = (text: string, hitMaxLoops = false): TaskRunResult => ({
+      text,
+      hitMaxLoops,
+      ...(incompleteActionEvidence.size > 0
+        ? { missingEvidence: [...incompleteActionEvidence.values()] }
+        : {}),
+    });
+
+    const failedCompletionResult = (
+      text: string,
+      completionObligationFailure: string
+    ): TaskRunResult => ({
+      ...taskResult(text),
+      completionObligationFailure,
+    });
 
     const noteVisible = () => {
       silentToolResults = 0;
@@ -926,21 +1193,35 @@ export async function createAgent(
         loopWarning = `\n\n[WARNING] You have only 5 loops remaining (${loop}/${maxLoops} used). If you are stuck in a loop, stop and summarize what you have done so far. If you still need more steps to complete the task, continue working.`;
       }
 
-      const preCompactSuffix = buildRequestSuffix(loopWarning);
-      const beforeCompactUsage = contextUsageSnapshot(preCompactSuffix);
-      lastTaskDiagnostics.lastContext = beforeCompactUsage;
-      yield { type: 'context:usage', ...beforeCompactUsage };
-      const compactResult = await compactActiveContext(preCompactSuffix, signal);
-      if (compactResult.compacted) {
-        yield { type: 'compact:done', freed: compactResult.freed };
-        const afterCompactUsage = contextUsageSnapshot(preCompactSuffix);
-        lastTaskDiagnostics.lastContext = afterCompactUsage;
-        yield { type: 'context:usage', ...afterCompactUsage };
-      }
-
       const suffix = buildRequestSuffix(loopWarning);
+      let requestContext: RequestContextBuildResult;
+      try {
+        requestContext = buildRequestContext(suffix, task.messageAnchor);
+      } catch (err) {
+        if (err instanceof RequestContextOverflowError) {
+          const usage = usageSnapshotForOverflow(err);
+          lastTaskDiagnostics.lastContext = usage;
+          yield { type: 'context:usage', ...usage };
+        }
+        throw err;
+      }
+      const usage = contextUsageSnapshotFromBuild(requestContext);
+      lastTaskDiagnostics.lastContext = usage;
+      yield { type: 'context:usage', ...usage };
+      if (requestContext.currentImagesSummarized > 0) {
+        yield {
+          type: 'warning',
+          message: `${requestContext.currentImagesSummarized} current-turn image(s) were replaced with auditable summaries to keep the request body below the provider byte limit. The model did not receive those pixels; rerun with smaller images if visual details are required.`,
+        };
+      }
+      if (requestContext.windowed) {
+        yield {
+          type: 'compact:done',
+          freed: Math.max(0, requestContext.rawTokens - requestContext.requestTokens),
+        };
+      }
       const requestMessages = providerCodec.encodeMessages(
-        store.buildContextRequestMessages(suffix, contextManager.buildLlmContext())
+        requestContext.messages
       );
 
       // Prefix cache diagnostic: detect unexpected system prompt changes
@@ -986,6 +1267,21 @@ export async function createAgent(
         request.tool_choice = 'auto';
       }
 
+      const requestBodyBytes = estimateSerializedBytes(request);
+      if (requestBodyBytes > requestBodyByteLimit) {
+        throw new RequestContextOverflowError(
+          `request body is too large (${requestBodyBytes}/${requestBodyByteLimit} bytes); retry with fewer or smaller images, or compress images before sending`,
+          {
+            rawTokens: requestContext.rawTokens,
+            protectedTokens: requestContext.protectedTokens,
+            maxTokens: compactThreshold,
+            rawBytes: requestContext.rawBytes,
+            protectedBytes: requestBodyBytes,
+            maxBytes: requestBodyByteLimit,
+          }
+        );
+      }
+
       // Debug: dump messages before API call
       // Always log API requests for debugging
       try {
@@ -993,13 +1289,22 @@ export async function createAgent(
         const os = await import('node:os');
         const path = await import('node:path');
         const logFile = process.env.MA_DEBUG || path.join(os.homedir(), '.my-agent', 'api-debug.log');
-        const dbg = requestMessages.map((m: any) => ({
-          role: m.role,
-          content: typeof m.content === 'string' ? m.content.slice(0, 200) : m.content,
-          reasoning_content: typeof m.reasoning_content === 'string' ? `${m.reasoning_content.length} chars` : undefined,
-          tool_calls: m.tool_calls?.length,
-          tool_call_id: m.tool_call_id,
-        }));
+        const dbg = requestMessages.map((m: any, index: number) => {
+          const isLatestRequestOnlyZimoosMessage =
+            index === requestMessages.length - 1 &&
+            m.role === 'user' &&
+            typeof m.content === 'string' &&
+            /<zimoos\b[\s\S]*?<\/zimoos>/.test(m.content);
+          return {
+            role: m.role,
+            content: typeof m.content === 'string'
+              ? (isLatestRequestOnlyZimoosMessage ? m.content : m.content.slice(0, 200))
+              : m.content,
+            reasoning_content: typeof m.reasoning_content === 'string' ? `${m.reasoning_content.length} chars` : undefined,
+            tool_calls: m.tool_calls?.length,
+            tool_call_id: m.tool_call_id,
+          };
+        });
         fs.appendFileSync(logFile, `[${new Date().toISOString()}] API REQUEST messages (${requestMessages.length}):\n${JSON.stringify(dbg, null, 2)}\n\n`);
       } catch { /* ignore */ }
 
@@ -1013,6 +1318,7 @@ export async function createAgent(
         })()
       );
       const { content: contentBuf, toolCalls, finishReason } = parsedTurn;
+      persistProviderState();
       const reasoningContent = providerCodec.shouldStoreReasoningContent(parsedTurn)
         ? parsedTurn.reasoningContent
         : undefined;
@@ -1020,11 +1326,76 @@ export async function createAgent(
         noteVisible();
       }
 
+      if (
+        lengthContinuationCount > 0 &&
+        !toolCalls &&
+        contentBuf.trim().length > 0 &&
+        lastLengthContinuationContent &&
+        isLikelyContinuationRepeat(lastLengthContinuationContent, contentBuf)
+      ) {
+        yield {
+          type: 'warning',
+          message: 'Model repeated prior truncated output after continuation; stopped automatic continuation to avoid runaway repetition.',
+        };
+        if (!task.parentId) {
+          const completionDecision = completionAudit.inspectFinalAttempt();
+          if (completionDecision.status === 'retry') {
+            store.appendUser(completionDecision.message!);
+            persistPending();
+            yield { type: 'warning', message: completionDecision.message! };
+            lengthContinuationCount = 0;
+            lastLengthContinuationContent = '';
+            tempOverride = 0.1;
+            continue;
+          }
+          if (completionDecision.status === 'failed') {
+            finalText = lastLengthContinuationContent;
+            return failedCompletionResult(
+              finalText,
+              completionDecision.message!
+            );
+          }
+        }
+        finalText = lastLengthContinuationContent;
+        return taskResult(finalText);
+      }
+
       if (finishReason === 'length' && !toolCalls) {
         yield { type: 'warning', message: 'Model output was truncated (token limit reached). Continuing...' };
         if (contentBuf.trim().length > 0) {
+          await completePendingZimoosOperationSummaries(contentBuf);
           store.appendAssistant(contentBuf, undefined, { reasoningContent });
+          lastLengthContinuationContent = contentBuf;
         }
+        lengthContinuationCount++;
+        if (lengthContinuationCount > MAX_AUTOMATIC_LENGTH_CONTINUATIONS) {
+          yield {
+            type: 'warning',
+            message: `Model reached the output token limit ${MAX_AUTOMATIC_LENGTH_CONTINUATIONS} times; stopped automatic continuation. Ask to continue if more output is needed.`,
+          };
+          finalText = contentBuf || lastLengthContinuationContent;
+          persistPending();
+          if (!task.parentId) {
+            const completionDecision = completionAudit.inspectFinalAttempt();
+            if (completionDecision.status === 'retry') {
+              store.appendUser(completionDecision.message!);
+              persistPending();
+              yield { type: 'warning', message: completionDecision.message! };
+              lengthContinuationCount = 0;
+              lastLengthContinuationContent = '';
+              tempOverride = 0.1;
+              continue;
+            }
+            if (completionDecision.status === 'failed') {
+              return failedCompletionResult(
+                finalText,
+                completionDecision.message!
+              );
+            }
+          }
+          return taskResult(finalText);
+        }
+        store.appendUser(buildContinuationNudge(contentBuf || lastLengthContinuationContent));
         persistPending();
         continue;
       }
@@ -1055,6 +1426,7 @@ export async function createAgent(
           looksLikeVerbalToolIntent(contentBuf)
         ) {
           verbalIntentRetries += 1;
+          await completePendingZimoosOperationSummaries(contentBuf);
           store.appendAssistant(contentBuf, undefined, { reasoningContent });
           store.appendUser(
             '你刚才说要继续操作，但没有调用工具。请现在直接调用合适的工具完成这一步；如果信息不足，请直接向用户提一个明确问题。'
@@ -1063,10 +1435,36 @@ export async function createAgent(
           tempOverride = 0.1;
           continue;
         }
+        if (!task.parentId && contentBuf.trim().length > 0) {
+          const completionDecision = completionAudit.inspectFinalAttempt();
+          if (completionDecision.status === 'retry') {
+            await completePendingZimoosOperationSummaries(contentBuf);
+            store.appendAssistant(contentBuf, undefined, { reasoningContent });
+            store.appendUser(completionDecision.message!);
+            persistPending();
+            yield {
+              type: 'warning',
+              message: completionDecision.message!,
+            };
+            tempOverride = 0.1;
+            continue;
+          }
+          if (completionDecision.status === 'failed') {
+            await completePendingZimoosOperationSummaries(contentBuf);
+            store.appendAssistant(contentBuf, undefined, { reasoningContent });
+            persistPending();
+            finalText = contentBuf;
+            return failedCompletionResult(
+              finalText,
+              completionDecision.message!
+            );
+          }
+        }
+        await completePendingZimoosOperationSummaries(contentBuf);
         store.appendAssistant(contentBuf, undefined, { reasoningContent });
         persistPending();
         finalText = contentBuf;
-        return { text: finalText, hitMaxLoops: false };
+        return taskResult(finalText);
       }
 
       const invalidToolCalls = repairedCalls
@@ -1113,14 +1511,24 @@ export async function createAgent(
         continue;
       }
 
+      if (contentBuf.trim().length > 0) {
+        await completePendingZimoosOperationSummaries(contentBuf);
+      }
       store.appendAssistant(contentBuf.trim() || '', repairedCalls, { reasoningContent });
 
-      // P0-b compatibility guard retained for tools without explicit schemas.
+      // P0-b compatibility guard: retry empty args only when the tool schema
+      // actually declares required arguments. Legitimate no-arg tools such as
+      // zimoos.current must execute on the first attempt.
       const allEmpty = repairedCalls.every((tc) => {
         const a = normalizeArguments(tc.function.arguments);
         return Object.keys(a).length === 0;
       });
-      if (allEmpty && emptyArgsRetries < 2) {
+      const shouldRetryAllEmpty =
+        allEmpty &&
+        repairedCalls.some((tc) =>
+          shouldRetryEmptyArguments(tools, tc.function.name)
+        );
+      if (shouldRetryAllEmpty && emptyArgsRetries < 2) {
         emptyArgsRetries += 1;
         store.popAssistant(); // remove the assistant message with empty tool_calls
         tempOverride = 0.1; // force low temperature for next request
@@ -1145,11 +1553,39 @@ export async function createAgent(
           continue;
         }
 
-        const { result, isError } = yield* toolExecutor.execute(
+        const {
+          result,
+          isError,
+          runtimeSlotUpdate,
+          actionEvidence,
+        } = yield* toolExecutor.execute(
           tc,
           toolCtx,
           signal
         );
+        completionAudit.recordToolEvidence({
+          toolName: fullName,
+          args,
+          succeeded: !isError,
+          verifiedAction: actionEvidence?.status === 'verified',
+        });
+        if (actionEvidence?.status === 'verified') {
+          incompleteActionEvidence.delete(actionEvidence.key);
+        } else if (actionEvidence) {
+          incompleteActionEvidence.set(actionEvidence.key, {
+            tool: fullName,
+            toolCallId: tc.id,
+            operation: actionEvidence.operation,
+            status: actionEvidence.status,
+          });
+        }
+        if (runtimeSlotUpdate) {
+          runtimeSlots.set(runtimeSlotUpdate);
+          await appendDebugLog(
+            `runtime slot updated: ${runtimeSlotUpdate.slotId} sourceTool=${fullName} toolCallId=${tc.id} frameId=${runtimeSlotUpdate.value.frame.frameId ?? '(unknown)'} frameCursor=${runtimeSlotUpdate.value.frame.frameCursor}`
+          );
+        }
+        persistProviderState();
         store.appendToolResult(tc.id, result);
         errorTracker.record(fullName, args, isError);
         const progress = recordToolProgress(fullName, args, !isError, result);
@@ -1163,11 +1599,12 @@ export async function createAgent(
       '失败点：达到最大循环次数。',
       '下一步：请缩小任务范围，或检查是否存在重复工具调用/缺少停止条件。',
     ].join('\n');
+    await completePendingZimoosOperationSummaries(stop);
     store.appendAssistant(stop);
     persistPending();
     yield { type: 'text', content: stop };
     finalText = stop;
-    return { text: finalText, hitMaxLoops: true };
+    return taskResult(finalText, true);
   }
 
   async function* chat(
@@ -1194,6 +1631,7 @@ export async function createAgent(
     }
 
     const workspaceBefore = collectWorkspaceSnapshot();
+    const completionAudit = new CompletionObligationAudit(rootPromptText);
 
     outer: while (stack.size() > 0) {
       if (signal?.aborted) break;
@@ -1209,15 +1647,19 @@ export async function createAgent(
       let failed = false;
       let failMessage = '';
       let aborted = false;
+      let missingEvidence: MissingActionEvidence[] = [];
+      let completionObligationFailure = '';
 
       try {
-        const gen = runTask(task, userMessage, signal);
+        const gen = runTask(task, userMessage, completionAudit, signal);
         while (true) {
           const { value, done } = await gen.next();
           if (done) {
             const result = value ?? { text: '', hitMaxLoops: false };
             taskText = result.text ?? '';
             hitMaxLoops = result.hitMaxLoops === true;
+            missingEvidence = result.missingEvidence ?? [];
+            completionObligationFailure = result.completionObligationFailure ?? '';
             break;
           }
           yield value as AgentEvent;
@@ -1254,6 +1696,7 @@ export async function createAgent(
       if (failed) {
         const cleanError = cleanErrorMessage(failMessage);
         const summary = buildFailureSummary(cleanError, lastTaskDiagnostics);
+        await completePendingZimoosOperationSummaries(summary);
         store.appendAssistant(summary);
         persistPending();
         taskText = summary;
@@ -1265,6 +1708,27 @@ export async function createAgent(
         stack.markFailed(task.id, taskText);
         foldTaskIfNeeded(task, taskText);
         yield { type: 'task:failed', taskId: task.id, error: 'max loops' };
+      } else if (missingEvidence.length > 0) {
+        const evidenceFailure = buildMissingEvidenceFailure(missingEvidence);
+        store.appendAssistant(evidenceFailure);
+        persistPending();
+        taskText = evidenceFailure;
+        yield { type: 'text', content: evidenceFailure };
+        stack.markFailed(task.id, evidenceFailure);
+        foldTaskIfNeeded(task, evidenceFailure);
+        yield { type: 'task:failed', taskId: task.id, error: evidenceFailure };
+      } else if (completionObligationFailure) {
+        store.appendAssistant(completionObligationFailure);
+        persistPending();
+        taskText = completionObligationFailure;
+        yield { type: 'text', content: completionObligationFailure };
+        stack.markFailed(task.id, completionObligationFailure);
+        foldTaskIfNeeded(task, completionObligationFailure);
+        yield {
+          type: 'task:failed',
+          taskId: task.id,
+          error: completionObligationFailure,
+        };
       } else {
         stack.markDone(task.id, taskText);
         foldTaskIfNeeded(task, taskText || '(no output)');
@@ -1281,6 +1745,7 @@ export async function createAgent(
 
   function reset(): void {
     store.reset(systemPrompt);
+    runtimeSlots.clear();
     stack.clear();
     taskArchive.clear();
     rootTranscriptAnchors.length = 0;
@@ -1322,7 +1787,15 @@ export async function createAgent(
   }
 
   function getContextUsage(): { used: number; total: number; compactThreshold: number; source: string } {
-    return contextUsageSnapshot();
+    const suffix = buildRequestSuffix();
+    try {
+      return contextUsageSnapshotFromBuild(buildRequestContext(suffix));
+    } catch (err) {
+      if (err instanceof RequestContextOverflowError) {
+        return usageSnapshotForOverflow(err);
+      }
+      throw err;
+    }
   }
 
   function inspectContext(): string {
@@ -1357,6 +1830,10 @@ export async function createAgent(
     return contextManager.clearActive();
   }
 
+  async function close(): Promise<void> {
+    await providerRuntime.close?.();
+  }
+
   return {
     chat,
     reset,
@@ -1365,6 +1842,7 @@ export async function createAgent(
     abortAll,
     revertLastTurnContextOnly,
     respondConfirm,
+    getProviderState,
     getContextUsage,
     inspectContext,
     searchContext,
@@ -1374,6 +1852,7 @@ export async function createAgent(
     poolContext,
     dropContext,
     clearActiveContext,
+    close,
   };
 }
 

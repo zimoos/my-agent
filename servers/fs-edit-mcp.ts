@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { createInterface } from 'node:readline';
+import { createHash, randomUUID } from 'node:crypto';
 
 type Id = string | number | null;
 interface Req { jsonrpc: '2.0'; id?: Id; method: string; params?: unknown }
@@ -19,10 +20,34 @@ const TOOLS = [
 
 const send = (r: Res) => process.stdout.write(JSON.stringify(r) + '\n');
 const log = (...a: unknown[]) => process.stderr.write('[fs-edit-mcp] ' + a.map(String).join(' ') + '\n');
-const ok = (text: string, isError = false) => ({ content: [{ type: 'text', text }], isError });
+const ok = (text: string, isError = false, structuredContent?: Record<string, unknown>) =>
+  structuredContent === undefined
+    ? { content: [{ type: 'text', text }], isError }
+    : { content: [{ type: 'text', text }], isError, structuredContent };
 const rec = (v: unknown): Record<string, unknown> => (v && typeof v === 'object' && !Array.isArray(v)) ? v as Record<string, unknown> : {};
 const errCode = (e: unknown) => (e as NodeJS.ErrnoException)?.code;
 const errMsg = (e: unknown) => e instanceof Error ? e.message : String(e);
+
+function mutationEvidence(metadata: Record<string, unknown>): Record<string, unknown> {
+  const id = randomUUID();
+  return {
+    id,
+    evidenceId: id,
+    tool: 'fs-edit__file_edit',
+    server: 'fs-edit',
+    toolName: 'file_edit',
+    operation: 'file_edit',
+    status: 'verified',
+    ...metadata,
+  };
+}
+
+function verifiedEdit(metadata: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...metadata,
+    'my-agent/evidence': mutationEvidence(metadata),
+  };
+}
 
 function isBinary(path: string): boolean {
   let fd: number | null = null;
@@ -55,7 +80,6 @@ export function handleFileEdit(args: Record<string, unknown>) {
   if (typeof oldStr !== 'string') return ok('file_edit: "old_string" must be a string', true);
   if (typeof newStr !== 'string') return ok('file_edit: "new_string" must be a string', true);
   if (oldStr === '') return ok('file_edit: "old_string" 不能为空', true);
-  if (oldStr === newStr) return ok('无变化: old_string 与 new_string 相同');
   if (DEVICES.has(path)) return ok(`拒绝编辑设备文件: ${path}`, true);
   try {
     const st = statSync(path);
@@ -63,6 +87,17 @@ export function handleFileEdit(args: Record<string, unknown>) {
     if (st.size > MAX_EDIT_BYTES) return ok(`文件过大（${Math.round(st.size / 1024)}KB），file_edit 上限 512KB`, true);
     if (isBinary(path)) return ok(`二进制文件，无法编辑: ${path}`, true);
     const before = readFileSync(path, 'utf-8');
+    const beforeHash = hashContent(before);
+    if (oldStr === newStr) {
+      return ok('无变化: old_string 与 new_string 相同', false, verifiedEdit({
+        changed: false,
+        replacementCount: 0,
+        byteDelta: 0,
+        beforeHash,
+        afterHash: beforeHash,
+        diff: '',
+      }));
+    }
     const count = countOccurrences(before, oldStr);
     if (count === 0) {
       const preview = before.slice(0, 200).replace(/\n/g, '\\n');
@@ -74,11 +109,19 @@ export function handleFileEdit(args: Record<string, unknown>) {
     const replaced = replaceAll ? count : 1;
     const delta = Buffer.byteLength(after, 'utf-8') - Buffer.byteLength(before, 'utf-8');
     const sign = delta > 0 ? '+' : '';
-    // 生成 diff 信息供前端展示
-    const diffLinesBefore = before.split('\n');
-    const diffLinesAfter = after.split('\n');
-    const diffSummary = generateUnifiedDiffSummary(diffLinesBefore, diffLinesAfter);
-    return ok(`已编辑 ${path}：替换 ${replaced} 处，大小变化 ${sign}${delta} bytes\n\n--- Diff ---\n${diffSummary}`);
+    const diff = generateUnifiedDiff(before, after);
+    return ok(
+      `已编辑 ${path}：替换 ${replaced} 处，大小变化 ${sign}${delta} bytes\n\n--- Diff ---\n${diff}`,
+      false,
+      verifiedEdit({
+        changed: true,
+        replacementCount: replaced,
+        byteDelta: delta,
+        beforeHash,
+        afterHash: hashContent(after),
+        diff,
+      }),
+    );
   } catch (e) { return fsErr('file_edit', path, e); }
 }
 
@@ -131,7 +174,7 @@ if (process.argv[1] && (process.argv[1].endsWith('fs-edit-mcp.ts') || process.ar
 /**
  * 生成简化的 unified diff 摘要（不依赖 jsdiff，避免循环依赖）
  */
-function generateUnifiedDiffSummary(oldLines: string[], newLines: string[]): string {
+function generateLegacyDiffSummary(oldLines: string[], newLines: string[]): string {
   const maxLen = Math.max(oldLines.length, newLines.length, 50);
   const limit = Math.min(maxLen, 60); // 最多显示 60 行
   
@@ -186,4 +229,112 @@ function generateUnifiedDiffSummary(oldLines: string[], newLines: string[]): str
   }
   
   return diff || '(no visible changes)';
+}
+
+function hashContent(content: string): string {
+  return createHash('sha256').update(content, 'utf8').digest('hex');
+}
+
+type DiffOperation = {
+  kind: 'context' | 'remove' | 'add';
+  line: string;
+  oldLine: number;
+  newLine: number;
+};
+
+function generateUnifiedDiff(before: string, after: string): string {
+  const operations = buildDiffOperations(before.split('\n'), after.split('\n'));
+  const changed = operations.flatMap((operation, index) => operation.kind === 'context' ? [] : [index]);
+  if (changed.length === 0) return '';
+
+  const hunks: string[] = [];
+  let cursor = 0;
+  while (cursor < changed.length) {
+    const firstChange = changed[cursor];
+    let end = Math.min(operations.length, firstChange + 4);
+    while (cursor + 1 < changed.length && changed[cursor + 1] < end) {
+      cursor++;
+      end = Math.min(operations.length, changed[cursor] + 4);
+    }
+
+    const start = Math.max(0, firstChange - 3);
+    const hunk = operations.slice(start, end);
+    const oldCount = hunk.filter((operation) => operation.kind !== 'add').length;
+    const newCount = hunk.filter((operation) => operation.kind !== 'remove').length;
+    const first = hunk[0];
+    const body = hunk.map((operation) => {
+      const prefix = operation.kind === 'context' ? ' ' : operation.kind === 'remove' ? '-' : '+';
+      return `${prefix}${operation.line}`;
+    });
+    hunks.push(`@@ -${formatRange(first.oldLine, oldCount)} +${formatRange(first.newLine, newCount)} @@\n${body.join('\n')}`);
+    cursor++;
+  }
+
+  return hunks.join('\n');
+}
+
+function buildDiffOperations(oldLines: string[], newLines: string[]): DiffOperation[] {
+  const cells = oldLines.length * newLines.length;
+  if (cells > 2_000_000) return buildSingleHunkFallback(oldLines, newLines);
+
+  const width = newLines.length + 1;
+  const lcs = new Uint32Array((oldLines.length + 1) * width);
+  for (let oldIndex = oldLines.length - 1; oldIndex >= 0; oldIndex--) {
+    for (let newIndex = newLines.length - 1; newIndex >= 0; newIndex--) {
+      const current = oldIndex * width + newIndex;
+      lcs[current] = oldLines[oldIndex] === newLines[newIndex]
+        ? lcs[(oldIndex + 1) * width + newIndex + 1] + 1
+        : Math.max(lcs[(oldIndex + 1) * width + newIndex], lcs[oldIndex * width + newIndex + 1]);
+    }
+  }
+
+  const operations: DiffOperation[] = [];
+  let oldIndex = 0;
+  let newIndex = 0;
+  let oldLine = 1;
+  let newLine = 1;
+  while (oldIndex < oldLines.length || newIndex < newLines.length) {
+    if (oldIndex < oldLines.length && newIndex < newLines.length && oldLines[oldIndex] === newLines[newIndex]) {
+      operations.push({ kind: 'context', line: oldLines[oldIndex++], oldLine: oldLine++, newLine: newLine++ });
+      newIndex++;
+    } else if (newIndex < newLines.length && (oldIndex === oldLines.length || lcs[oldIndex * width + newIndex + 1] > lcs[(oldIndex + 1) * width + newIndex])) {
+      operations.push({ kind: 'add', line: newLines[newIndex++], oldLine, newLine: newLine++ });
+    } else {
+      operations.push({ kind: 'remove', line: oldLines[oldIndex++], oldLine: oldLine++, newLine });
+    }
+  }
+  return operations;
+}
+
+function buildSingleHunkFallback(oldLines: string[], newLines: string[]): DiffOperation[] {
+  let prefix = 0;
+  while (prefix < oldLines.length && prefix < newLines.length && oldLines[prefix] === newLines[prefix]) prefix++;
+  let suffix = 0;
+  while (
+    suffix < oldLines.length - prefix
+    && suffix < newLines.length - prefix
+    && oldLines[oldLines.length - suffix - 1] === newLines[newLines.length - suffix - 1]
+  ) suffix++;
+
+  const operations: DiffOperation[] = [];
+  for (let index = 0; index < prefix; index++) {
+    operations.push({ kind: 'context', line: oldLines[index], oldLine: index + 1, newLine: index + 1 });
+  }
+  for (let index = prefix; index < oldLines.length - suffix; index++) {
+    operations.push({ kind: 'remove', line: oldLines[index], oldLine: index + 1, newLine: prefix + 1 });
+  }
+  for (let index = prefix; index < newLines.length - suffix; index++) {
+    operations.push({ kind: 'add', line: newLines[index], oldLine: prefix + 1, newLine: index + 1 });
+  }
+  for (let index = 0; index < suffix; index++) {
+    const oldIndex = oldLines.length - suffix + index;
+    const newIndex = newLines.length - suffix + index;
+    operations.push({ kind: 'context', line: oldLines[oldIndex], oldLine: oldIndex + 1, newLine: newIndex + 1 });
+  }
+  return operations;
+}
+
+function formatRange(start: number, count: number): string {
+  if (count === 0) return `${Math.max(0, start - 1)},0`;
+  return count === 1 ? String(start) : `${start},${count}`;
 }

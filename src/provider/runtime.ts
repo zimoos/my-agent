@@ -7,7 +7,8 @@ import type {
   ChatCompletionChunk,
 } from 'openai/resources/chat/completions';
 import pRetry, { AbortError as PRetryAbortError } from 'p-retry';
-import type { ModelConfig } from '../mcp/types.js';
+import type { ModelConfig, ProviderSessionState } from '../mcp/types.js';
+import { createAgoraProviderRuntime, type AgoraProviderContext, type AgoraMemoryController } from './agora.js';
 
 export const DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS = 180_000;
 export const DEFAULT_PROVIDER_MAX_RETRIES = 5;
@@ -37,9 +38,22 @@ export type ProviderAttemptEvent =
       stream: boolean;
     };
 
+export interface ProviderProgressEvent {
+  type: 'progress';
+  provider: string;
+  phase?: string;
+  message: string;
+  progress?: number;
+  total?: number;
+  operation?: string;
+  details?: Record<string, unknown>;
+}
+
+export type ProviderRuntimeEvent = ProviderAttemptEvent | ProviderProgressEvent;
+
 export interface ProviderRunOptions {
   signal?: AbortSignal;
-  onEvent?: (event: ProviderAttemptEvent) => void;
+  onEvent?: (event: ProviderRuntimeEvent) => void;
 }
 
 export class ProviderStreamIdleTimeoutError extends Error {
@@ -105,6 +119,7 @@ export function createProviderClient(model: ModelConfig, policy = resolveProvide
 export interface ProviderRuntime {
   readonly client: OpenAI;
   readonly policy: ProviderPolicy;
+  ready?(): Promise<void>;
   createChatCompletion(
     request: ChatCompletionCreateParamsNonStreaming,
     options?: ProviderRunOptions
@@ -113,6 +128,9 @@ export interface ProviderRuntime {
     request: ChatCompletionCreateParamsStreaming,
     options?: ProviderRunOptions
   ): Promise<AsyncIterable<ChatCompletionChunk>>;
+  getProviderState?(): ProviderSessionState | null;
+  getMemoryController?(): AgoraMemoryController | null;
+  close?(): Promise<void>;
 }
 
 function isAbortLike(err: unknown): boolean {
@@ -268,9 +286,13 @@ function pRetryAbort(err: unknown): never {
 
 export function createProviderRuntime(
   model: ModelConfig,
-  overrideClient?: OpenAI
+  overrideClient?: OpenAI,
+  context?: AgoraProviderContext
 ): ProviderRuntime {
   const policy = resolveProviderPolicy(model);
+  if (model.provider?.toLowerCase() === 'agora') {
+    return createAgoraProviderRuntime(model, policy, context) as unknown as ProviderRuntime;
+  }
   const client = overrideClient ?? createProviderClient(model, policy);
   const maxAttempts = policy.maxRetries + 1;
 

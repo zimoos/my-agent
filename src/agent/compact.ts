@@ -6,6 +6,12 @@ export function compactToolResult(
   result: string,
   maxChars: number = TOOL_RESULT_MAX_CHARS
 ): string {
+  // Base64 images are atomic payloads. Text truncation corrupts the URL while
+  // leaving a misleading data:image prefix that downstream code may trust.
+  if (/^data:image\/[^;,]+;base64,/i.test(result)) {
+    return result;
+  }
+
   let out = result;
 
   try {

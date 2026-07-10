@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/zimoos/my-agent/discussions
+    about: Use GitHub Discussions for usage questions, model reports, and product ideas.
+  - name: Security vulnerability
+    url: https://github.com/zimoos/my-agent/security/advisories/new
+    about: Report security vulnerabilities privately.

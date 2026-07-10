@@ -1,4 +1,6 @@
 import type { ChatCompletionMessageToolCall } from 'openai/resources/chat/completions';
+import { createHash } from 'node:crypto';
+import { resolve } from 'node:path';
 import type { AgentConfig, McpConnection } from '../mcp/types.js';
 import type { Task, TaskStack } from '../task-stack.js';
 import type { AgentEvent } from './events.js';
@@ -9,11 +11,11 @@ import { routeToolCall, findToolSchema } from './tool-router.js';
 import { createTodoList } from './todo.js';
 import { parseToolResultDiff } from './diff-artifact.js';
 import type { ContextManager } from './context-manager.js';
-
-const DANGER_EXEC_TOOLS = new Set<string>([
-  'exec-mcp__execute_command',
-  'exec__execute_command',
-]);
+import {
+  createZimoosRuntimeSlotUpdate,
+  sanitizeZimoosToolResultForHistory,
+  type RuntimeContextSlotUpdate,
+} from './runtime-context-slots.js';
 
 const ASK_USER_PREFIX = '[ask_user] ';
 const PLAN_OPEN = '[plan]\n';
@@ -25,6 +27,17 @@ function extractCommand(args: Record<string, any>): string {
   if (typeof args.command === 'string') return args.command;
   if (typeof args.cmd === 'string') return args.cmd;
   return '';
+}
+
+function isExecuteCommandCapability(toolName: string): boolean {
+  return toolName === 'execute_command';
+}
+
+function normalizeCwd(args: Record<string, unknown>): string {
+  const cwd = args.cwd;
+  return typeof cwd === 'string' && cwd.length > 0
+    ? resolve(cwd)
+    : resolve(process.cwd());
 }
 
 function isTtyInteractive(): boolean {
@@ -43,7 +56,7 @@ export interface BuiltinTool {
   handler: (
     args: Record<string, any>,
     ctx: BuiltinToolContext
-  ) => { content: string; isError: boolean };
+  ) => { content: string; isError: boolean } | Promise<{ content: string; isError: boolean }>;
 }
 
 export interface ToolExecutionContext {
@@ -57,6 +70,75 @@ export interface ToolExecutionContext {
 export interface ConfirmProvider {
   nextId: () => string;
   awaitApproval: (id: string, signal?: AbortSignal) => Promise<boolean>;
+}
+
+export interface ToolExecutionResult {
+  result: string;
+  isError: boolean;
+  runtimeSlotUpdate?: RuntimeContextSlotUpdate;
+  structuredContent?: Record<string, unknown>;
+  _meta?: Record<string, unknown>;
+  requiresEvidence?: boolean;
+  hasVerifiedEvidence?: boolean;
+  actionEvidence?: {
+    key: string;
+    operation: string;
+    status: 'verified' | 'missing' | 'failed';
+  };
+}
+
+function requiresStructuredEvidence(
+  toolName: string
+): boolean {
+  if (isExecuteCommandCapability(toolName)) return true;
+  const lower = toolName.toLowerCase();
+  return /_(write|edit|delete|create|remove|move|rename)_/.test(`_${lower}_`);
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value) ?? String(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJson).join(',')}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
+    .join(',')}}`;
+}
+
+function actionEvidenceKey(
+  operation: string,
+  args: Record<string, unknown>
+): string {
+  if (isExecuteCommandCapability(operation)) {
+    return createHash('sha256')
+      .update(operation)
+      .update('\0')
+      .update(extractCommand(args))
+      .update('\0')
+      .update(normalizeCwd(args))
+      .digest('hex');
+  }
+  return createHash('sha256')
+    .update(operation)
+    .update('\0')
+    .update(stableJson(args))
+    .digest('hex');
+}
+
+function hasVerifiedStructuredEvidence(
+  structuredContent: Record<string, unknown> | undefined,
+  expectedOperation: string
+): boolean {
+  const evidence = structuredContent?.['my-agent/evidence'];
+  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) return false;
+  const value = evidence as Record<string, unknown>;
+  return value.status === 'verified' &&
+    typeof value.operation === 'string' &&
+    value.operation.trim() === expectedOperation;
 }
 
 export class ToolExecutor {
@@ -87,7 +169,7 @@ export class ToolExecutor {
     tc: ChatCompletionMessageToolCall,
     ctx: ToolExecutionContext,
     signal?: AbortSignal
-  ): AsyncGenerator<AgentEvent, { result: string; isError: boolean }, unknown> {
+  ): AsyncGenerator<AgentEvent, ToolExecutionResult, unknown> {
     const fullName = tc.function.name;
     const args = normalizeArguments(tc.function.arguments);
 
@@ -108,6 +190,10 @@ export class ToolExecutor {
     let toolResult = '';
     let isError = false;
     let skipExecute = false;
+    let executedToolName = fullName;
+    let structuredContent: Record<string, unknown> | undefined;
+    let meta: Record<string, unknown> | undefined;
+    let externalTool = false;
 
     const webPolicyBlock = this.reserveWebCall(fullName, args);
     if (webPolicyBlock) {
@@ -116,7 +202,8 @@ export class ToolExecutor {
       skipExecute = true;
     }
 
-    if (!skipExecute && DANGER_EXEC_TOOLS.has(fullName)) {
+    const routedToolName = routeToolCall(this.connections, fullName)?.toolName;
+    if (!skipExecute && routedToolName && isExecuteCommandCapability(routedToolName)) {
       let cmd = extractCommand(args);
       const mode = this.config.danger?.mode ?? 'confirm';
 
@@ -163,7 +250,7 @@ export class ToolExecutor {
     if (!skipExecute) {
       const builtin = this.builtinTools.get(fullName);
       if (builtin) {
-        const r = builtin.handler(args, ctx);
+        const r = await builtin.handler(args, ctx);
         toolResult = r.content;
         isError = r.isError;
         if (!isError && fullName === 'ask_user') {
@@ -182,6 +269,8 @@ export class ToolExecutor {
           toolResult = `Error: unknown tool '${fullName}'`;
           isError = true;
         } else {
+          executedToolName = route.toolName;
+          externalTool = true;
           try {
             const r = await route.conn.call(
               route.toolName,
@@ -190,6 +279,8 @@ export class ToolExecutor {
             );
             toolResult = r.content;
             isError = r.isError;
+            structuredContent = r.structuredContent;
+            meta = r._meta;
           } catch (err) {
             toolResult = `Error: ${(err as Error).message}`;
             isError = true;
@@ -198,12 +289,74 @@ export class ToolExecutor {
       }
     }
 
-    const short = formatToolResultForUi(toolResult);
-    const artifact = !isError ? parseToolResultDiff(short) : undefined;
-    yield { type: 'tool:result', ok: !isError, content: short, artifact };
-    const compacted = compactToolResult(toolResult);
+    const runtimeSlotUpdate = createZimoosRuntimeSlotUpdate({
+      rawResult: toolResult,
+      isError,
+      sourceTool: executedToolName,
+      toolCallId: tc.id,
+      actionArgs: args,
+    });
+    const zimoosHistoryAudit = !isError
+      ? sanitizeZimoosToolResultForHistory({
+          rawResult: toolResult,
+          sourceTool: executedToolName,
+          actionArgs: args,
+        })
+      : null;
+    const historyResult = runtimeSlotUpdate
+      ? runtimeSlotUpdate.auditText
+      : zimoosHistoryAudit
+        ? zimoosHistoryAudit
+      : compactToolResult(toolResult);
+    const uiResult = runtimeSlotUpdate
+      ? runtimeSlotUpdate.auditText
+      : zimoosHistoryAudit
+        ? zimoosHistoryAudit
+      : toolResult;
 
-    return { result: compacted, isError };
+    const short = formatToolResultForUi(uiResult);
+    const artifact = !isError ? parseToolResultDiff(short) : undefined;
+    const resultEvent: AgentEvent = {
+      type: 'tool:result',
+      ok: !isError,
+      content: short,
+      artifact,
+    };
+    if (structuredContent !== undefined) {
+      resultEvent.structuredContent = structuredContent;
+    }
+    if (meta !== undefined) {
+      resultEvent._meta = meta;
+    }
+    yield resultEvent;
+
+    const requiresEvidence = externalTool &&
+      requiresStructuredEvidence(executedToolName);
+    const executionResult: ToolExecutionResult = {
+      result: historyResult,
+      isError,
+      runtimeSlotUpdate: runtimeSlotUpdate ?? undefined,
+    };
+    if (structuredContent !== undefined) {
+      executionResult.structuredContent = structuredContent;
+    }
+    if (meta !== undefined) executionResult._meta = meta;
+    if (requiresEvidence) {
+      const hasVerifiedEvidence = !isError &&
+        hasVerifiedStructuredEvidence(structuredContent, executedToolName);
+      executionResult.requiresEvidence = true;
+      executionResult.hasVerifiedEvidence = hasVerifiedEvidence;
+      executionResult.actionEvidence = {
+        key: actionEvidenceKey(executedToolName, args),
+        operation: executedToolName,
+        status: hasVerifiedEvidence
+          ? 'verified'
+          : isError
+            ? 'failed'
+            : 'missing',
+      };
+    }
+    return executionResult;
   }
 
   private reserveWebCall(fullName: string, args: Record<string, any>): string | null {

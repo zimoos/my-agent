@@ -104,3 +104,62 @@ test('model profiles: lists remote models across credentials and persists select
     assert.equal(saved.model.apiKey, undefined);
   });
 });
+
+test('model profiles: saving Agora default preserves memory binding metadata', async () => {
+  const home = mktmp('ma-model-profile-home-');
+  fs.mkdirSync(path.join(home, '.my-agent'), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, '.my-agent', 'config.json'),
+    JSON.stringify({
+      credentials: {
+        agora: {
+          provider: 'agora',
+          baseURL: 'http://127.0.0.1:8000/v1',
+          apiKeyMode: 'none',
+          modelsCache: { models: ['qwen3.6-35b-a3b-q4'] },
+        },
+      },
+      profiles: {
+        'agora/qwen3.6-35b-a3b-q4': {
+          credentialId: 'agora',
+          model: 'qwen3.6-35b-a3b-q4',
+          label: 'Agora-qwen3.6-35b-a3b-q4',
+          agoraMemory: {
+            userId: 'agent-user',
+            projectId: 'my-agent',
+            conversationId: 'conv-001',
+            memoryProfile: 'profile-agora-demo',
+          },
+        },
+      },
+    })
+  );
+
+  await withEnv({ HOME: home }, async () => {
+    globalThis.fetch = (async () => new Response('{}', { status: 404 })) as any;
+
+    const selected = (await listModelChoices(config())).find(
+      (choice) => choice.id === 'agora/qwen3.6-35b-a3b-q4'
+    );
+    assert.ok(selected);
+    saveDefaultModelChoice(selected);
+
+    const saved = JSON.parse(fs.readFileSync(path.join(home, '.my-agent', 'config.json'), 'utf-8'));
+    assert.equal(saved.defaultProfile, 'agora/qwen3.6-35b-a3b-q4');
+    assert.equal(saved.model.provider, 'agora');
+    assert.equal(saved.model.baseURL, 'mcp-stdio://agora');
+    assert.equal(saved.model.apiKey, 'agora-mcp');
+    assert.deepEqual(saved.profiles['agora/qwen3.6-35b-a3b-q4'].agoraMemory, {
+      userId: 'agent-user',
+      projectId: 'my-agent',
+      conversationId: 'conv-001',
+      memoryProfile: 'profile-agora-demo',
+    });
+    assert.deepEqual(saved.model.agoraMemory, {
+      userId: 'agent-user',
+      projectId: 'my-agent',
+      conversationId: 'conv-001',
+      memoryProfile: 'profile-agora-demo',
+    });
+  });
+});

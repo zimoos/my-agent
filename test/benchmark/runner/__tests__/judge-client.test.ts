@@ -7,6 +7,7 @@ import {
   parseScore,
   applyPostCheckCap,
   selectJudgeModel,
+  MAX_WORKSPACE_DIFF_CHARS,
   type JudgeConfig,
   type JudgeInput,
   type JudgeScore,
@@ -172,6 +173,49 @@ test('buildJudgePrompt: 无 referenceSolution 时不渲染参考解区块', () =
   const input = makeInput({ referenceSolution: undefined });
   const p = buildJudgePrompt(input);
   assert.doesNotMatch(p, /参考解法之一/);
+});
+
+test('buildJudgePrompt: 多 MB workspace diff 有界并按文件保留首尾与截断说明', () => {
+  const makeLargeFileDiff = (path: string, first: string, last: string): string => [
+    `diff --git a/${path} b/${path}`,
+    `--- a/${path}`,
+    `+++ b/${path}`,
+    `+${first}`,
+    `+${'x'.repeat(900_000)}`,
+    `+${last}`,
+  ].join('\n');
+  const workspaceDiff = [
+    makeLargeFileDiff('src/alpha.ts', 'ALPHA_FIRST', 'ALPHA_LAST'),
+    makeLargeFileDiff('src/beta.ts', 'BETA_FIRST', 'BETA_LAST'),
+    makeLargeFileDiff('docs/decision.md', 'DOC_FIRST', 'DOC_LAST'),
+  ].join('\n');
+
+  const p = buildJudgePrompt(makeInput({
+    taskDescription: 'BOUNDARY_TASK_DESCRIPTION',
+    prompt: 'BOUNDARY_USER_PROMPT',
+    workspaceDiff,
+    finalAnswer: 'BOUNDARY_FINAL_ANSWER',
+  }));
+  const diffStart = p.indexOf('```diff\n') + '```diff\n'.length;
+  const diffEnd = p.indexOf('\n```\n\n## 被测提交：最终回复', diffStart);
+  const renderedDiff = p.slice(diffStart, diffEnd);
+
+  assert.ok(renderedDiff.length <= MAX_WORKSPACE_DIFF_CHARS);
+  assert.ok(p.length <= MAX_WORKSPACE_DIFF_CHARS + 10_000);
+  assert.match(p, /BOUNDARY_TASK_DESCRIPTION/);
+  assert.match(p, /BOUNDARY_USER_PROMPT/);
+  assert.match(p, /BOUNDARY_FINAL_ANSWER/);
+  assert.match(renderedDiff, /WORKSPACE DIFF TRUNCATED/);
+  assert.match(renderedDiff, /WORKSPACE DIFF OMITTED: \d+ chars from middle/);
+  assert.match(renderedDiff, /diff --git a\/src\/alpha\.ts b\/src\/alpha\.ts/);
+  assert.match(renderedDiff, /ALPHA_FIRST/);
+  assert.match(renderedDiff, /ALPHA_LAST/);
+  assert.match(renderedDiff, /diff --git a\/src\/beta\.ts b\/src\/beta\.ts/);
+  assert.match(renderedDiff, /BETA_FIRST/);
+  assert.match(renderedDiff, /BETA_LAST/);
+  assert.match(renderedDiff, /diff --git a\/docs\/decision\.md b\/docs\/decision\.md/);
+  assert.match(renderedDiff, /DOC_FIRST/);
+  assert.match(renderedDiff, /DOC_LAST/);
 });
 
 // ─── judge() 集成：mock OpenAI ───

@@ -18,6 +18,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
 import { loadTasks } from './task-loader.js';
 import { runTask } from './task-runner.js';
 import { scoreLevel, scoreBenchmark } from './scorer.js';
@@ -410,7 +411,7 @@ function taskSelectionFingerprint(
 
 // 把 L3 的 JudgeScore 包成现有 TaskResult 形状,以便复用 scoreLevel / reporter。
 // 每 run 的 rawScore 用 6 维加权 total;hardPass 用 L3 pass 四重门槛。
-function l3ResultToTaskResult(r: L3TaskResult): TaskResult {
+export function l3ResultToTaskResult(r: L3TaskResult): TaskResult {
   const emptyTrace: RunTrace = {
     taskId: r.taskId,
     runIndex: 0,
@@ -442,12 +443,17 @@ function l3ResultToTaskResult(r: L3TaskResult): TaskResult {
 
   const runScores: TaskScore[] = r.runs.map((score, i) => {
     const total = weightedTotal(score);
-    const hardPass = isL3Pass(score, total);
+    const detail = r.details.find((candidate) => candidate.runIndex === i);
+    const hardPass =
+      r.passed &&
+      detail !== undefined &&
+      detail.hardGateFailures.length === 0 &&
+      isL3Pass(score, total);
     return {
       taskId: r.taskId,
       hardPass,
       softScore: 1,
-      rawScore: total,
+      rawScore: hardPass ? total : 0,
       hardResults: [],
       softResults: [],
       trace: { ...emptyTrace, runIndex: i },
@@ -458,13 +464,14 @@ function l3ResultToTaskResult(r: L3TaskResult): TaskResult {
     runScores.length > 0
       ? runScores.filter((s) => s.hardPass).length / runScores.length
       : 0;
+  const hasFailedRun = runScores.some((s) => !s.hardPass);
 
   return {
     taskId: r.taskId,
     level: 'L3',
     runs: runScores,
-    median: r.total,
-    stability: r.passed ? 1 : 0,
+    median: hasFailedRun ? 0 : r.total,
+    stability: hasFailedRun ? 0 : 1,
     passRate,
   };
 }
@@ -580,7 +587,13 @@ function withRuns<T extends { runtime: { runs: number } }>(task: T, runs: number
   };
 }
 
-main().catch((err) => {
-  console.error('Benchmark runtime error:', err);
-  process.exit(EXIT_RUNTIME_ERROR);
-});
+const isDirectExecution =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isDirectExecution) {
+  main().catch((err) => {
+    console.error('Benchmark runtime error:', err);
+    process.exit(EXIT_RUNTIME_ERROR);
+  });
+}

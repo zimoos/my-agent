@@ -46,6 +46,7 @@ function isRealUserMessage(text: string): boolean {
   if (!trimmed) return false;
   if (trimmed.startsWith('（子任务）')) return false;
   if (trimmed.startsWith('Please provide your answer based on the tool results above.')) return false;
+  if (trimmed.startsWith('[MA internal continuation request]')) return false;
   return true;
 }
 

@@ -26,6 +26,7 @@ export function resolveProviderCodec(model: ModelConfig): ProviderCodec {
   const provider = model.provider?.toLowerCase();
   if (provider === 'deepseek') return createDeepSeekCodec(model);
   if (provider === 'lmstudio') return lmStudioCodec;
+  if (provider === 'agora') return openaiCodec;
   if (provider === 'openai') return openaiCodec;
   if (isDeepSeekBaseURL(model.baseURL)) return createDeepSeekCodec(model);
   if (isLmStudioBaseURL(model.baseURL)) return lmStudioCodec;

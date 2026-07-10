@@ -24,7 +24,14 @@ export type AgentEvent =
   | { type: 'task:failed'; taskId: string; error: string }
   | { type: 'task:aborted'; taskId: string }
   | { type: 'tool:call'; name: string; args: Record<string, any> }
-  | { type: 'tool:result'; ok: boolean; content: string; artifact?: DiffArtifact }
+  | {
+      type: 'tool:result';
+      ok: boolean;
+      content: string;
+      artifact?: DiffArtifact;
+      structuredContent?: Record<string, unknown>;
+      _meta?: Record<string, unknown>;
+    }
   | { type: 'workspace:diff'; artifact: WorkspaceDiffArtifact }
   | { type: 'token'; text: string }
   | { type: 'text'; content: string }
@@ -36,6 +43,7 @@ export type AgentEvent =
   | { type: 'compact:done'; freed: number }
   | { type: 'provider:attempt'; attempt: number; maxAttempts: number; timeoutMs: number; stream: boolean }
   | { type: 'provider:retry'; attempt: number; nextAttempt: number; retriesLeft: number; maxRetries: number; delayMs: number; error: string; stream: boolean }
+  | { type: 'provider:progress'; provider: string; phase?: string; message: string; progress?: number; total?: number }
   | { type: 'ask_user'; question: string }
   | { type: 'plan'; content: string }
   | { type: 'aborted' }

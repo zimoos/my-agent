@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import type { ProviderSessionState } from '../mcp/types.js';
 
 export interface SessionMeta {
   id: string;
@@ -8,12 +9,14 @@ export interface SessionMeta {
   cwd: string;
   model: string;
   messageCount: number;
+  providerState?: ProviderSessionState;
 }
 
 export interface SessionStore {
   create(meta: Omit<SessionMeta, 'id' | 'messageCount'>): string;
   append(sessionId: string, msg: any): void;
   truncate(sessionId: string, keepMessages: number): void;
+  updateProviderState(sessionId: string, providerState: ProviderSessionState): void;
   load(sessionId: string): any[];
   list(limit?: number): SessionMeta[];
   latest(): string | null;
@@ -102,6 +105,13 @@ export function createSessionStore(sessionDir?: string): SessionStore {
     }
   }
 
+  function updateProviderState(sessionId: string, providerState: ProviderSessionState): void {
+    const meta = readMeta(metaPath(sessionId));
+    if (!meta) return;
+    meta.providerState = providerState;
+    writeMeta(metaPath(sessionId), meta);
+  }
+
   function load(sessionId: string): any[] {
     const p = jsonlPath(sessionId);
     if (!fs.existsSync(p)) return [];
@@ -160,5 +170,5 @@ export function createSessionStore(sessionDir?: string): SessionStore {
     return dir;
   }
 
-  return { create, append, truncate, load, list, latest, prune, getSessionDir };
+  return { create, append, truncate, updateProviderState, load, list, latest, prune, getSessionDir };
 }

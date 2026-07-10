@@ -10,7 +10,7 @@ import {
 } from 'node:readline';
 import { stdin as input, stdout as output } from 'node:process';
 import { fileURLToPath } from 'node:url';
-import { globalConfigDir, globalConfigPath } from './config.js';
+import { AGORA_MCP_API_KEY, AGORA_MCP_BASE_URL, globalConfigDir, globalConfigPath } from './config.js';
 import { createDefaultSkills } from './skills/loadSkills.js';
 import { makeSecretRef, maskSecret, storeSecret } from './secrets/keychain.js';
 
@@ -83,17 +83,28 @@ function serverCommand(projectRoot: string, name: string): { command: string; ar
 
 function normalizeBaseURL(provider: string, baseURL: string): string {
   const trimmed = baseURL.trim().replace(/\/$/, '');
+  if (provider === 'agora') return AGORA_MCP_BASE_URL;
   if (provider === 'lmstudio' && !trimmed.endsWith('/v1')) return `${trimmed}/v1`;
   return trimmed;
 }
 
-function providerFromBaseURL(baseURL: string): 'deepseek' | 'lmstudio' | 'openai' {
-  if (baseURL.includes('api.deepseek.com')) return 'deepseek';
-  if (baseURL.includes('localhost') || baseURL.includes('127.0.0.1')) return 'lmstudio';
+function providerFromBaseURL(baseURL: string): 'agora' | 'deepseek' | 'lmstudio' | 'openai' {
+  if (baseURL.trim().startsWith('mcp-stdio://agora')) return 'agora';
+  try {
+    const url = new URL(baseURL);
+    if (url.hostname === 'api.deepseek.com' || url.hostname.endsWith('.deepseek.com')) return 'deepseek';
+    if ((url.hostname === 'localhost' || url.hostname === '127.0.0.1') && url.port === '8000') return 'agora';
+    if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') return 'lmstudio';
+  } catch {
+    if (baseURL.includes('api.deepseek.com')) return 'deepseek';
+    if (baseURL.includes(':8000')) return 'agora';
+    if (baseURL.includes('localhost') || baseURL.includes('127.0.0.1')) return 'lmstudio';
+  }
   return 'openai';
 }
 
 function defaultCredentialName(provider: string): string {
+  if (provider === 'agora') return 'agora';
   if (provider === 'deepseek') return 'DeepSeek';
   if (provider === 'lmstudio') return 'LMStudio-local';
   return 'OpenAI';
@@ -253,7 +264,7 @@ async function collectProfileConfig(rawArgs: string[]): Promise<{
     const rawBaseURL = rawArgs[0];
     const provider = providerFromBaseURL(rawBaseURL);
     const baseURL = normalizeBaseURL(provider, rawBaseURL);
-    const apiKey = rawArgs[2] || (provider === 'lmstudio' ? 'lm-studio' : '');
+    const apiKey = rawArgs[2] || (provider === 'agora' ? AGORA_MCP_API_KEY : provider === 'lmstudio' ? 'lm-studio' : '');
     const credentialId = defaultCredentialName(provider);
     return {
       provider,
@@ -269,16 +280,19 @@ async function collectProfileConfig(rawArgs: string[]): Promise<{
   const rl = readline.createInterface({ input, output });
   try {
     console.log(`${C.bold}my-agent init${C.reset}\n`);
-    const provider = await selectOption<'lmstudio' | 'deepseek'>(
+    const provider = await selectOption<'lmstudio' | 'deepseek' | 'agora'>(
       'Model source',
       [
         { label: 'LM Studio local', value: 'lmstudio' },
+        { label: 'Agora local', value: 'agora' },
         { label: 'DeepSeek official', value: 'deepseek' },
       ]
     );
-    const providerLabel = provider === 'deepseek' ? 'DeepSeek' : 'LMStudio';
+    const providerLabel = provider === 'deepseek' ? 'DeepSeek' : provider === 'agora' ? 'Agora' : 'LMStudio';
     const defaultBaseURL = provider === 'deepseek'
       ? 'https://api.deepseek.com'
+      : provider === 'agora'
+        ? AGORA_MCP_BASE_URL
       : 'http://localhost:1234/v1';
     const baseURL = normalizeBaseURL(
       provider,
@@ -286,11 +300,17 @@ async function collectProfileConfig(rawArgs: string[]): Promise<{
     );
     const defaultCredential = defaultCredentialName(provider);
     const credentialId = await rl.question(`${C.cyan}Credential name ${C.dim}(${defaultCredential})${C.reset}: `) || defaultCredential;
-    const apiKey = provider === 'lmstudio'
-      ? 'lm-studio'
+    const apiKey = provider === 'agora'
+      ? AGORA_MCP_API_KEY
+      : provider === 'lmstudio'
+        ? 'lm-studio'
       : await questionHidden(rl, `${C.cyan}API key ${C.dim}(stored in Keychain)${C.reset}: `);
-    const models = await fetchModelIds(baseURL, apiKey);
-    const fallback = provider === 'deepseek' ? 'deepseek-v4-pro' : 'qwen3-30b-a3b';
+    const models = provider === 'agora' ? [] : await fetchModelIds(baseURL, apiKey);
+    const fallback = provider === 'deepseek'
+      ? 'deepseek-v4-pro'
+      : provider === 'agora'
+        ? 'qwen3.6-35b-a3b-q4'
+        : 'qwen3-30b-a3b';
     const model = await chooseModel(rl, providerLabel, models, fallback);
     return { provider, providerLabel, credentialId, baseURL, model, apiKey, models };
   } finally {
@@ -343,7 +363,7 @@ export async function runInit(rawArgs = process.argv.slice(2)): Promise<void> {
     provider,
     baseURL,
     model,
-    ...(secretRef ? { secretRef } : { apiKey: 'lm-studio' }),
+    ...(secretRef ? { secretRef } : { apiKey: provider === 'agora' ? AGORA_MCP_API_KEY : 'lm-studio' }),
   };
 
   const config: Record<string, any> = {

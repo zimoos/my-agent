@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, lstatSync, readlinkSync, existsSync, openSync, readSync, closeSync } from 'node:fs';
 import { dirname, extname, join, relative } from 'node:path';
 import { createInterface } from 'node:readline';
+import { createHash, randomUUID } from 'node:crypto';
 import pico from 'picocolors';
 
 type Id = string | number | null;
@@ -34,10 +35,27 @@ const TOOLS = [
 const mime = (ext: string) => ext === '.jpg' ? 'image/jpeg' : ext === '.svg' ? 'image/svg+xml' : ext === '.ico' ? 'image/x-icon' : `image/${ext.slice(1)}`;
 const send = (r: Res) => process.stdout.write(JSON.stringify(r) + '\n');
 const log = (...a: unknown[]) => process.stderr.write('[fs-mcp] ' + a.map(String).join(' ') + '\n');
-const ok = (text: string, isError = false) => ({ content: [{ type: 'text', text }], isError });
+const ok = (text: string, isError = false, structuredContent?: Record<string, unknown>) =>
+  structuredContent === undefined
+    ? { content: [{ type: 'text', text }], isError }
+    : { content: [{ type: 'text', text }], isError, structuredContent };
 const rec = (v: unknown): Record<string, unknown> => (v && typeof v === 'object' && !Array.isArray(v)) ? v as Record<string, unknown> : {};
 const errCode = (e: unknown) => (e as NodeJS.ErrnoException)?.code;
 const errMsg = (e: unknown) => e instanceof Error ? e.message : String(e);
+
+function mutationEvidence(operation: string, metadata: Record<string, unknown>): Record<string, unknown> {
+  const id = randomUUID();
+  return {
+    id,
+    evidenceId: id,
+    tool: `fs-mcp__${operation}`,
+    server: 'fs-mcp',
+    toolName: operation,
+    operation,
+    status: 'verified',
+    ...metadata,
+  };
+}
 
 function isBinary(path: string): boolean {
   let fd: number | null = null;
@@ -81,7 +99,21 @@ function handleReadFile(args: Record<string, unknown>) {
     if (st.size > MAX_FILE_BYTES && offset === 1 && limit === null) return ok(`文件过大（${Math.round(st.size / 1024)}KB），请指定 offset 和 limit 参数读取部分内容`, true);
     if (isBinary(path)) return ok(`二进制文件，无法读取: ${path}`, true);
     const raw = readFileSync(path, 'utf-8');
-    return ok(formatLines(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw, offset, limit));
+    const content = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+    const lines = content.split('\n');
+    const start = Math.max(1, offset);
+    const end = limit === null ? lines.length : Math.min(lines.length, start + limit - 1);
+    const complete = end >= lines.length;
+    return ok(formatLines(content, offset, limit), false, {
+      offset,
+      limit,
+      totalLines: lines.length,
+      start,
+      end,
+      complete,
+      nextOffset: complete ? null : end + 1,
+      hash: createHash('sha256').update(raw, 'utf8').digest('hex'),
+    });
   } catch (e) { return fsErr('read_file', path, e); }
 }
 
@@ -125,7 +157,20 @@ function handleWriteFile(args: Record<string, unknown>) {
       const diff = generateWriteFileDiff('', normalized, path);
       result = `已写入 ${path}（${bytes} bytes）\n\n--- Diff ---\n${diff}`;
     }
-    return ok(result);
+    const beforeHash = existed
+      ? createHash('sha256').update(oldContent, 'utf8').digest('hex')
+      : null;
+    const afterHash = createHash('sha256').update(normalized, 'utf8').digest('hex');
+    return ok(result, false, {
+      'my-agent/evidence': mutationEvidence('write_file', {
+        path,
+        changed: !existed || oldContent !== normalized,
+        existed,
+        bytes,
+        beforeHash,
+        afterHash,
+      }),
+    });
   } catch (e) { return ok(`write_file failed: ${errMsg(e)}`, true); }
 }
 

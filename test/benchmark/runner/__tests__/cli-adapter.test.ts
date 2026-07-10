@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import * as net from 'node:net';
 import { fileURLToPath } from 'node:url';
+import { spawn, type ChildProcess } from 'node:child_process';
 
 import {
   loadAdapter,
@@ -13,7 +15,10 @@ import {
 } from '../cli-adapter.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(__dirname, '..', '..', '..', '..');
 const ADAPTERS_DIR = path.resolve(__dirname, '..', '..', 'adapters');
+const CLI_ADAPTER = path.resolve(__dirname, '..', 'cli-adapter.ts');
+const TSX_CLI = path.join(REPO_ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 
 function mkTmpDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -317,3 +322,251 @@ test('runAdapter: env 变量被传递', async () => {
     fs.rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+async function allocatePort(): Promise<number> {
+  const server = net.createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const port = address.port;
+  await new Promise<void>((resolve, reject) => {
+    server.close((err) => err ? reject(err) : resolve());
+  });
+  return port;
+}
+
+async function canBind(port: number): Promise<boolean> {
+  const server = net.createServer();
+  return await new Promise<boolean>((resolve) => {
+    server.once('error', () => resolve(false));
+    server.listen(port, '127.0.0.1', () => {
+      server.close(() => resolve(true));
+    });
+  });
+}
+
+async function waitForPortRelease(port: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await canBind(port)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return canBind(port);
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function waitForExit(proc: ChildProcess): Promise<{ code: number | null; stderr: string }> {
+  let stderr = '';
+  proc.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8'); });
+  return new Promise((resolve) => {
+    proc.once('exit', (code) => resolve({ code, stderr }));
+  });
+}
+
+async function killEscapedBestEffort(pid: number): Promise<void> {
+  for (const target of [-pid, pid]) {
+    try {
+      process.kill(target, 'SIGKILL');
+    } catch {
+      // The process may have already exited after the assertion.
+    }
+  }
+}
+
+test('runAdapter: timeout kills escaped process-group descendant and releases its port', async () => {
+  const port = await allocatePort();
+  const workdir = mkTmpDir('adapter-process-tree-');
+  const readinessFile = path.join(workdir, 'escaped-descendant.json');
+  const descendantScript = [
+    "const fs = require('node:fs')",
+    "const net = require('node:net')",
+    `net.createServer(() => {}).listen(${port}, '127.0.0.1', () => fs.writeFileSync(${JSON.stringify(readinessFile)}, JSON.stringify({ pid: process.pid, port: ${port} })))`,
+    'setInterval(() => {}, 60_000)',
+  ].join(';');
+  const parentScript = [
+    "const { spawn } = require('node:child_process')",
+    "const fs = require('node:fs')",
+    `const child = spawn(process.execPath, ['-e', ${JSON.stringify(descendantScript)}], { detached: true, stdio: 'ignore' })`,
+    'child.unref()',
+    `while (!fs.existsSync(${JSON.stringify(readinessFile)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)`,
+    "console.log('DESCENDANT_PID=' + child.pid)",
+    'setInterval(() => {}, 60_000)',
+  ].join(';');
+  const cfg: AdapterConfig = {
+    name: 'process-tree-timeout',
+    underlyingModel: 'test-only',
+    command: process.execPath,
+    args: ['-e', parentScript],
+    timeoutSec: 0.5,
+  };
+  let descendantPid: number | undefined;
+
+  try {
+    const result = await runAdapter(cfg, 'x', workdir);
+    assert.equal(result.timedOut, true);
+    const match = result.stdout.match(/DESCENDANT_PID=(\d+)/);
+    assert.ok(match, `descendant did not start before timeout: ${result.stdout}`);
+    descendantPid = Number(match[1]);
+
+    assert.equal(isAlive(descendantPid), false, `escaped descendant pid ${descendantPid} survived`);
+    const releasedByAdapter = await waitForPortRelease(port, 2_000);
+    assert.equal(releasedByAdapter, true, `descendant kept port ${port} after timeout`);
+  } finally {
+    if (descendantPid) {
+      await killEscapedBestEffort(descendantPid);
+      await waitForPortRelease(port, 2_000);
+    }
+    fs.rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test('runAdapter: normal parent exit also kills descendants and releases their port', async () => {
+  const port = await allocatePort();
+  const workdir = mkTmpDir('adapter-normal-exit-tree-');
+  const descendantScript = [
+    "const net = require('node:net')",
+    `net.createServer(() => {}).listen(${port}, '127.0.0.1', () => console.log('READY'))`,
+    'setInterval(() => {}, 60_000)',
+  ].join(';');
+  const parentScript = [
+    "const { spawn } = require('node:child_process')",
+    `const child = spawn(process.execPath, ['-e', ${JSON.stringify(descendantScript)}], { stdio: ['ignore', 'pipe', 'ignore'] })`,
+    "child.stdout.once('data', () => { console.log(`DESCENDANT_PID=${child.pid}`); process.exit(0) })",
+  ].join(';');
+  const cfg: AdapterConfig = {
+    name: 'process-tree-normal-exit',
+    underlyingModel: 'test-only',
+    command: process.execPath,
+    args: ['-e', parentScript],
+    timeoutSec: 5,
+  };
+  let descendantPid: number | undefined;
+
+  try {
+    const result = await runAdapter(cfg, 'x', workdir);
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.timedOut, false);
+    const match = result.stdout.match(/DESCENDANT_PID=(\d+)/);
+    assert.ok(match, `descendant did not start before normal exit: ${result.stdout}`);
+    descendantPid = Number(match[1]);
+
+    const releasedByAdapter = await waitForPortRelease(port, 2_000);
+    if (!releasedByAdapter && descendantPid) {
+      try {
+        process.kill(descendantPid, 'SIGKILL');
+      } catch {
+        // It exited between the port probe and cleanup.
+      }
+      await waitForPortRelease(port, 2_000);
+    }
+    assert.equal(releasedByAdapter, true, `descendant kept port ${port} after normal exit`);
+  } finally {
+    if (descendantPid) {
+      try {
+        process.kill(descendantPid, 'SIGKILL');
+      } catch {
+        // Already reaped by the adapter implementation.
+      }
+    }
+    await waitForPortRelease(port, 2_000);
+    fs.rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test('runAdapter: timeout returns promptly and kills its direct child when ps is unavailable', async () => {
+  const workdir = mkTmpDir('adapter-no-ps-timeout-');
+  const originalPath = process.env.PATH;
+  process.env.PATH = path.join(workdir, 'no-ps-on-this-path');
+  const cfg: AdapterConfig = {
+    name: 'no-ps-timeout',
+    underlyingModel: 'test-only',
+    command: process.execPath,
+    args: ['-e', 'setTimeout(() => process.exit(0), 2500)'],
+    timeoutSec: 0.2,
+  };
+
+  try {
+    const startedAt = Date.now();
+    const result = await runAdapter(cfg, 'x', workdir);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(result.timedOut, true);
+    assert.ok(elapsedMs < 1_500, `timeout waited ${elapsedMs}ms after ps failed`);
+    assert.ok(result.exitCode !== 0, 'direct child should be terminated instead of exiting naturally');
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    fs.rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test(
+  'runAdapter does not kill an unrelated process whose argv only resembles its run marker',
+  { skip: process.platform !== 'darwin' ? 'ps argv matching regression is macOS-specific' : false },
+  async () => {
+    const workdir = mkTmpDir('adapter-argv-marker-');
+    const marker = '00000000-0000-4000-8000-000000000042';
+    const preload = path.join(workdir, 'fixed-random-uuid.cjs');
+    const runner = path.join(workdir, 'run-adapter.mts');
+    fs.writeFileSync(
+      preload,
+      [
+        "const crypto = require('node:crypto');",
+        `crypto.randomUUID = () => ${JSON.stringify(marker)};`,
+        "require('node:module').syncBuiltinESMExports();",
+      ].join('\n'),
+    );
+    fs.writeFileSync(
+      runner,
+      [
+        `import { runAdapter } from ${JSON.stringify(CLI_ADAPTER)};`,
+        'void (async () => {',
+        `  const result = await runAdapter({ name: 'marker-cleanup', underlyingModel: 'test-only', command: process.execPath, args: ['-e', 'process.exit(0)'], timeoutSec: 5 }, 'x', ${JSON.stringify(workdir)});`,
+        '  process.stdout.write(JSON.stringify(result));',
+        '})().catch((error) => { console.error(error); process.exitCode = 1; });',
+      ].join('\n'),
+    );
+    const unrelatedEnv = { ...process.env };
+    delete unrelatedEnv.MY_AGENT_ADAPTER_RUN_ID;
+    const unrelated = spawn(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 60000)', '--', `MY_AGENT_ADAPTER_RUN_ID=${marker}`],
+      { detached: true, env: unrelatedEnv, stdio: 'ignore' },
+    );
+    unrelated.unref();
+    assert.ok(unrelated.pid, 'unrelated process must receive a pid');
+
+    try {
+      const inheritedNodeOptions = process.env.NODE_OPTIONS;
+      const runnerProcess = spawn(process.execPath, [TSX_CLI, runner], {
+        cwd: REPO_ROOT,
+        env: {
+          ...process.env,
+          NODE_OPTIONS: [inheritedNodeOptions, `--require=${preload}`].filter(Boolean).join(' '),
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const runnerResult = await waitForExit(runnerProcess);
+      assert.equal(runnerResult.code, 0, runnerResult.stderr);
+      assert.equal(
+        isAlive(unrelated.pid!),
+        true,
+        'adapter cleanup must not signal a process whose marker exists only in argv text',
+      );
+    } finally {
+      await killEscapedBestEffort(unrelated.pid!);
+      fs.rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);

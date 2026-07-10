@@ -96,6 +96,30 @@ test('applyAgentEvent: retry attempts keep n/5 semantics after the first wait', 
   assert.equal(store.getState().thinking?.event, '等待模型响应（重试 2/5）· 180s 超时');
 });
 
+test('applyAgentEvent: provider progress updates transient status without thinking label', () => {
+  const store = createUiStore();
+  store.startThinking();
+  store.updateThinking({ isThinking: true });
+
+  applyAgentEvent(
+    store,
+    {
+      type: 'provider:progress',
+      provider: 'agora',
+      phase: 'model_load',
+      message: 'Agora · 加载本地模型 qwen3.6-35b-a3b-q4',
+      progress: 40,
+    },
+    {}
+  );
+
+  const state = store.getState();
+  assert.equal(state.thinking?.event, 'Agora · 加载本地模型 qwen3.6-35b-a3b-q4');
+  assert.equal(state.thinking?.isThinking, false);
+  assert.equal(state.thinking?.thoughtDurationMs, null);
+  assert.equal(state.messages.length, 0);
+});
+
 test('applyAgentEvent: progress is rendered as visible system message', () => {
   const store = createUiStore();
   store.startThinking();

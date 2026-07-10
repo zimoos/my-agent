@@ -167,6 +167,43 @@ test('collectDiff: 嵌套目录新增文件', async () => {
   }
 });
 
+test('collectDiff: 巨型 node_modules 在基线和收集阶段都被排除，真实文件仍保留', async () => {
+  const hugeDependency = 'x'.repeat(2 * 1024 * 1024);
+  const fx = makeFixture({
+    'src/index.js': 'export const value = 1;\n',
+    'node_modules/preinstalled/index.js': hugeDependency,
+  });
+  try {
+    const { workdir, cleanup } = await prepareWorkspace(fx.dir);
+    try {
+      const tracked = git(['ls-files'], workdir).split('\n').filter(Boolean);
+      assert.deepEqual(tracked, ['src/index.js']);
+
+      writeFileSync(join(workdir, 'src/index.js'), 'export const value = 2;\n');
+      mkdirSync(join(workdir, 'docs'), { recursive: true });
+      writeFileSync(join(workdir, 'docs/decision.md'), '# Decision\n');
+      mkdirSync(join(workdir, 'packages/app/node_modules/puppeteer'), { recursive: true });
+      writeFileSync(
+        join(workdir, 'packages/app/node_modules/puppeteer/browser.js'),
+        hugeDependency,
+      );
+      git(['add', '-f', 'packages/app/node_modules/puppeteer/browser.js'], workdir);
+
+      const diff = await collectDiff(workdir);
+      const paths = diff.files.map((file) => file.path);
+      assert.deepEqual(paths.sort(), ['docs/decision.md', 'src/index.js']);
+      assert.ok(diff.files.every((file) => !file.path.includes('node_modules')));
+      assert.doesNotMatch(diff.summary, /node_modules|puppeteer/);
+      assert.match(diff.files.find((file) => file.path === 'src/index.js')!.diff, /value = 2/);
+      assert.match(diff.files.find((file) => file.path === 'docs/decision.md')!.diff, /Decision/);
+    } finally {
+      await cleanup();
+    }
+  } finally {
+    fx.cleanup();
+  }
+});
+
 test('prepareWorkspace: fixture 目录不存在时抛错', async () => {
   await assert.rejects(
     () => prepareWorkspace(join(tmpdir(), `__no_such_fixture_${Date.now()}__`)),
@@ -181,6 +218,31 @@ test('prepareWorkspace: setup 命令失败时抛错向上传播', async () => {
       () => prepareWorkspace(fx.dir, ['node -e "process.exit(3)"']),
     );
   } finally {
+    fx.cleanup();
+  }
+});
+
+test('prepareWorkspace: setup 失败时仍删除已创建的临时 workspace', async () => {
+  const fx = makeFixture({ 'a.txt': 'a\n' });
+  const markerDir = mkdtempSync(join(tmpdir(), 'ma-bench-setup-failure-'));
+  const marker = join(markerDir, 'workspace-path.txt');
+  const script = [
+    `require('node:fs').writeFileSync(${JSON.stringify(marker)}, process.cwd())`,
+    'process.exit(7)',
+  ].join(';');
+  let leakedWorkdir = '';
+
+  try {
+    await assert.rejects(
+      () => prepareWorkspace(fx.dir, [`${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`]),
+    );
+    leakedWorkdir = readFileSync(marker, 'utf8');
+    const leaked = existsSync(leakedWorkdir);
+    if (leaked) rmSync(leakedWorkdir, { recursive: true, force: true });
+    assert.equal(leaked, false, `setup failure leaked workspace: ${leakedWorkdir}`);
+  } finally {
+    if (leakedWorkdir) rmSync(leakedWorkdir, { recursive: true, force: true });
+    rmSync(markerDir, { recursive: true, force: true });
     fx.cleanup();
   }
 });

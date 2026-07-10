@@ -20,6 +20,14 @@ import {
   type JudgeScore,
 } from './judge-client.js';
 import { medianJudgeScore, scoreL3 } from './l3-scorer.js';
+import {
+  BROWSER_EVIDENCE_CLASSES,
+  collectTrustedBrowserEvidence,
+  type BrowserEvidenceClass,
+  type BrowserEvidenceResult,
+  type BrowserVerificationSpec,
+  type BrowserViewportSpec,
+} from './browser-verifier.js';
 
 // ─── L3TaskDef (YAML shape) ───
 
@@ -44,6 +52,7 @@ export interface L3TaskDef {
   referenceSolution?: string;
   noModifyFiles: string[];
   objectiveChecks: L3ObjectiveCheck[];
+  browserVerification?: BrowserVerificationSpec;
   runtime: {
     timeoutSec: number;
     runs: number;
@@ -69,6 +78,10 @@ export interface L3RunDetail {
     exitCode: number;
     stdoutTail: string;
   }>;
+  browserVerification?: BrowserEvidenceResult & {
+    evidencePath: string;
+  };
+  hardGateFailures: string[];
 }
 
 export interface L3TaskResult {
@@ -213,6 +226,11 @@ export function loadL3Task(yamlPath: string): L3TaskDef {
     noModifyFiles = noModifyRaw as string[];
   }
 
+  const browserVerification = parseBrowserVerification(
+    obj['browser_verification'],
+    loc,
+  );
+
   const runtimeRaw = obj['runtime'];
   if (!runtimeRaw || typeof runtimeRaw !== 'object' || Array.isArray(runtimeRaw)) {
     throw new Error(`[${loc}] runtime must be a mapping`);
@@ -239,9 +257,178 @@ export function loadL3Task(yamlPath: string): L3TaskDef {
     referenceSolution,
     noModifyFiles,
     objectiveChecks,
+    browserVerification,
     runtime: { timeoutSec, runs },
     sourcePath: yamlPath,
   };
+}
+
+function parseBrowserVerification(
+  raw: unknown,
+  loc: string,
+): BrowserVerificationSpec | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(`[${loc}] browser_verification must be a mapping`);
+  }
+  const obj = raw as Record<string, unknown>;
+  const entrypoint = requireString(obj, 'entrypoint', `${loc} browser_verification`);
+  const evidencePath = optionalString(obj, 'evidence_path');
+  assertRelativePath(entrypoint, `${loc} browser_verification.entrypoint`);
+  if (evidencePath) {
+    assertRelativePath(evidencePath, `${loc} browser_verification.evidence_path`);
+  }
+
+  const requiredRaw = obj['required_evidence'];
+  if (!Array.isArray(requiredRaw) || requiredRaw.length === 0) {
+    throw new Error(
+      `[${loc}] browser_verification.required_evidence must be a non-empty array`,
+    );
+  }
+  const allowedEvidence = new Set<string>(BROWSER_EVIDENCE_CLASSES);
+  const requiredEvidence: BrowserEvidenceClass[] = [];
+  for (const [i, value] of requiredRaw.entries()) {
+    if (typeof value !== 'string' || !allowedEvidence.has(value)) {
+      throw new Error(
+        `[${loc}] browser_verification.required_evidence[${i}] is not supported`,
+      );
+    }
+    if (requiredEvidence.includes(value as BrowserEvidenceClass)) {
+      throw new Error(
+        `[${loc}] browser_verification.required_evidence contains duplicate "${value}"`,
+      );
+    }
+    requiredEvidence.push(value as BrowserEvidenceClass);
+  }
+
+  const viewportsRaw = obj['viewports'];
+  if (!Array.isArray(viewportsRaw) || viewportsRaw.length === 0) {
+    throw new Error(`[${loc}] browser_verification.viewports must be a non-empty array`);
+  }
+  const viewportNames = new Set<string>();
+  const viewports: BrowserViewportSpec[] = viewportsRaw.map((value, i) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(
+        `[${loc}] browser_verification.viewports[${i}] must be a mapping`,
+      );
+    }
+    const viewport = value as Record<string, unknown>;
+    const name = requireString(
+      viewport,
+      'name',
+      `${loc} browser_verification.viewports[${i}]`,
+    );
+    const width = viewport['width'];
+    const height = viewport['height'];
+    if (!Number.isInteger(width) || (width as number) <= 0) {
+      throw new Error(
+        `[${loc}] browser_verification.viewports[${i}].width must be a positive integer`,
+      );
+    }
+    if (!Number.isInteger(height) || (height as number) <= 0) {
+      throw new Error(
+        `[${loc}] browser_verification.viewports[${i}].height must be a positive integer`,
+      );
+    }
+    if (viewportNames.has(name)) {
+      throw new Error(
+        `[${loc}] browser_verification.viewports contains duplicate name "${name}"`,
+      );
+    }
+    viewportNames.add(name);
+    return { name, width: width as number, height: height as number };
+  });
+
+  const controlsRaw = requiredMapping(obj, 'controls', `${loc} browser_verification`);
+  const controls = {
+    movementKey: requireString(controlsRaw, 'movement_key', `${loc} browser_verification.controls`),
+    collisionKey: requireString(controlsRaw, 'collision_key', `${loc} browser_verification.controls`),
+    saveKey: requireString(controlsRaw, 'save_key', `${loc} browser_verification.controls`),
+    hitSelector: requireString(controlsRaw, 'hit_selector', `${loc} browser_verification.controls`),
+  };
+
+  const hookRaw = requiredMapping(obj, 'hook', `${loc} browser_verification`);
+  const hookVersion = hookRaw['version'];
+  if (!Number.isInteger(hookVersion) || (hookVersion as number) <= 0) {
+    throw new Error(`[${loc}] browser_verification.hook.version must be a positive integer`);
+  }
+  const hook = {
+    global: requireString(hookRaw, 'global', `${loc} browser_verification.hook`),
+    version: hookVersion as number,
+    snapshotMethod: requireString(
+      hookRaw,
+      'snapshot_method',
+      `${loc} browser_verification.hook`,
+    ),
+  };
+
+  let server: BrowserVerificationSpec['server'];
+  if (obj['server'] !== undefined) {
+    const serverRaw = requiredMapping(obj, 'server', `${loc} browser_verification`);
+    const host = requireString(serverRaw, 'host', `${loc} browser_verification.server`);
+    const port = serverRaw['port'];
+    if (!Number.isInteger(port) || (port as number) < 0 || (port as number) > 65_535) {
+      throw new Error(`[${loc}] browser_verification.server.port must be an integer from 0 to 65535`);
+    }
+    server = { host, port: port as number };
+  }
+
+  let persistence: BrowserVerificationSpec['persistence'];
+  if (obj['persistence'] !== undefined) {
+    const persistenceRaw = requiredMapping(
+      obj,
+      'persistence',
+      `${loc} browser_verification`,
+    );
+    const storageKey = requireString(
+      persistenceRaw,
+      'storage_key',
+      `${loc} browser_verification.persistence`,
+    );
+    const observedStatePathsRaw = persistenceRaw['observed_state_paths'];
+    if (
+      !Array.isArray(observedStatePathsRaw) ||
+      observedStatePathsRaw.length === 0 ||
+      !observedStatePathsRaw.every((value) => typeof value === 'string' && value.length > 0)
+    ) {
+      throw new Error(
+        `[${loc}] browser_verification.persistence.observed_state_paths must be a non-empty array of strings`,
+      );
+    }
+    persistence = {
+      storageKey,
+      observedStatePaths: observedStatePathsRaw as string[],
+    };
+  }
+
+  return {
+    entrypoint,
+    requiredEvidence,
+    viewports,
+    controls,
+    hook,
+    ...(persistence ? { persistence } : {}),
+    ...(server ? { server } : {}),
+    ...(evidencePath ? { evidencePath } : {}),
+  };
+}
+
+function requiredMapping(
+  obj: Record<string, unknown>,
+  key: string,
+  loc: string,
+): Record<string, unknown> {
+  const value = obj[key];
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`[${loc}] field "${key}" must be a mapping`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function assertRelativePath(value: string, loc: string): void {
+  if (path.isAbsolute(value) || path.normalize(value).split(path.sep).includes('..')) {
+    throw new Error(`[${loc}] must stay within the benchmark workspace`);
+  }
 }
 
 function optionalString(
@@ -350,6 +537,24 @@ async function runOnce(
       })),
     ].map((c) => runObjectiveCheck(c, ws.workdir));
 
+    const browserVerification = task.browserVerification
+      ? await collectTrustedBrowserEvidence(task.browserVerification, ws.workdir)
+      : undefined;
+    const judgeChecks: JudgeInput['objectiveChecks'] = checkResults.map((c) => ({
+      command: c.command,
+      exitCode: c.exitCode,
+      stdout: c.stdout,
+      weightInto: c.weightInto,
+    }));
+    if (browserVerification) {
+      judgeChecks.push({
+        command: `browser_verification ${browserVerification.evidencePath}`,
+        exitCode: browserVerification.passed ? 0 : 1,
+        stdout: browserVerification.summary,
+        weightInto: 'TaskCompletion',
+      });
+    }
+
     const judgeInput: JudgeInput = {
       taskDescription: `${task.id} - ${task.title}`,
       prompt: task.prompt,
@@ -357,12 +562,7 @@ async function runOnce(
       referenceSolution: task.referenceSolution,
       workspaceDiff: diff.files.map((f) => f.diff).join('\n'),
       finalAnswer: adapterResult.finalAnswer,
-      objectiveChecks: checkResults.map((c) => ({
-        command: c.command,
-        exitCode: c.exitCode,
-        stdout: c.stdout,
-        weightInto: c.weightInto,
-      })),
+      objectiveChecks: judgeChecks,
       runtimeStats: {
         elapsedMs: adapterResult.elapsedMs,
         exitCode: adapterResult.exitCode,
@@ -370,6 +570,19 @@ async function runOnce(
     };
 
     const score = await judge(judgeInput, judgeConfig);
+
+    const hardGateFailures = [
+      ...(adapterResult.timedOut ? ['adapter timed out'] : []),
+      ...(adapterResult.exitCode !== 0
+        ? [`adapter exited with code ${adapterResult.exitCode}`]
+        : []),
+      ...checkResults
+        .filter((check) => check.exitCode !== 0)
+        .map((check) => `objective check failed: ${check.command}`),
+      ...(browserVerification?.failures ?? []).map(
+        (failure) => `browser verification failed: ${failure}`,
+      ),
+    ];
 
     const detail: L3RunDetail = {
       runIndex,
@@ -388,6 +601,12 @@ async function runOnce(
         exitCode: c.exitCode,
         stdoutTail: (c.stdout ?? '').slice(-400),
       })),
+      browserVerification: browserVerification && {
+        passed: browserVerification.passed,
+        failures: browserVerification.failures,
+        evidencePath: browserVerification.evidencePath,
+      },
+      hardGateFailures,
     };
 
     return { score, detail };
@@ -436,7 +655,8 @@ export async function runL3Task(
   }
 
   const median = medianJudgeScore(scores);
-  const { total, passed } = scoreL3(median);
+  const { total, passed: scorePassed } = scoreL3(median);
+  const passed = scorePassed && details.every((detail) => detail.hardGateFailures.length === 0);
 
   return {
     taskId: task.id,
