@@ -96,12 +96,8 @@ pre {
 
 .hero {
   position: relative;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(320px, 520px);
-  gap: 36px;
-  align-items: center;
   min-height: calc(100vh - 72px);
-  padding: 74px 7vw 64px;
+  padding: 70px 7vw 250px;
   overflow: hidden;
 }
 
@@ -118,9 +114,30 @@ pre {
 }
 
 .hero-copy,
-.hero-logo {
+.hero-background {
   position: relative;
   z-index: 1;
+}
+
+.hero-background {
+  position: absolute;
+  right: 5vw;
+  bottom: 28px;
+  z-index: 0;
+  width: min(1160px, 90vw);
+  height: auto;
+  border: 1px solid #34313d;
+  border-radius: 8px;
+  box-shadow: 0 30px 90px rgba(0, 0, 0, 0.52), 0 0 46px rgba(255, 107, 231, 0.14);
+}
+
+.hero::after {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  content: "";
+  background: linear-gradient(90deg, #050505 0%, rgba(5, 5, 5, 0.94) 43%, rgba(5, 5, 5, 0.22) 72%, rgba(5, 5, 5, 0) 100%);
+  pointer-events: none;
 }
 
 .eyebrow {
@@ -202,17 +219,6 @@ h3 {
 
 .button.secondary {
   background: #111216;
-}
-
-.hero-logo {
-  display: flex;
-  justify-content: center;
-}
-
-.hero-logo img {
-  width: min(100%, 520px);
-  height: auto;
-  filter: drop-shadow(0 24px 60px rgba(255, 107, 231, 0.22));
 }
 
 .terminal-band,
@@ -432,7 +438,6 @@ h3 {
     padding-bottom: 4px;
   }
 
-  .hero,
   .split,
   .feature-grid,
   .install-grid {
@@ -440,16 +445,18 @@ h3 {
   }
 
   .hero {
-    min-height: auto;
-    padding: 54px 22px 38px;
+    min-height: 0;
+    padding: 54px 22px 160px;
   }
 
-  .hero-logo {
-    justify-content: flex-start;
+  .hero-background {
+    right: 22px;
+    bottom: 24px;
+    width: 300px;
   }
 
-  .hero-logo img {
-    max-width: 360px;
+  .hero::after {
+    background: linear-gradient(180deg, #050505 0%, rgba(5, 5, 5, 0.92) 42%, rgba(5, 5, 5, 0.38) 80%, rgba(5, 5, 5, 0.15) 100%);
   }
 
   .terminal-band,
