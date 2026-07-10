@@ -189,6 +189,19 @@ function buildContinuationNudge(previous: string): string {
   ].join('\n');
 }
 
+function buildImmediateToolNudge(previous: string): string {
+  const normalized = previous.trim();
+  const tail = normalized.slice(Math.max(0, normalized.length - 800));
+  return [
+    '[MA internal action request]',
+    'Your previous response was cut off while describing an unfinished action, but it did not include a tool call.',
+    'Do not continue the plan or explain the next step. Call exactly one appropriate tool now to make concrete progress.',
+    'For a large file or long operation, perform the first safe part with a tool and continue in later turns.',
+    'Last visible tail:',
+    tail,
+  ].join('\n');
+}
+
 function compactResultPreview(content: string): string {
   const oneLine = String(content ?? '').replace(/\s+/g, ' ').trim();
   if (!oneLine) return '';
@@ -401,7 +414,9 @@ function looksLikeVerbalToolIntent(text: string): boolean {
   if (/(?:结果|如下|内容|已经|已完成|完成|找到|共有|共\s*\d+|输出|行数)/.test(compact)) {
     return false;
   }
-  return /(?:我|让我|好的，我|接下来|现在).{0,12}(?:先|来|会|去|准备|继续|再)?\s*(?:读|读取|查看|列|列出|搜索|搜|执行|运行|统计|创建|写|写入|修改|编辑|替换|修复|实现|检查)/.test(compact);
+  const chineseIntent = /(?:我|让我|好的，我|接下来|现在).{0,12}(?:先|来|会|去|准备|继续|再)?\s*(?:读|读取|查看|列|列出|搜索|搜|执行|运行|统计|创建|写|写入|修改|编辑|替换|修复|实现|检查)/.test(compact);
+  const englishIntent = /(?:i(?:'ll| will| need to)|let me|now i|next i).{0,40}\b(?:read|list|search|run|execute|count|create|write|edit|replace|fix|implement|check|verify)\b/i.test(compact);
+  return chineseIntent || englishIntent;
 }
 
 function getRequiredArgs(
@@ -1367,6 +1382,23 @@ export async function createAgent(
           store.appendAssistant(contentBuf, undefined, { reasoningContent });
           lastLengthContinuationContent = contentBuf;
         }
+        // Local coding models often spend a full turn on hidden reasoning and
+        // leave only a verbal promise such as "now I will write the file".
+        // A generic continuation nudge repeats that promise; require the next
+        // turn to take one concrete tool action instead.
+        if (
+          verbalIntentRetries < 2 &&
+          userAskedForConcreteToolWork(textFromChatContent(rootUserMessage)) &&
+          looksLikeVerbalToolIntent(contentBuf)
+        ) {
+          verbalIntentRetries += 1;
+          store.appendUser(buildImmediateToolNudge(contentBuf));
+          persistPending();
+          lengthContinuationCount = 0;
+          lastLengthContinuationContent = '';
+          tempOverride = 0.1;
+          continue;
+        }
         lengthContinuationCount++;
         if (lengthContinuationCount > MAX_AUTOMATIC_LENGTH_CONTINUATIONS) {
           yield {
@@ -1590,6 +1622,25 @@ export async function createAgent(
         errorTracker.record(fullName, args, isError);
         const progress = recordToolProgress(fullName, args, !isError, result);
         if (progress) yield progress;
+      }
+      // A local model can spend a truncated turn only updating its plan, then
+      // announce a real action it still has not performed. Do not let a
+      // todo_write satisfy that turn: the next request must make the promised
+      // concrete tool call rather than receive a generic continuation prompt.
+      const planningOnlyTruncatedTurn =
+        finishReason === 'length' &&
+        repairedCalls.every((tc) => tc.function.name === 'todo_write');
+      if (
+        planningOnlyTruncatedTurn &&
+        verbalIntentRetries < 2 &&
+        userAskedForConcreteToolWork(textFromChatContent(rootUserMessage)) &&
+        looksLikeVerbalToolIntent(contentBuf)
+      ) {
+        verbalIntentRetries += 1;
+        store.appendUser(buildImmediateToolNudge(contentBuf));
+        persistPending();
+        tempOverride = 0.1;
+        continue;
       }
       persistPending();
     }

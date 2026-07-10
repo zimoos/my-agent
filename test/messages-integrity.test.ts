@@ -2218,6 +2218,104 @@ test('messages: truncated output appends an internal continuation nudge on the n
   }
 });
 
+test('messages: truncated verbal tool intent is redirected to an immediate tool action', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    const agent = await createAgent(makeConfig(), makeConnections());
+    state.responses.push(
+      {
+        kind: 'stream',
+        chunks: streamChunks({
+          content: 'Now I will create public/index.html with the browser demo.',
+          finishReason: 'length',
+        }),
+      },
+      {
+        kind: 'stream',
+        chunks: streamChunks({
+          toolCalls: [
+            {
+              id: 'call_action_after_length',
+              name: 'todo_write',
+              arguments: JSON.stringify({ action: 'add', text: 'Create browser demo' }),
+            },
+          ],
+          finishReason: 'tool_calls',
+        }),
+      },
+      {
+        kind: 'stream',
+        chunks: streamChunks({ content: 'I created the first concrete task.' }),
+      },
+    );
+
+    const events = await drain(agent.chat('Create public/index.html and verify it in a browser.'));
+
+    assert.equal(state.calls.length, 3);
+    const secondRequestText = messagesText(state.calls[1].messages);
+    assert.match(secondRequestText, /\[MA internal action request\]/);
+    assert.match(secondRequestText, /Call exactly one appropriate tool now/);
+    assert.doesNotMatch(secondRequestText, /\[MA internal continuation request\]/);
+    assert.ok(
+      events.some((event) => event.type === 'tool:call' && event.name === 'todo_write'),
+      'the action nudge must produce a real tool call'
+    );
+  } finally {
+    restore();
+  }
+});
+
+test('messages: truncated planning-only tool turn cannot replace the promised action', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    const agent = await createAgent(makeConfig(), makeConnections());
+    state.responses.push(
+      {
+        kind: 'stream',
+        chunks: streamChunks({
+          content: 'Now I will create public/index.html with the browser demo.',
+          toolCalls: [
+            {
+              id: 'call_plan_only',
+              name: 'todo_write',
+              arguments: JSON.stringify({ action: 'add', text: 'Create browser demo' }),
+            },
+          ],
+          finishReason: 'length',
+        }),
+      },
+      {
+        kind: 'stream',
+        chunks: streamChunks({
+          toolCalls: [
+            {
+              id: 'call_concrete_after_plan',
+              name: 'todo_write',
+              arguments: JSON.stringify({ action: 'add', text: 'Write first browser demo file section' }),
+            },
+          ],
+          finishReason: 'tool_calls',
+        }),
+      },
+      {
+        kind: 'stream',
+        chunks: streamChunks({ content: 'I started the concrete file work.' }),
+      },
+    );
+
+    await drain(agent.chat('Create public/index.html and verify it in a browser.'));
+
+    assert.equal(state.calls.length, 3);
+    const secondRequestText = messagesText(state.calls[1].messages);
+    assert.match(secondRequestText, /\[MA internal action request\]/);
+    assert.doesNotMatch(secondRequestText, /\[MA internal continuation request\]/);
+  } finally {
+    restore();
+  }
+});
+
 test('messages: repeated continuation output is not persisted or continued again', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);

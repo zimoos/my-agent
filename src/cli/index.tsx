@@ -23,6 +23,42 @@ import { createContextManager } from '../agent/context-manager.js';
 let activeConnections: McpConnection[] = [];
 let activeAgent: Agent | undefined;
 
+/**
+ * A non-interactive run can be killed by an external E2E harness while an
+ * Agora MCP child owns the local model. Node's default SIGTERM behaviour skips
+ * runPrompt's finally block, so explicitly close provider-owned children first.
+ */
+function installRunSignalCleanup(
+  connections: McpConnection[],
+  agent: Agent,
+): () => void {
+  let shuttingDown = false;
+
+  const stop = (signal: NodeJS.Signals): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    void (async () => {
+      try {
+        await shutdown(connections, agent);
+      } finally {
+        activeConnections = [];
+        activeAgent = undefined;
+        process.exit(signal === 'SIGINT' ? 130 : 143);
+      }
+    })();
+  };
+
+  const onSigint = (): void => stop('SIGINT');
+  const onSigterm = (): void => stop('SIGTERM');
+  process.once('SIGINT', onSigint);
+  process.once('SIGTERM', onSigterm);
+
+  return () => {
+    process.off('SIGINT', onSigint);
+    process.off('SIGTERM', onSigterm);
+  };
+}
+
 function parseResume(raw: string | boolean | undefined): string | true | undefined {
   if (raw === undefined) return undefined;
   if (raw === true || raw === '') return true;
@@ -138,6 +174,7 @@ async function runPrompt(configPath: string | undefined, prompt: string): Promis
   activeConnections = connections;
   activeAgent = agent;
   let finalText = '';
+  const removeSignalCleanup = installRunSignalCleanup(connections, agent);
 
   try {
     for await (const event of agent.chat(prompt)) {
@@ -168,6 +205,7 @@ async function runPrompt(configPath: string | undefined, prompt: string): Promis
     if (!finalText.endsWith('\n')) process.stdout.write('\n');
     process.stdout.write(`\n===FINAL_ANSWER===\n${finalText.trim()}\n===END===\n`);
   } finally {
+    removeSignalCleanup();
     await shutdown(connections, agent);
     activeConnections = [];
     activeAgent = undefined;

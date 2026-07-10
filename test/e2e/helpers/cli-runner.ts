@@ -40,17 +40,33 @@ export async function runMaPrompt(params: {
       cwd: params.cwd ?? defaultE2ECwd(),
       env: { ...process.env, ...params.env, NO_COLOR: '1', FORCE_COLOR: '0' },
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
     }
   );
 
   let stdout = '';
   let stderr = '';
   let timedOut = false;
+  const signalProcessTree = (signal: NodeJS.Signals): void => {
+    if (proc.pid && process.platform !== 'win32') {
+      try {
+        process.kill(-proc.pid, signal);
+        return;
+      } catch {
+        // The process may have exited before its group was established.
+      }
+    }
+    try {
+      proc.kill(signal);
+    } catch {
+      // Best-effort cleanup for a test process that has already exited.
+    }
+  };
   const timer = setTimeout(() => {
     timedOut = true;
-    proc.kill('SIGTERM');
+    signalProcessTree('SIGTERM');
     setTimeout(() => {
-      if (!proc.killed) proc.kill('SIGKILL');
+      signalProcessTree('SIGKILL');
     }, 5000).unref();
   }, timeoutMs);
 
