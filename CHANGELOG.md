@@ -2,7 +2,7 @@
 
 All notable MA changes are documented here. MA is an alpha product; versions may change behavior while the core terminal-agent workflow is being hardened.
 
-## Unreleased
+## v0.2.0-alpha.0 - 2026-07-11
 
 ### Added
 

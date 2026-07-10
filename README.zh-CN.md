@@ -5,11 +5,11 @@ DeepSeek 无脑配置，本地小模型也能变生产力。
 
 MA 的核心不是“又接了一个模型”，而是两件事：远程模型配置必须无脑，本地小模型必须能做真实项目。DeepSeek 走交互式配置，LM Studio/Qwen 则通过长上下文、工具调用加固、模型切换和 benchmark 驱动修复，把小模型转化成能持续工作的生产力。
 
-`v0.1.2-alpha` 当前支持 LM Studio 本地模型、DeepSeek 官方 API，以及通过 MCP stdio 接入的 Agora。Agora 是 MA 的本地优先深度适配：它展示真实的模型加载和 MemoryPatch 状态，不会把记忆伪装成一段 prompt。
+`v0.2.0-alpha.0` 当前支持 LM Studio 本地模型、DeepSeek 官方 API，以及通过 MCP stdio 接入的 Agora。Agora 是 MA 的本地优先深度适配：它展示真实的模型加载和 MemoryPatch 状态，不会把记忆伪装成一段 prompt。
 
 官网：https://zimoos.github.io/my-agent/
 
-发布页：https://github.com/zimoos/my-agent/releases/tag/v0.1.2-alpha
+发布页：https://github.com/zimoos/my-agent/releases/tag/v0.2.0-alpha.0
 
 [路线图](ROADMAP.md) · [变更记录](CHANGELOG.md) · [参与贡献](CONTRIBUTING.md) · [Discussions](https://github.com/zimoos/my-agent/discussions)
 
