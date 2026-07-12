@@ -37,6 +37,35 @@ test('session store: append writes one JSON line per call and updates messageCou
   assert.equal(meta.messageCount, 2);
 });
 
+test('session store: provider chat truth preserves MA-local Memory batch checkpoint state', () => {
+  const dir = mktmp('sess-');
+  const store = createSessionStore(dir);
+  try {
+    const id = store.create({ createdAt: Date.now(), cwd: '/tmp/project', model: 'agora' });
+    store.updateProviderState(id, {
+      provider_id: 'agora',
+      memory: {
+        status: 'pending',
+        active_batch: { batch_id: 'batch-a' },
+        last_auto_intake_message_end: 12,
+        last_auto_intake_runtime_message_end: 13,
+      },
+    });
+    store.updateProviderState(id, {
+      provider_id: 'agora',
+      agora_session_id: 'chat-a',
+      memory: { status: 'mounted', active_memory_patch_ids: ['patch-a'] },
+    });
+    const state = store.list().find((meta) => meta.id === id)?.providerState;
+    assert.equal(state?.memory?.status, 'mounted');
+    assert.deepEqual(state?.memory?.active_batch, { batch_id: 'batch-a' });
+    assert.equal(state?.memory?.last_auto_intake_message_end, 12);
+    assert.equal(state?.memory?.last_auto_intake_runtime_message_end, 13);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('session store: load round-trips all appended messages', () => {
   const dir = mktmp('sess-');
   const store = createSessionStore(dir);

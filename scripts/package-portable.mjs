@@ -46,8 +46,31 @@ function copyAgoraRuntime(appDir, target) {
   if (manifest.version !== '0.2.0' || manifest.host_protocol_major !== 1) {
     throw new Error(`unexpected Agora contract: ${manifest.version}/host-v${manifest.host_protocol_major}`);
   }
-  if (manifest.files?.['bin/agora'] !== sha256(binaryPath)) {
-    throw new Error('Agora binary SHA-256 does not match manifest');
+  const requiredCapabilities = ['mcp-stdio', 'memory-profile-v2', 'memory-intake-v2'];
+  if (!requiredCapabilities.every((capability) => manifest.capabilities?.includes(capability))) {
+    throw new Error('Agora artifact is missing required Memory v2 capabilities');
+  }
+  for (const [relative, expected] of Object.entries(manifest.files ?? {})) {
+    const target = path.resolve(source, relative);
+    if (!target.startsWith(`${source}${path.sep}`) || !fs.existsSync(target) || sha256(target) !== expected) {
+      throw new Error(`Agora artifact integrity mismatch: ${relative}`);
+    }
+  }
+  const sourceLike = [];
+  const visit = (directory) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const target = path.join(directory, entry.name);
+      if (entry.isDirectory()) visit(target);
+      else if (/\.(py|pyc|js|map)$/i.test(entry.name)) sourceLike.push(path.relative(source, target));
+    }
+  };
+  visit(source);
+  if (sourceLike.length > 0) {
+    throw new Error(`Agora user artifact contains source-like files: ${sourceLike.join(', ')}`);
+  }
+  const packageIntegrity = process.env.MA_AGORA_PACKAGE_INTEGRITY?.trim();
+  if (!packageIntegrity?.startsWith('sha512-')) {
+    throw new Error('macos-arm64 portable release requires MA_AGORA_PACKAGE_INTEGRITY from the exact npm tarball');
   }
   const destination = path.join(appDir, 'resources', 'agora');
   copyRequired(source, destination);
@@ -59,6 +82,7 @@ function copyAgoraRuntime(appDir, target) {
       platform: 'darwin-arm64',
       host_protocol_major: 1,
       native_core_abi: 1,
+      package_integrity: packageIntegrity,
       manifest_sha256: sha256(manifestPath),
     }, null, 2) + '\n',
     'utf8'

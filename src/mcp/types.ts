@@ -122,6 +122,20 @@ export interface ProviderSessionState {
     profile_id?: string;
     binding_id?: string;
     active_memory_patch_ids?: string[];
+    requested_memory_patch_ids?: string[];
+    patchset_revision?: number;
+    mounted_memories?: Array<{
+      memory_id: string;
+      memory_name: string;
+      patch_id: string;
+      patch_name: string;
+      version: string;
+    }>;
+    auto_target_memory_ids?: string[];
+    active_batch?: Record<string, unknown>;
+    last_auto_intake_message_end?: number;
+    last_auto_intake_runtime_message_end?: number;
+    runtime_message_count?: number;
     last_verified_at?: string;
     [key: string]: unknown;
   };

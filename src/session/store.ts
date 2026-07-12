@@ -108,7 +108,13 @@ export function createSessionStore(sessionDir?: string): SessionStore {
   function updateProviderState(sessionId: string, providerState: ProviderSessionState): void {
     const meta = readMeta(metaPath(sessionId));
     if (!meta) return;
-    meta.providerState = providerState;
+    meta.providerState = {
+      ...(meta.providerState ?? {}),
+      ...providerState,
+      ...(meta.providerState?.memory || providerState.memory
+        ? { memory: { ...(meta.providerState?.memory ?? {}), ...(providerState.memory ?? {}) } }
+        : {}),
+    };
     writeMeta(metaPath(sessionId), meta);
   }
 

@@ -1,8 +1,9 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import type {
   ChatCompletion,
@@ -44,6 +45,33 @@ export interface AgoraCapabilities {
   lineageCas: boolean;
   rollback: boolean;
   progress: boolean;
+  memoryV2: boolean;
+  namedMemories: boolean;
+  multiTargetIntake: boolean;
+  incrementalSegments: boolean;
+  multiPatchMount: boolean;
+  requestBoundaryHotSwap: boolean;
+  runtimeMode: 'v2' | 'legacy' | 'unavailable';
+}
+
+export interface AgoraRuntimeContract {
+  runtime_version?: string;
+  host_protocol?: string;
+  host_protocol_major?: number;
+  registry_schema_version?: number;
+  native_core_abi?: number;
+  capabilities?: Record<string, number | boolean | string>;
+  memory_runtime_v2?: { enabled?: boolean; rollback?: string };
+}
+
+export interface AgoraMemory {
+  id: string;
+  name: string;
+  normalized_name?: string;
+  base_model_id: string;
+  head_patch_id?: string | null;
+  status: string;
+  metadata?: Record<string, any>;
 }
 
 export interface AgoraMemoryProfile {
@@ -51,6 +79,7 @@ export interface AgoraMemoryProfile {
   name: string;
   base_model_id: string;
   active_memory_patch_ids: string[];
+  auto_intake_target_memory_ids?: string[];
   writable_patch_family?: string | null;
   auto_intake_policy?: {
     enabled?: boolean;
@@ -71,20 +100,96 @@ export interface AgoraMemoryPatch {
   version: string;
   mountable: boolean;
   status: string;
+  memory_id?: string | null;
+  normalized_name?: string | null;
+  parent_patch_id?: string | null;
+  segment_ids?: string[];
+}
+
+export type AgoraIntakeTargetStatus =
+  | 'queued'
+  | 'compiling'
+  | 'completed'
+  | 'noop'
+  | 'review'
+  | 'conflict'
+  | 'failed';
+
+export interface AgoraMemoryIntakeTarget {
+  mode: 'create' | 'increment';
+  name?: string;
+  memory_id?: string;
+  expected_parent_patch_id?: string | null;
+  output_name: string;
+}
+
+export interface AgoraMemoryIntakeTargetResult {
+  id: string;
+  batch_id: string;
+  mode: 'create' | 'increment';
+  memory_id?: string | null;
+  memory_name?: string | null;
+  output_name: string;
+  expected_parent_patch_id?: string | null;
+  status: AgoraIntakeTargetStatus;
+  output_patch_id?: string | null;
+  error?: { code?: string; message?: string; retryable?: boolean } | null;
+  result?: Record<string, any> | null;
+}
+
+export interface AgoraMemoryIntakeBatchResult {
+  status: string;
+  batch_id: string;
+  batch?: Record<string, any>;
+  targets: AgoraMemoryIntakeTargetResult[];
+}
+
+export class AgoraMcpError extends Error {
+  readonly code?: string;
+  readonly field?: string;
+  readonly retryable?: boolean;
+  readonly payload: Record<string, any>;
+
+  constructor(message: string, payload: Record<string, any>) {
+    super(message);
+    this.name = 'AgoraMcpError';
+    const error = asRecord(payload.error) ?? {};
+    this.code = typeof error.code === 'string'
+      ? error.code
+      : typeof error.type === 'string' ? error.type : undefined;
+    this.field = typeof error.field === 'string' ? error.field : undefined;
+    this.retryable = typeof error.retryable === 'boolean' ? error.retryable : undefined;
+    this.payload = payload;
+  }
 }
 
 export interface AgoraMemoryController {
   getCapabilities(): AgoraCapabilities;
+  getRuntimeContract(): AgoraRuntimeContract | null;
+  updateLocalMemoryState(patch: Record<string, unknown>): void;
+  listMemories(): Promise<AgoraMemory[]>;
+  getMemory(memoryId: string): Promise<AgoraMemory>;
+  createMemory(name: string, id?: string): Promise<AgoraMemory>;
+  renameMemory(memoryId: string, name: string): Promise<AgoraMemory>;
   listProfiles(): Promise<AgoraMemoryProfile[]>;
   listPatches(includeDisabled?: boolean): Promise<AgoraMemoryPatch[]>;
   createProfile(args: Record<string, any>): Promise<Record<string, any>>;
   renameProfile(profileId: string, name: string): Promise<Record<string, any>>;
-  selectProfile(profileId: string, scope?: 'project' | 'conversation'): Promise<Record<string, any>>;
+  selectProfile(profileId: string, scope?: 'user' | 'project' | 'conversation'): Promise<Record<string, any>>;
   applyPatchSelection(profileId: string, patchIds: string[], writableFamily?: string | null): Promise<Record<string, any>>;
+  mountMemories(profileId: string, memoryIds: string[], scope?: 'user' | 'project' | 'conversation'): Promise<Record<string, any>>;
   getIntakeStatus(): Promise<Record<string, any>>;
   startIntake(args?: Record<string, any>): Promise<Record<string, any>>;
   finalizeIntake(jobId: string, profileId: string): Promise<Record<string, any>>;
-  setAutoPolicy(profileId: string, enabled: boolean): Promise<Record<string, any>>;
+  startBatchIntake(args: {
+    targets: AgoraMemoryIntakeTarget[];
+    source_message_start?: number;
+    source_message_end?: number;
+  }): Promise<AgoraMemoryIntakeBatchResult>;
+  getBatchIntake(batchId: string): Promise<AgoraMemoryIntakeBatchResult>;
+  applyCompletedBatch(batch: AgoraMemoryIntakeBatchResult, profileId: string): Promise<Record<string, any>>;
+  setAutoPolicy(profileId: string, enabled: boolean, targetMemoryIds?: string[]): Promise<Record<string, any>>;
+  rollbackMemory(memoryId: string, expectedHeadPatchId: string, targetPatchId: string): Promise<AgoraMemory>;
   listModels(): Promise<Record<string, any>[]>;
   downloadModel(modelId: string, onProgress?: (event: McpProgressEvent) => void): Promise<Record<string, any>>;
   status(args?: Record<string, any>): Promise<AgoraMemoryToolResult>;
@@ -158,12 +263,29 @@ interface ResolvedAgoraCommand {
   command: string;
   args: string[];
   trust: 'verified' | 'unverified';
-  source: 'configured' | 'override' | 'bundled' | 'path';
+  source: 'configured' | 'override' | 'bundled' | 'npm' | 'path';
   lock?: Record<string, any>;
+}
+
+function verifyNativeSignature(command: string): boolean {
+  if (process.platform !== 'darwin') return true;
+  return spawnSync('/usr/bin/codesign', ['--verify', '--strict', '--verbose=2', command], { stdio: 'ignore' }).status === 0;
 }
 
 function sha256File(file: string): string {
   return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+export function verifyAgoraManifestFiles(root: string, manifest: Record<string, any>): boolean {
+  const files = asRecord(manifest.files);
+  if (!files || Object.keys(files).length === 0) return false;
+  const canonicalRoot = path.resolve(root);
+  return Object.entries(files).every(([relative, expected]) => {
+    if (typeof expected !== 'string' || path.isAbsolute(relative)) return false;
+    const target = path.resolve(canonicalRoot, relative);
+    if (!target.startsWith(`${canonicalRoot}${path.sep}`) || !fs.statSync(target, { throwIfNoEntry: false })?.isFile()) return false;
+    return sha256File(target) === expected;
+  });
 }
 
 function verifyBundledAgora(command: string): Record<string, any> | null {
@@ -174,11 +296,43 @@ function verifyBundledAgora(command: string): Record<string, any> | null {
   try {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-    const expected = manifest?.files?.['bin/agora'];
-    if (typeof expected !== 'string' || sha256File(command) !== expected) return null;
+    if (!verifyAgoraManifestFiles(root, manifest)) return null;
     if (manifest.version !== lock.version || manifest.host_protocol_major !== lock.host_protocol_major) return null;
+    if (lock.native_core_abi !== undefined && manifest.native_core_abi !== lock.native_core_abi) return null;
     if (lock.manifest_sha256 && sha256File(manifestPath) !== lock.manifest_sha256) return null;
+    if (!verifyNativeSignature(command)) return null;
     return lock;
+  } catch {
+    return null;
+  }
+}
+
+function resolveInstalledAgoraPackage(): ResolvedAgoraCommand | null {
+  try {
+    const require = createRequire(import.meta.url);
+    const packageJsonPath = require.resolve('@zimoos/agora/package.json');
+    const packageRoot = path.dirname(packageJsonPath);
+    const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+    const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot, 'manifest.json'), 'utf8'));
+    const command = path.join(packageRoot, 'bin', 'agora');
+    const requiredCapabilities = ['mcp-stdio', 'memory-profile-v2', 'memory-intake-v2'];
+    if (
+      packageJson.version !== '0.2.0' ||
+      packageJson.dependencies?.['@zimoos/agora-darwin-arm64'] !== '0.2.0' ||
+      manifest.version !== '0.2.0' ||
+      manifest.host_protocol_major !== 1 ||
+      manifest.native_core_abi !== 1 ||
+      !requiredCapabilities.every((capability) => manifest.capabilities?.includes(capability)) ||
+      !commandExists(command) ||
+      !verifyNativeSignature(command)
+    ) return null;
+    return {
+      command,
+      args: ['mcp', 'serve'],
+      trust: 'verified',
+      source: 'npm',
+      lock: { version: '0.2.0', host_protocol_major: 1, native_core_abi: 1 },
+    };
   } catch {
     return null;
   }
@@ -197,6 +351,9 @@ function resolveAgoraCommand(runtime?: AgoraRuntimeConfig): ResolvedAgoraCommand
     if (!lock) throw new Error(`Bundled Agora failed integrity verification: ${candidate}`);
     return { command: candidate, args: ['mcp', 'serve'], trust: 'verified', source: 'bundled', lock };
   }
+
+  const installed = resolveInstalledAgoraPackage();
+  if (installed) return installed;
 
   if (process.env.MA_AGORA_ALLOW_UNVERIFIED === '1') {
     const pathAgora = findOnPath('agora');
@@ -237,6 +394,10 @@ function defaultProjectId(cwd?: string): string {
   return `${base}-${suffix}`;
 }
 
+export function agoraProjectProfileId(cwd?: string): string {
+  return `ma-project-${defaultProjectId(cwd).toLowerCase().replace(/[^a-z0-9._-]+/g, '-')}`;
+}
+
 function toStringList(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
@@ -262,7 +423,10 @@ function normalizeToolCalls(value: unknown): ChatCompletionMessageToolCall[] | u
   return out.length > 0 ? out : undefined;
 }
 
-function stateFromChatPayload(payload: Record<string, any>): ProviderSessionState {
+function stateFromChatPayload(
+  payload: Record<string, any>,
+  requestedPatchIds?: string[] | null
+): ProviderSessionState {
   const metadata = payload.metadata && typeof payload.metadata === 'object' ? payload.metadata : {};
   const memory =
     payload.memory && typeof payload.memory === 'object'
@@ -284,8 +448,17 @@ function stateFromChatPayload(payload: Record<string, any>): ProviderSessionStat
   const bindingId = typeof memory.binding_id === 'string' ? memory.binding_id : undefined;
   const enabled = typeof memory.enabled === 'boolean' ? memory.enabled : undefined;
   const reason = typeof memory.reason === 'string' ? memory.reason : undefined;
+  const runtime = asRecord(payload.memory_runtime) ?? asRecord(metadata.memory_runtime) ?? {};
+  const revision = Number(runtime.patchset_revision);
+  const requested = requestedPatchIds ? [...requestedPatchIds] : undefined;
+  const matchesRequest = requested === undefined || (
+    requested.length === activePatchIds.length &&
+    requested.every((id, index) => id === activePatchIds[index])
+  );
   const status = enabled === false
     ? 'disabled'
+    : !matchesRequest
+      ? 'stale'
     : activePatchIds.length > 0
       ? 'mounted'
       : profileId
@@ -305,6 +478,8 @@ function stateFromChatPayload(payload: Record<string, any>): ProviderSessionStat
       profile_id: profileId,
       binding_id: bindingId,
       active_memory_patch_ids: activePatchIds,
+      ...(requested ? { requested_memory_patch_ids: requested } : {}),
+      ...(Number.isFinite(revision) ? { patchset_revision: revision } : {}),
       enabled,
       reason,
       last_verified_at: verifiedAt,
@@ -431,6 +606,9 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
   private selectedProfileId: string | null = null;
   private doctorPayload: Record<string, any> | null = null;
   private modelsPayload: Record<string, any> | null = null;
+  private runtimeContract: AgoraRuntimeContract | null = null;
+  private requestedPatchIds: string[] | null = null;
+  private requestedAfterRevision: number | null = null;
   private runtimeTrust: 'verified' | 'unverified' = 'unverified';
   private runtimeSource = 'unknown';
 
@@ -455,6 +633,14 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
 
   getCapabilities(): AgoraCapabilities {
     const has = (name: string) => this.toolNames.has(name);
+    const contract = this.runtimeContract?.capabilities ?? {};
+    const enabled = (name: string) => contract[name] === 1 || contract[name] === true;
+    const namedMemories = has('memories_create') && has('memories_list') && has('memories_rename') && enabled('named_memories');
+    const multiTargetIntake = has('memory_intake_batch_run') && has('memory_intake_batch_get') && enabled('multi_target_intake');
+    const incrementalSegments = enabled('incremental_segments');
+    const multiPatchMount = enabled('multi_model_delta_mount');
+    const requestBoundaryHotSwap = enabled('request_boundary_hot_swap');
+    const memoryV2 = namedMemories && multiTargetIntake && incrementalSegments && multiPatchMount && requestBoundaryHotSwap && has('memories_rollback');
     return {
       chat: has('chat_complete'),
       modelCatalog: has('models_list') && has('models_status'),
@@ -467,6 +653,28 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
       lineageCas: has('memory_lineage_advance'),
       rollback: has('memory_patch_versions'),
       progress: true,
+      memoryV2,
+      namedMemories,
+      multiTargetIntake,
+      incrementalSegments,
+      multiPatchMount,
+      requestBoundaryHotSwap,
+      runtimeMode: memoryV2
+        ? 'v2'
+        : has('memory_intake_run') && has('memory_profiles_update') ? 'legacy' : 'unavailable',
+    };
+  }
+
+  getRuntimeContract(): AgoraRuntimeContract | null {
+    return this.runtimeContract ? { ...this.runtimeContract } : null;
+  }
+
+  updateLocalMemoryState(patch: Record<string, unknown>): void {
+    this.lastState = {
+      ...(this.lastState ?? { provider_id: 'agora' }),
+      memory: { ...(this.lastState?.memory ?? {}), ...patch },
+      runtime_trust: this.runtimeTrust,
+      runtime_source: this.runtimeSource,
     };
   }
 
@@ -476,6 +684,40 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
 
   getMemoryController(): AgoraMemoryController | null {
     return this.toolNames.has('chat_complete') ? this : null;
+  }
+
+  async listMemories(): Promise<AgoraMemory[]> {
+    this.requireV2();
+    const payload = await this.callJsonTool('memories_list', { base_model_id: this.model.model });
+    return Array.isArray(payload.memories) ? payload.memories as AgoraMemory[] : [];
+  }
+
+  async getMemory(memoryId: string): Promise<AgoraMemory> {
+    this.requireV2();
+    const payload = await this.callJsonTool('memories_get', { memory_id: memoryId });
+    const memory = asRecord(payload.memory);
+    if (!memory) throw new Error(`Agora did not return Memory: ${memoryId}`);
+    return memory as unknown as AgoraMemory;
+  }
+
+  async createMemory(name: string, id?: string): Promise<AgoraMemory> {
+    this.requireV2();
+    const payload = await this.callJsonTool('memories_create', {
+      ...(id ? { id } : {}),
+      name,
+      base_model_id: this.model.model,
+    });
+    const memory = asRecord(payload.memory);
+    if (!memory) throw new Error('Agora did not return the created Memory');
+    return memory as unknown as AgoraMemory;
+  }
+
+  async renameMemory(memoryId: string, name: string): Promise<AgoraMemory> {
+    this.requireV2();
+    const payload = await this.callJsonTool('memories_rename', { memory_id: memoryId, name });
+    const memory = asRecord(payload.memory);
+    if (!memory) throw new Error(`Agora did not return renamed Memory: ${memoryId}`);
+    return memory as unknown as AgoraMemory;
   }
 
   async listProfiles(): Promise<AgoraMemoryProfile[]> {
@@ -501,11 +743,12 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
       name: typeof args.name === 'string' && args.name.trim() ? args.name.trim() : profileId,
       base_model_id: this.model.model,
       active_memory_patch_ids: this.patchIdsFromArgs(args),
+      auto_intake_target_memory_ids: toStringList(args.auto_intake_target_memory_ids),
       writable_patch_family: typeof args.writable_patch_family === 'string' ? args.writable_patch_family : undefined,
       auto_intake_policy: args.auto_intake_policy ?? { enabled: false },
       memory_enabled: args.memory_enabled !== false,
     });
-    await this.ensureBinding(profileId, args.scope === 'conversation' ? 'conversation' : 'project');
+    await this.ensureBinding(profileId, args.scope === 'conversation' ? 'conversation' : args.scope === 'user' ? 'user' : 'project');
     this.selectedProfileId = profileId;
     return payload;
   }
@@ -517,7 +760,7 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
 
   async selectProfile(
     profileId: string,
-    scope: 'project' | 'conversation' = 'project'
+    scope: 'user' | 'project' | 'conversation' = 'project'
   ): Promise<Record<string, any>> {
     const profiles = await this.listProfiles();
     const profile = profiles.find((item) => item.id === profileId);
@@ -536,12 +779,46 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
     const updated = await this.callJsonTool('memory_profiles_update', {
       profile_id: profileId,
       active_memory_patch_ids: patchIds,
-      writable_patch_family: writableFamily ?? null,
+      ...(this.getCapabilities().memoryV2 ? {} : { writable_patch_family: writableFamily ?? null }),
       memory_enabled: true,
     });
     await this.ensureBinding(profileId, 'project');
     this.selectedProfileId = profileId;
+    this.markPatchSelectionPending(profileId, patchIds);
     return { ...updated, mount_status: 'pending_next_chat' };
+  }
+
+  async mountMemories(
+    profileId: string,
+    memoryIds: string[],
+    scope: 'user' | 'project' | 'conversation' = 'project'
+  ): Promise<Record<string, any>> {
+    this.requireV2();
+    const baseProfileId = profileId.split('--conversation-')[0].replace(/--user-default$/, '');
+    const effectiveProfileId = scope === 'conversation'
+      ? `${baseProfileId}--conversation-${this.safeScopeId(this.model.agoraMemory?.conversationId || this.context.sessionId || 'default')}`
+      : scope === 'user' ? `${baseProfileId}--user-default` : baseProfileId;
+    const [memories, patches] = await Promise.all([this.listMemories(), this.listPatches(true)]);
+    const selected = memoryIds.map((memoryId) => {
+      const memory = memories.find((item) => item.id === memoryId);
+      if (!memory) throw new Error(`Memory not found: ${memoryId}`);
+      if (!memory.head_patch_id) throw new Error(`Memory has no compiled version yet: ${memory.name}`);
+      const patch = patches.find((item) => item.id === memory.head_patch_id);
+      if (!patch?.mountable) throw new Error(`Memory version is not mountable: ${memory.name}`);
+      if (patch.base_model_id !== this.model.model) throw new Error(`Memory is incompatible with model ${this.model.model}: ${memory.name}`);
+      return patch.id;
+    });
+    await this.upsertProfile(effectiveProfileId, selected, true);
+    const bindingId = await this.ensureBinding(effectiveProfileId, scope);
+    this.selectedProfileId = effectiveProfileId;
+    this.markPatchSelectionPending(effectiveProfileId, selected, bindingId);
+    return {
+      profile_id: effectiveProfileId,
+      binding_id: bindingId,
+      memory_ids: memoryIds,
+      active_memory_patch_ids: selected,
+      mount_status: 'pending_next_chat',
+    };
   }
 
   async getIntakeStatus(): Promise<Record<string, any>> {
@@ -604,15 +881,87 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
     return { ...advanced, outcome: 'activated', mount_status: 'pending_next_chat' };
   }
 
-  async setAutoPolicy(profileId: string, enabled: boolean): Promise<Record<string, any>> {
+  async startBatchIntake(args: {
+    targets: AgoraMemoryIntakeTarget[];
+    source_message_start?: number;
+    source_message_end?: number;
+  }): Promise<AgoraMemoryIntakeBatchResult> {
+    this.requireV2();
+    if (!Array.isArray(args.targets) || args.targets.length === 0) {
+      throw new Error('Memory intake requires at least one explicit target');
+    }
+    const payload = await this.callJsonTool('memory_intake_batch_run', {
+      session_id: this.requireSessionId(),
+      targets: args.targets,
+      ...(Number.isInteger(args.source_message_start) ? { source_message_start: args.source_message_start } : {}),
+      ...(Number.isInteger(args.source_message_end) ? { source_message_end: args.source_message_end } : {}),
+    });
+    return this.normalizeBatch(payload);
+  }
+
+  async getBatchIntake(batchId: string): Promise<AgoraMemoryIntakeBatchResult> {
+    this.requireV2();
+    return this.normalizeBatch(await this.callJsonTool('memory_intake_batch_get', { batch_id: batchId }));
+  }
+
+  async applyCompletedBatch(
+    batch: AgoraMemoryIntakeBatchResult,
+    profileId: string
+  ): Promise<Record<string, any>> {
+    this.requireV2();
+    const completed = batch.targets.filter((target) => target.status === 'completed' && target.output_patch_id);
+    if (completed.length === 0) {
+      return { outcome: 'no_completed_targets', targets: batch.targets };
+    }
+    const [profiles, patches] = await Promise.all([this.listProfiles(), this.listPatches(true)]);
+    const profile = profiles.find((item) => item.id === profileId);
+    if (!profile) throw new Error(`memory profile not found: ${profileId}`);
+    const completedByMemory = new Map<string, string>();
+    for (const target of completed) {
+      if (target.memory_id && target.output_patch_id) completedByMemory.set(target.memory_id, target.output_patch_id);
+    }
+    const nextIds: string[] = [];
+    for (const patchId of profile.active_memory_patch_ids) {
+      const patch = patches.find((item) => item.id === patchId);
+      const replacement = patch?.memory_id ? completedByMemory.get(patch.memory_id) : undefined;
+      nextIds.push(replacement ?? patchId);
+      if (patch?.memory_id) completedByMemory.delete(patch.memory_id);
+    }
+    nextIds.push(...completedByMemory.values());
+    const mounted = await this.applyPatchSelection(profileId, Array.from(new Set(nextIds)));
+    return { ...mounted, outcome: 'completed_targets_selected', targets: batch.targets };
+  }
+
+  async setAutoPolicy(
+    profileId: string,
+    enabled: boolean,
+    targetMemoryIds?: string[]
+  ): Promise<Record<string, any>> {
     this.requireTools('memory_profiles_update');
     const profiles = await this.listProfiles();
     const profile = profiles.find((item) => item.id === profileId);
     if (!profile) throw new Error(`memory profile not found: ${profileId}`);
     return this.callJsonTool('memory_profiles_update', {
       profile_id: profileId,
+      ...(targetMemoryIds ? { auto_intake_target_memory_ids: targetMemoryIds } : {}),
       auto_intake_policy: { ...profile.auto_intake_policy, enabled },
     });
+  }
+
+  async rollbackMemory(
+    memoryId: string,
+    expectedHeadPatchId: string,
+    targetPatchId: string
+  ): Promise<AgoraMemory> {
+    this.requireV2();
+    const payload = await this.callJsonTool('memories_rollback', {
+      memory_id: memoryId,
+      expected_head_patch_id: expectedHeadPatchId,
+      target_patch_id: targetPatchId,
+    });
+    const memory = asRecord(payload.memory);
+    if (!memory) throw new Error(`Agora did not return rolled back Memory: ${memoryId}`);
+    return memory as unknown as AgoraMemory;
   }
 
   async listModels(): Promise<Record<string, any>[]> {
@@ -668,6 +1017,7 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
           models: this.modelsPayload,
           runtime_trust: this.runtimeTrust,
           runtime_source: this.runtimeSource,
+          runtime_contract: this.runtimeContract,
         },
         null,
         2
@@ -680,6 +1030,15 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
     try {
       this.ensureMemoryReady();
       const profileId = this.resolveProfileId(args);
+      const memoryIds = toStringList(args.memory_ids);
+      if (this.getCapabilities().memoryV2 && Array.isArray(args.memory_ids)) {
+        const mounted = await this.mountMemories(
+          profileId,
+          memoryIds,
+          args.scope === 'conversation' ? 'conversation' : args.scope === 'user' ? 'user' : 'project'
+        );
+        return this.ok({ action: 'mount', ...mounted });
+      }
       const patchIds = this.patchIdsFromArgs(args);
       await this.upsertProfile(
         profileId,
@@ -697,6 +1056,7 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
         args.scope === 'conversation' ? 'conversation' : 'project'
       );
       this.selectedProfileId = profileId;
+      this.markPatchSelectionPending(profileId, patchIds, bindingId);
       return this.ok({
         action: 'mount',
         profile_id: profileId,
@@ -714,6 +1074,7 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
       const profileId = this.resolveProfileId(args);
       await this.upsertProfile(profileId, undefined, false);
       this.selectedProfileId = profileId;
+      this.markPatchSelectionPending(profileId, []);
       return this.ok({
         action: 'disable',
         profile_id: profileId,
@@ -726,6 +1087,21 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
 
   async internalize(args: Record<string, any>): Promise<AgoraMemoryToolResult> {
     try {
+      if (this.getCapabilities().memoryV2) {
+        const targets = Array.isArray(args.targets) ? args.targets as AgoraMemoryIntakeTarget[] : [];
+        const batch = await this.startBatchIntake({
+          targets,
+          ...(Number.isInteger(args.source_message_start) ? { source_message_start: args.source_message_start } : {}),
+          ...(Number.isInteger(args.source_message_end) ? { source_message_end: args.source_message_end } : {}),
+        });
+        return this.ok({
+          action: 'internalize',
+          status: batch.status,
+          batch_id: batch.batch_id,
+          targets: batch.targets,
+          message: 'Memory intake is running in the background; use /memory status to inspect progress.',
+        });
+      }
       const submitted = await this.startIntake(args);
       const jobId = typeof submitted.job_id === 'string' ? submitted.job_id : submitted.job?.id;
       if (typeof jobId !== 'string' || !jobId) throw new Error('memory_intake_run did not return job_id');
@@ -746,6 +1122,16 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
   async rollback(args: Record<string, any>): Promise<AgoraMemoryToolResult> {
     try {
       this.ensureMemoryReady();
+      if (this.getCapabilities().memoryV2) {
+        const memoryId = String(args.memory_id ?? '').trim();
+        const expectedHeadPatchId = String(args.expected_head_patch_id ?? '').trim();
+        const targetPatchId = String(args.target_patch_id ?? args.patch_id ?? '').trim();
+        if (!memoryId || !expectedHeadPatchId || !targetPatchId) {
+          throw new Error('rollback requires memory_id, expected_head_patch_id, and target_patch_id');
+        }
+        const memory = await this.rollbackMemory(memoryId, expectedHeadPatchId, targetPatchId);
+        return this.ok({ action: 'rollback', memory, mount_status: 'pending_explicit_mount' });
+      }
       const profileId = this.resolveProfileId(args);
       const targetPatchId = typeof args.patch_id === 'string' && args.patch_id.trim()
         ? args.patch_id.trim()
@@ -805,10 +1191,16 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
         this.resources = [];
       }
       this.doctorPayload = await this.callJsonTool('doctor', {}, undefined, false);
+      if (this.toolNames.has('runtime_capabilities')) {
+        const capabilityPayload = await this.callJsonTool('runtime_capabilities', {}, undefined, false);
+        this.runtimeContract = (asRecord(capabilityPayload.contract) ?? capabilityPayload) as AgoraRuntimeContract;
+      } else {
+        this.runtimeContract = asRecord(this.doctorPayload.contract) as AgoraRuntimeContract | null;
+      }
       if (command.trust === 'verified') {
         const expectedVersion = command.lock?.version;
-        const actualVersion = this.doctorPayload.version;
-        const actualMajor = this.doctorPayload.contract?.host_protocol_major;
+        const actualVersion = this.runtimeContract?.runtime_version ?? this.doctorPayload.version;
+        const actualMajor = this.runtimeContract?.host_protocol_major;
         if (actualVersion !== expectedVersion || actualMajor !== command.lock?.host_protocol_major) {
           throw new Error(
             `Agora runtime contract mismatch: expected ${expectedVersion}/host-v${command.lock?.host_protocol_major}, ` +
@@ -833,6 +1225,16 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
     const missing = names.filter((name) => !this.toolNames.has(name));
     if (missing.length > 0) {
       throw new Error(`Agora capability unavailable: ${missing.join(', ')}`);
+    }
+  }
+
+  private requireV2(): void {
+    const capabilities = this.getCapabilities();
+    if (!capabilities.memoryV2) {
+      throw new Error(
+        `Agora Memory Runtime v2 is unavailable (runtime mode: ${capabilities.runtimeMode}). ` +
+        'Named Memory, multi-target intake, incremental segments, multi-patch mount, hot swap, and rollback are required.'
+      );
     }
   }
 
@@ -867,7 +1269,7 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
       throw new Error(`Agora MCP tool ${toolName} returned invalid JSON payload`);
     }
     const record = payload as Record<string, any>;
-    if (isErrorPayload(record)) throw new Error(errorText(record));
+    if (isErrorPayload(record)) throw new AgoraMcpError(errorText(record), record);
     return record;
   }
 
@@ -898,7 +1300,38 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
         ? (event) => options.onEvent?.(providerProgressFromMcp(event))
         : undefined
     );
-    this.lastState = stateFromChatPayload(payload);
+    const requestedPatchIds = this.requestedPatchIds;
+    const localMemoryState = this.lastState?.memory;
+    this.lastState = stateFromChatPayload(payload, requestedPatchIds);
+    this.lastState.memory = {
+      ...(localMemoryState?.active_batch !== undefined ? { active_batch: localMemoryState.active_batch } : {}),
+      ...(localMemoryState?.last_auto_intake_message_end !== undefined
+        ? { last_auto_intake_message_end: localMemoryState.last_auto_intake_message_end } : {}),
+      ...(localMemoryState?.last_auto_intake_runtime_message_end !== undefined
+        ? { last_auto_intake_runtime_message_end: localMemoryState.last_auto_intake_runtime_message_end } : {}),
+      ...(this.lastState.memory ?? {}),
+      runtime_message_count: Array.isArray(rawRequest.messages) ? rawRequest.messages.length : 0,
+    };
+    const activePatchIds = this.lastState.memory?.active_memory_patch_ids ?? [];
+    const revision = this.lastState.memory?.patchset_revision;
+    const revisionAdvanced = this.requestedAfterRevision === null || (
+      typeof revision === 'number' && revision > this.requestedAfterRevision
+    );
+    if (
+      requestedPatchIds &&
+      requestedPatchIds.length === activePatchIds.length &&
+      requestedPatchIds.every((id, index) => id === activePatchIds[index]) &&
+      revisionAdvanced
+    ) {
+      this.requestedPatchIds = null;
+      this.requestedAfterRevision = null;
+      delete this.lastState.memory?.requested_memory_patch_ids;
+    } else if (requestedPatchIds) {
+      this.lastState.memory = { ...(this.lastState.memory ?? {}), status: 'stale' };
+    }
+    if (this.getCapabilities().memoryV2 && activePatchIds.length > 0) {
+      await this.hydrateMountedMemories(activePatchIds);
+    }
     this.lastState.runtime_trust = this.runtimeTrust;
     this.lastState.runtime_source = this.runtimeSource;
     return payload;
@@ -1040,27 +1473,111 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
     });
   }
 
+  private markPatchSelectionPending(
+    profileId: string,
+    patchIds: string[],
+    bindingId?: string
+  ): void {
+    const previousActive = this.lastState?.memory?.active_memory_patch_ids ?? [];
+    const changed = previousActive.length !== patchIds.length || previousActive.some((id, index) => id !== patchIds[index]);
+    this.requestedPatchIds = [...patchIds];
+    this.requestedAfterRevision = changed && typeof this.lastState?.memory?.patchset_revision === 'number'
+      ? this.lastState.memory.patchset_revision
+      : null;
+    const previous = this.lastState;
+    this.lastState = {
+      provider_id: 'agora',
+      ...(previous?.agora_session_id ? { agora_session_id: previous.agora_session_id } : {}),
+      memory: {
+        ...(previous?.memory ?? {}),
+        status: 'pending',
+        profile_id: profileId,
+        ...(bindingId ? { binding_id: bindingId } : {}),
+        active_memory_patch_ids: previous?.memory?.active_memory_patch_ids ?? [],
+        requested_memory_patch_ids: [...patchIds],
+      },
+      runtime_trust: this.runtimeTrust,
+      runtime_source: this.runtimeSource,
+    };
+  }
+
+  private async hydrateMountedMemories(activePatchIds: string[]): Promise<void> {
+    try {
+      const [memories, patches, profiles] = await Promise.all([
+        this.listMemories(),
+        this.listPatches(true),
+        this.listProfiles(),
+      ]);
+      const mounted = activePatchIds.flatMap((patchId) => {
+        const patch = patches.find((item) => item.id === patchId);
+        const memory = patch?.memory_id ? memories.find((item) => item.id === patch.memory_id) : undefined;
+        if (!patch || !memory) return [];
+        return [{
+          memory_id: memory.id,
+          memory_name: memory.name,
+          patch_id: patch.id,
+          patch_name: patch.name,
+          version: patch.version,
+        }];
+      });
+      const profileId = this.lastState?.memory?.profile_id;
+      const profile = profiles.find((item) => item.id === profileId);
+      if (this.lastState?.memory) {
+        this.lastState.memory.mounted_memories = mounted;
+        this.lastState.memory.auto_target_memory_ids = profile?.auto_intake_target_memory_ids ?? [];
+      }
+    } catch {
+      // Chat truth remains valid even if the user-facing catalog cannot be hydrated.
+    }
+  }
+
+  private normalizeBatch(payload: Record<string, any>): AgoraMemoryIntakeBatchResult {
+    const batch = asRecord(payload.batch) ?? {};
+    const batchId = String(payload.batch_id ?? batch.id ?? '').trim();
+    if (!batchId) throw new Error('Agora did not return a Memory intake batch id');
+    const rawTargets = Array.isArray(payload.targets) ? payload.targets : [];
+    return {
+      status: String(payload.status ?? batch.status ?? 'unknown'),
+      batch_id: batchId,
+      batch,
+      targets: rawTargets
+        .filter((target): target is Record<string, any> => Boolean(asRecord(target)))
+        .map((target) => ({
+          ...target,
+          id: String(target.id ?? ''),
+          batch_id: String(target.batch_id ?? batchId),
+          mode: target.mode === 'create' ? 'create' : 'increment',
+          output_name: String(target.output_name ?? target.memory_name ?? ''),
+          status: String(target.status ?? 'queued') as AgoraIntakeTargetStatus,
+        })),
+    };
+  }
+
   private async ensureBinding(
     profileId: string,
-    scope: 'project' | 'conversation' = 'project'
+    scope: 'user' | 'project' | 'conversation' = 'project'
   ): Promise<string | undefined> {
     const metadata = this.buildMetadata(undefined, { memory_profile: profileId });
     const listed = await this.callJsonTool('memory_profile_bindings_list', { profile_id: profileId });
     const bindings = Array.isArray(listed.bindings) ? listed.bindings : [];
     const match = bindings.find((binding: any) => {
       if (binding?.scope_type !== scope || binding?.user_id !== metadata.user_id) return false;
-      if (binding?.project_id !== metadata.project_id) return false;
-      return scope === 'project' || binding?.conversation_id === metadata.conversation_id;
+      if (scope !== 'user' && binding?.project_id !== metadata.project_id) return false;
+      return scope !== 'conversation' || binding?.conversation_id === metadata.conversation_id;
     });
     if (match?.id) return String(match.id);
     const created = await this.callJsonTool('memory_profile_bindings_create', {
       profile_id: profileId,
       scope_type: scope,
       user_id: metadata.user_id,
-      project_id: metadata.project_id,
+      ...(scope !== 'user' ? { project_id: metadata.project_id } : {}),
       ...(scope === 'conversation' ? { conversation_id: metadata.conversation_id } : {}),
     });
     return typeof created.binding?.id === 'string' ? created.binding.id : undefined;
+  }
+
+  private safeScopeId(value: string): string {
+    return value.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'default';
   }
 
   private async resolveRollbackPatchId(): Promise<string | null> {

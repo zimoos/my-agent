@@ -145,7 +145,7 @@ User-facing slash commands:
 | Command | Purpose |
 | --- | --- |
 | `/model` | Open the model/profile picker |
-| `/memory` | Manage named profiles, patch selection, writable memory, automatic intake, and rollback |
+| `/memory` | Manage named Memories, multi-memory mounts, multi-target intake, automatic policy, and rollback |
 | `/help` | Show user-facing commands |
 | `/clear` | Clear current conversation |
 | `/exit` | Exit MA |
@@ -184,9 +184,9 @@ DeepSeek/deepseek-v4-flash
 
 MA can run Agora as a provider-owned MCP stdio subprocess instead of asking users to manage a local HTTP server. The TUI reports real provider stages such as local-model loading, memory mounting, and generation.
 
-When the active provider is Agora, MA can expose verified MemoryPatch operations: mount, disable, internalize, roll back, and inspect state. MA treats a memory module as active only after Agora returns matching response metadata; it never fakes memory by injecting facts into a prompt.
+When the active provider is Agora, users operate uniquely named, independently versioned Memories; MemoryPatch is the immutable version object. MA reports `mounted` only after a later Agora response returns the requested ordered Patch ids and an advanced PatchSet revision. It never fakes memory by injecting facts into a prompt.
 
-`/memory` controls named MemoryProfiles stored in Agora. A profile may mount one writable family plus multiple read-only overlays. Automatic intake advances only the writable family, preserves overlays, and runs in the background after 4 new user turns or about 2,000 pending tokens and 60 seconds of idle time.
+`/memory` can mount zero or more Memories per project or conversation and hot-swap them at the next request boundary without restarting the base model. One intake batch may mix a new Memory with increments to multiple existing Memories; the source is extracted once and each target reports completed/noop/review/conflict/failed independently. Automatic intake requires explicit targets and runs after 4 new user turns or about 2,000 pending tokens plus 60 seconds of idle time. Failed targets can be retried alone or explicitly abandoned without blocking input or adding transcript noise.
 
 Context Usage remains independent from MemoryPatch state: the TUI continues to show used/trigger/window/source from `agent.getContextUsage()`. Internalization never clears context, and compaction never claims to internalize memory.
 

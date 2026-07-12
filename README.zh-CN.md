@@ -144,7 +144,7 @@ ESC ESC    切换历史会话
 | 指令 | 用途 |
 | --- | --- |
 | `/model` | 打开模型/profile 选择器 |
-| `/memory` | 管理命名 Profile、Patch 多选、主记忆、自动内化和回滚 |
+| `/memory` | 管理具名 Memory、多记忆挂载、多目标内化、自动策略和回滚 |
 | `/help` | 查看用户可用指令 |
 | `/clear` | 清空当前对话 |
 | `/exit` | 退出 MA |
@@ -183,9 +183,9 @@ DeepSeek/deepseek-v4-flash
 
 MA 可以把 Agora 作为 provider 自己管理的 MCP stdio 子进程运行，不要求用户维护本地 HTTP 服务。TUI 会展示真实的本地模型加载、记忆挂载和生成阶段。
 
-当 Agora 是当前 provider 时，MA 会提供经过验证的 MemoryPatch 操作：挂载、停用、内化、回滚和状态查看。只有 Agora 响应 metadata 返回匹配的状态，MA 才会说明记忆已生效；不会把一段事实塞进 prompt 伪装成记忆。
+当 Agora 是当前 provider 时，用户操作的是名称唯一、可持续迭代的 Memory；MemoryPatch 是它的不可变版本。只有下一次 Agora 响应 metadata 返回相同的 ordered Patch ids 和更新后的 PatchSet revision，MA 才会显示 `mounted`；不会把一段事实塞进 prompt 伪装成记忆。
 
-`/memory` 直接控制 Agora registry 中的命名 MemoryProfile。一个 Profile 可以挂载一个可写主记忆 family 和多个只读 overlay；自动内化只推进主 family，overlay 不会被覆盖。默认资格阈值是 4 个新增用户回合或约 2000 pending tokens，并在空闲 60 秒后后台运行，不阻塞输入。
+`/memory` 可在项目或单个会话中同时挂载 0～N 个 Memory，并在下一次请求边界热拔插，不重启基座。内化时可以在一个 batch 中混合“新建 Memory”和“增量到多个旧 Memory”；同一 source 只提取一次，各目标独立报告 completed/noop/review/conflict/failed。自动内化必须显式选择目标，默认在 4 个新增用户回合或约 2000 pending tokens、空闲 60 秒后运行；失败目标可单独重试或明确放弃，输入框和 transcript 不受影响。
 
 Context Usage 与 MemoryPatch 是两条独立状态：底栏始终从 `agent.getContextUsage()` 显示 used/trigger/window/source；内化不会清空 context，compact 也不会冒充记忆内化。
 
