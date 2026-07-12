@@ -10,6 +10,7 @@
   "files": [
     "dist",
     "bin",
+    "scripts/fix-node-pty.mjs",
     "README.md",
     "README.zh-CN.md",
     "LICENSE"
