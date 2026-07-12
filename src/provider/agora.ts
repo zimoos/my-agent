@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 import type {
   ChatCompletion,
   ChatCompletionCreateParamsNonStreaming,
@@ -31,7 +32,61 @@ export interface AgoraMemoryToolResult {
   isError: boolean;
 }
 
+export interface AgoraCapabilities {
+  chat: boolean;
+  modelCatalog: boolean;
+  modelDownload: boolean;
+  profileRead: boolean;
+  profileWrite: boolean;
+  patchCatalog: boolean;
+  mount: boolean;
+  intake: boolean;
+  lineageCas: boolean;
+  rollback: boolean;
+  progress: boolean;
+}
+
+export interface AgoraMemoryProfile {
+  id: string;
+  name: string;
+  base_model_id: string;
+  active_memory_patch_ids: string[];
+  writable_patch_family?: string | null;
+  auto_intake_policy?: {
+    enabled?: boolean;
+    min_user_turns?: number;
+    min_pending_tokens?: number;
+    idle_seconds?: number;
+    activation_mode?: 'auto' | 'review';
+  };
+  memory_enabled?: boolean;
+  status?: string;
+}
+
+export interface AgoraMemoryPatch {
+  id: string;
+  name: string;
+  base_model_id: string;
+  family: string;
+  version: string;
+  mountable: boolean;
+  status: string;
+}
+
 export interface AgoraMemoryController {
+  getCapabilities(): AgoraCapabilities;
+  listProfiles(): Promise<AgoraMemoryProfile[]>;
+  listPatches(includeDisabled?: boolean): Promise<AgoraMemoryPatch[]>;
+  createProfile(args: Record<string, any>): Promise<Record<string, any>>;
+  renameProfile(profileId: string, name: string): Promise<Record<string, any>>;
+  selectProfile(profileId: string, scope?: 'project' | 'conversation'): Promise<Record<string, any>>;
+  applyPatchSelection(profileId: string, patchIds: string[], writableFamily?: string | null): Promise<Record<string, any>>;
+  getIntakeStatus(): Promise<Record<string, any>>;
+  startIntake(args?: Record<string, any>): Promise<Record<string, any>>;
+  finalizeIntake(jobId: string, profileId: string): Promise<Record<string, any>>;
+  setAutoPolicy(profileId: string, enabled: boolean): Promise<Record<string, any>>;
+  listModels(): Promise<Record<string, any>[]>;
+  downloadModel(modelId: string, onProgress?: (event: McpProgressEvent) => void): Promise<Record<string, any>>;
   status(args?: Record<string, any>): Promise<AgoraMemoryToolResult>;
   mount(args: Record<string, any>): Promise<AgoraMemoryToolResult>;
   disable(args: Record<string, any>): Promise<AgoraMemoryToolResult>;
@@ -40,28 +95,10 @@ export interface AgoraMemoryController {
 }
 
 const REQUIRED_TOOLS = new Set(['doctor', 'models_list', 'chat_complete']);
-const REQUIRED_MEMORY_TOOLS = new Set([
-  'memory_profiles_list',
-  'memory_profiles_create',
-  'memory_profiles_update',
-  'memory_profile_bindings_list',
-  'memory_profile_bindings_create',
-  'memory_sources_create',
-  'memory_sources_list',
-  'memory_sources_get',
-  'memory_intake_run',
-  'memory_intake_get',
-  'memory_patch_versions',
-]);
-
 const TERMINAL_INTAKE_STATUSES = new Set(['completed', 'failed']);
 const DEFAULT_AGORA_MAX_TOKENS = 4096;
 const AGORA_TIMEOUT_CAP_SECONDS = 300;
 const AGORA_TIMEOUT_HEADROOM_MS = 5000;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function stringifyArgs(value: unknown): string {
   if (typeof value === 'string') return value;
@@ -117,25 +154,57 @@ function bundledAgoraCandidates(): string[] {
   ];
 }
 
-function resolveAgoraCommand(runtime?: AgoraRuntimeConfig): { command: string; args: string[] } {
+interface ResolvedAgoraCommand {
+  command: string;
+  args: string[];
+  trust: 'verified' | 'unverified';
+  source: 'configured' | 'override' | 'bundled' | 'path';
+  lock?: Record<string, any>;
+}
+
+function sha256File(file: string): string {
+  return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+function verifyBundledAgora(command: string): Record<string, any> | null {
+  const root = path.dirname(path.dirname(command));
+  const manifestPath = path.join(root, 'manifest.json');
+  const lockPath = path.join(root, 'runtime-lock.json');
+  if (!fs.existsSync(manifestPath) || !fs.existsSync(lockPath)) return null;
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    const expected = manifest?.files?.['bin/agora'];
+    if (typeof expected !== 'string' || sha256File(command) !== expected) return null;
+    if (manifest.version !== lock.version || manifest.host_protocol_major !== lock.host_protocol_major) return null;
+    if (lock.manifest_sha256 && sha256File(manifestPath) !== lock.manifest_sha256) return null;
+    return lock;
+  } catch {
+    return null;
+  }
+}
+
+function resolveAgoraCommand(runtime?: AgoraRuntimeConfig): ResolvedAgoraCommand {
   const configured = runtime?.command?.trim();
-  if (configured) return { command: configured, args: runtime?.args ?? ['mcp', 'serve'] };
+  if (configured) return { command: configured, args: runtime?.args ?? ['mcp', 'serve'], trust: 'unverified', source: 'configured' };
 
   const envCommand = process.env.MA_AGORA_COMMAND?.trim();
-  if (envCommand) return { command: envCommand, args: runtime?.args ?? ['mcp', 'serve'] };
+  if (envCommand) return { command: envCommand, args: runtime?.args ?? ['mcp', 'serve'], trust: 'unverified', source: 'override' };
 
   for (const candidate of bundledAgoraCandidates()) {
-    if (commandExists(candidate)) return { command: candidate, args: ['mcp', 'serve'] };
+    if (!commandExists(candidate)) continue;
+    const lock = verifyBundledAgora(candidate);
+    if (!lock) throw new Error(`Bundled Agora failed integrity verification: ${candidate}`);
+    return { command: candidate, args: ['mcp', 'serve'], trust: 'verified', source: 'bundled', lock };
   }
 
-  const pathAgora = findOnPath('agora');
-  if (pathAgora) return { command: pathAgora, args: ['mcp', 'serve'] };
-
-  const devFallback = '/Users/zhuqingyu/dev/agora/.venv/bin/agora';
-  if (commandExists(devFallback)) return { command: devFallback, args: ['mcp', 'serve'] };
+  if (process.env.MA_AGORA_ALLOW_UNVERIFIED === '1') {
+    const pathAgora = findOnPath('agora');
+    if (pathAgora) return { command: pathAgora, args: ['mcp', 'serve'], trust: 'unverified', source: 'path' };
+  }
 
   throw new Error(
-    'Agora provider requires an Agora runtime command. Set model.agoraRuntime.command or MA_AGORA_COMMAND.'
+    'Agora runtime is not installed in the verified MA bundle. Set MA_AGORA_COMMAND only for an explicit unverified development override.'
   );
 }
 
@@ -156,8 +225,16 @@ function safeUserId(): string {
 }
 
 function defaultProjectId(cwd?: string): string {
-  const base = path.basename(cwd || process.cwd()).trim();
-  return base || 'my-agent';
+  const requested = path.resolve(cwd || process.cwd());
+  let canonical = requested;
+  try {
+    canonical = fs.realpathSync.native(requested);
+  } catch {
+    // Keep the normalized absolute path for a project that is not mounted yet.
+  }
+  const base = path.basename(canonical).trim() || 'my-agent';
+  const suffix = createHash('sha256').update(canonical).digest('hex').slice(0, 12);
+  return `${base}-${suffix}`;
 }
 
 function toStringList(value: unknown): string[] {
@@ -354,6 +431,8 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
   private selectedProfileId: string | null = null;
   private doctorPayload: Record<string, any> | null = null;
   private modelsPayload: Record<string, any> | null = null;
+  private runtimeTrust: 'verified' | 'unverified' = 'unverified';
+  private runtimeSource = 'unknown';
 
   constructor(
     private readonly model: ModelConfig,
@@ -370,10 +449,25 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
   }
 
   memoryReady(): boolean {
-    for (const name of REQUIRED_MEMORY_TOOLS) {
-      if (!this.toolNames.has(name)) return false;
-    }
-    return true;
+    const capabilities = this.getCapabilities();
+    return capabilities.profileRead && capabilities.profileWrite && capabilities.mount;
+  }
+
+  getCapabilities(): AgoraCapabilities {
+    const has = (name: string) => this.toolNames.has(name);
+    return {
+      chat: has('chat_complete'),
+      modelCatalog: has('models_list') && has('models_status'),
+      modelDownload: has('models_download'),
+      profileRead: has('memory_profiles_list'),
+      profileWrite: has('memory_profiles_create') && has('memory_profiles_update'),
+      patchCatalog: has('memory_patches_list'),
+      mount: has('memory_profile_bindings_list') && has('memory_profile_bindings_create'),
+      intake: has('memory_intake_run') && has('memory_intake_get') && has('memory_intake_status'),
+      lineageCas: has('memory_lineage_advance'),
+      rollback: has('memory_patch_versions'),
+      progress: true,
+    };
   }
 
   getProviderState(): ProviderSessionState | null {
@@ -381,7 +475,158 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
   }
 
   getMemoryController(): AgoraMemoryController | null {
-    return this.memoryReady() ? this : null;
+    return this.toolNames.has('chat_complete') ? this : null;
+  }
+
+  async listProfiles(): Promise<AgoraMemoryProfile[]> {
+    this.requireTools('memory_profiles_list');
+    const payload = await this.callJsonTool('memory_profiles_list', { base_model_id: this.model.model });
+    return Array.isArray(payload.profiles) ? payload.profiles as AgoraMemoryProfile[] : [];
+  }
+
+  async listPatches(includeDisabled = false): Promise<AgoraMemoryPatch[]> {
+    this.requireTools('memory_patches_list');
+    const payload = await this.callJsonTool('memory_patches_list', {
+      base_model_id: this.model.model,
+      include_disabled: includeDisabled,
+    });
+    return Array.isArray(payload.patches) ? payload.patches as AgoraMemoryPatch[] : [];
+  }
+
+  async createProfile(args: Record<string, any>): Promise<Record<string, any>> {
+    this.requireTools('memory_profiles_create');
+    const profileId = this.resolveProfileId(args);
+    const payload = await this.callJsonTool('memory_profiles_create', {
+      id: profileId,
+      name: typeof args.name === 'string' && args.name.trim() ? args.name.trim() : profileId,
+      base_model_id: this.model.model,
+      active_memory_patch_ids: this.patchIdsFromArgs(args),
+      writable_patch_family: typeof args.writable_patch_family === 'string' ? args.writable_patch_family : undefined,
+      auto_intake_policy: args.auto_intake_policy ?? { enabled: false },
+      memory_enabled: args.memory_enabled !== false,
+    });
+    await this.ensureBinding(profileId, args.scope === 'conversation' ? 'conversation' : 'project');
+    this.selectedProfileId = profileId;
+    return payload;
+  }
+
+  async renameProfile(profileId: string, name: string): Promise<Record<string, any>> {
+    this.requireTools('memory_profiles_update');
+    return this.callJsonTool('memory_profiles_update', { profile_id: profileId, name });
+  }
+
+  async selectProfile(
+    profileId: string,
+    scope: 'project' | 'conversation' = 'project'
+  ): Promise<Record<string, any>> {
+    const profiles = await this.listProfiles();
+    const profile = profiles.find((item) => item.id === profileId);
+    if (!profile) throw new Error(`memory profile not found: ${profileId}`);
+    await this.ensureBinding(profileId, scope);
+    this.selectedProfileId = profileId;
+    return { profile, scope, mount_status: 'pending_next_chat' };
+  }
+
+  async applyPatchSelection(
+    profileId: string,
+    patchIds: string[],
+    writableFamily?: string | null
+  ): Promise<Record<string, any>> {
+    this.requireTools('memory_profiles_update');
+    const updated = await this.callJsonTool('memory_profiles_update', {
+      profile_id: profileId,
+      active_memory_patch_ids: patchIds,
+      writable_patch_family: writableFamily ?? null,
+      memory_enabled: true,
+    });
+    await this.ensureBinding(profileId, 'project');
+    this.selectedProfileId = profileId;
+    return { ...updated, mount_status: 'pending_next_chat' };
+  }
+
+  async getIntakeStatus(): Promise<Record<string, any>> {
+    this.requireTools('memory_intake_status');
+    const sessionId = this.requireSessionId();
+    return this.callJsonTool('memory_intake_status', { session_id: sessionId });
+  }
+
+  async startIntake(args: Record<string, any> = {}): Promise<Record<string, any>> {
+    this.requireTools('memory_intake_run');
+    const sessionId = this.requireSessionId();
+    const profileId = this.resolveProfileId(args);
+    const profiles = await this.listProfiles();
+    const profile = profiles.find((item) => item.id === profileId);
+    if (!profile) throw new Error(`memory profile not found: ${profileId}`);
+    const family = typeof args.into === 'string' && args.into.trim()
+      ? args.into.trim()
+      : typeof args.writable_patch_family === 'string' && args.writable_patch_family.trim()
+        ? args.writable_patch_family.trim()
+        : profile.writable_patch_family?.trim();
+    if (!family) throw new Error('memory intake requires a writable memory module; use --into <family>');
+    const patches = await this.listPatches(true);
+    const expected = profile.active_memory_patch_ids.find(
+      (id) => patches.find((patch) => patch.id === id)?.family === family
+    );
+    return this.callJsonTool('memory_intake_run', {
+      session_id: sessionId,
+      profile_id: profileId,
+      writable_patch_family: family,
+      ...(expected ? { expected_previous_patch_id: expected } : {}),
+    });
+  }
+
+  async finalizeIntake(jobId: string, profileId: string): Promise<Record<string, any>> {
+    this.requireTools('memory_intake_get');
+    const current = await this.callJsonTool('memory_intake_get', { job_id: jobId });
+    if (!TERMINAL_INTAKE_STATUSES.has(String(current.status))) return current;
+    if (String(current.status) === 'failed') throw new Error(errorText(current));
+    const job = asRecord(current.job) ?? current;
+    const patchId = typeof job.output_memory_patch_id === 'string'
+      ? job.output_memory_patch_id
+      : typeof current.output_memory_patch_id === 'string' ? current.output_memory_patch_id : undefined;
+    if (!patchId) return { ...current, outcome: 'noop' };
+    const profiles = await this.listProfiles();
+    const profile = profiles.find((item) => item.id === profileId);
+    if (!profile) throw new Error(`memory profile not found: ${profileId}`);
+    if (profile.auto_intake_policy?.activation_mode === 'review') {
+      return { ...current, outcome: 'review_required' };
+    }
+    this.requireTools('memory_lineage_advance');
+    const lineage = asRecord(job.result)?.lineage ?? asRecord(current.result)?.lineage ?? {};
+    const advanced = await this.callJsonTool('memory_lineage_advance', {
+      profile_id: profileId,
+      family: lineage.family ?? profile.writable_patch_family,
+      expected_previous_patch_id: lineage.previous_patch_id ?? null,
+      new_patch_id: patchId,
+      session_id: this.requireSessionId(),
+      job_id: jobId,
+    });
+    return { ...advanced, outcome: 'activated', mount_status: 'pending_next_chat' };
+  }
+
+  async setAutoPolicy(profileId: string, enabled: boolean): Promise<Record<string, any>> {
+    this.requireTools('memory_profiles_update');
+    const profiles = await this.listProfiles();
+    const profile = profiles.find((item) => item.id === profileId);
+    if (!profile) throw new Error(`memory profile not found: ${profileId}`);
+    return this.callJsonTool('memory_profiles_update', {
+      profile_id: profileId,
+      auto_intake_policy: { ...profile.auto_intake_policy, enabled },
+    });
+  }
+
+  async listModels(): Promise<Record<string, any>[]> {
+    this.requireTools('models_list');
+    const payload = await this.callJsonTool('models_list', {});
+    return Array.isArray(payload.models) ? payload.models : [];
+  }
+
+  async downloadModel(
+    modelId: string,
+    onProgress?: (event: McpProgressEvent) => void
+  ): Promise<Record<string, any>> {
+    this.requireTools('models_download');
+    return this.callJsonTool('models_download', { model_id: modelId }, undefined, true, onProgress);
   }
 
   async close(): Promise<void> {
@@ -417,10 +662,12 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
           provider: 'agora',
           ready_tools: [...this.toolNames].sort(),
           resources: this.resources,
-          memory_capability_ready: this.memoryReady(),
+          capabilities: this.getCapabilities(),
           provider_state: this.lastState,
           doctor: this.doctorPayload,
           models: this.modelsPayload,
+          runtime_trust: this.runtimeTrust,
+          runtime_source: this.runtimeSource,
         },
         null,
         2
@@ -434,18 +681,27 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
       this.ensureMemoryReady();
       const profileId = this.resolveProfileId(args);
       const patchIds = this.patchIdsFromArgs(args);
-      await this.upsertProfile(profileId, patchIds.length > 0 ? patchIds : undefined, true);
-      const bindingId = await this.ensureBinding(profileId);
-      const verified = await this.verifyMemoryState({
+      await this.upsertProfile(
         profileId,
-        expectedPatchIds: patchIds.length > 0 ? patchIds : undefined,
-      });
+        patchIds.length > 0 ? patchIds : undefined,
+        true,
+        {
+          name: typeof args.name === 'string' ? args.name : undefined,
+          writablePatchFamily: typeof args.writable_patch_family === 'string'
+            ? args.writable_patch_family
+            : undefined,
+        }
+      );
+      const bindingId = await this.ensureBinding(
+        profileId,
+        args.scope === 'conversation' ? 'conversation' : 'project'
+      );
       this.selectedProfileId = profileId;
       return this.ok({
         action: 'mount',
         profile_id: profileId,
         binding_id: bindingId,
-        provider_state: verified,
+        mount_status: 'pending_next_chat',
       });
     } catch (err) {
       return this.fail(err);
@@ -457,12 +713,11 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
       this.ensureMemoryReady();
       const profileId = this.resolveProfileId(args);
       await this.upsertProfile(profileId, undefined, false);
-      const verified = await this.verifyMemoryState({ profileId, expectedPatchIds: [] });
       this.selectedProfileId = profileId;
       return this.ok({
         action: 'disable',
         profile_id: profileId,
-        provider_state: verified,
+        mount_status: 'pending_next_chat',
       });
     } catch (err) {
       return this.fail(err);
@@ -471,53 +726,17 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
 
   async internalize(args: Record<string, any>): Promise<AgoraMemoryToolResult> {
     try {
-      this.ensureMemoryReady();
-      const sessionId = this.lastState?.agora_session_id;
-      if (!sessionId) {
-        throw new Error('Agora session is not established yet; run one Agora chat turn before internalizing memory.');
-      }
-      const submitted = await this.callJsonTool('memory_intake_run', { session_id: sessionId });
+      const submitted = await this.startIntake(args);
       const jobId = typeof submitted.job_id === 'string' ? submitted.job_id : submitted.job?.id;
       if (typeof jobId !== 'string' || !jobId) throw new Error('memory_intake_run did not return job_id');
-      let current = submitted;
-      for (let i = 0; i < 120; i++) {
-        if (TERMINAL_INTAKE_STATUSES.has(String(current.status))) break;
-        await sleep(500);
-        current = await this.callJsonTool('memory_intake_get', { job_id: jobId });
-      }
-      if (String(current.status) === 'failed') {
-        throw new Error(errorText(current));
-      }
-      const patchId =
-        typeof current.output_memory_patch_id === 'string'
-          ? current.output_memory_patch_id
-          : typeof current.job?.output_memory_patch_id === 'string'
-            ? current.job.output_memory_patch_id
-            : undefined;
-      if (!patchId) {
-        return this.ok({
-          action: 'internalize',
-          status: 'noop',
-          job_id: jobId,
-          source_id: current.source_id ?? current.job?.source_id,
-          message: 'memory intake completed but did not produce a MemoryPatch',
-          job: current.job,
-        });
-      }
       const profileId = this.resolveProfileId(args);
-      await this.upsertProfile(profileId, [patchId], true);
-      const bindingId = await this.ensureBinding(profileId);
-      const verified = await this.verifyMemoryState({ profileId, expectedPatchIds: [patchId] });
-      this.selectedProfileId = profileId;
       return this.ok({
         action: 'internalize',
-        status: 'mounted',
+        status: 'queued',
         profile_id: profileId,
-        binding_id: bindingId,
         job_id: jobId,
-        source_id: current.source_id ?? current.job?.source_id,
-        output_memory_patch_id: patchId,
-        provider_state: verified,
+        source_id: submitted.source_id ?? submitted.job?.source_id,
+        message: 'memory intake is running in the background; use /memory status to inspect progress',
       });
     } catch (err) {
       return this.fail(err);
@@ -534,16 +753,21 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
           ? args.target_patch_id.trim()
           : await this.resolveRollbackPatchId();
       if (!targetPatchId) throw new Error('rollback requires patch_id when there is no single previous patch candidate');
-      await this.upsertProfile(profileId, [targetPatchId], true);
-      const bindingId = await this.ensureBinding(profileId);
-      const verified = await this.verifyMemoryState({ profileId, expectedPatchIds: [targetPatchId] });
-      this.selectedProfileId = profileId;
+      const [profiles, patches] = await Promise.all([this.listProfiles(), this.listPatches(true)]);
+      const profile = profiles.find((item) => item.id === profileId);
+      const target = patches.find((item) => item.id === targetPatchId);
+      if (!profile || !target) throw new Error('rollback profile or target patch not found');
+      const nextIds = profile.active_memory_patch_ids.map((id) => {
+        const patch = patches.find((item) => item.id === id);
+        return patch?.family === target.family ? targetPatchId : id;
+      });
+      if (!nextIds.includes(targetPatchId)) nextIds.push(targetPatchId);
+      const result = await this.applyPatchSelection(profileId, nextIds, profile.writable_patch_family);
       return this.ok({
         action: 'rollback',
         profile_id: profileId,
-        binding_id: bindingId,
-        active_memory_patch_ids: [targetPatchId],
-        provider_state: verified,
+        active_memory_patch_ids: nextIds,
+        mount_status: result.mount_status,
       });
     } catch (err) {
       return this.fail(err);
@@ -553,6 +777,8 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
   private async start(): Promise<void> {
     const runtime = this.model.agoraRuntime;
     const command = resolveAgoraCommand(runtime);
+    this.runtimeTrust = command.trust;
+    this.runtimeSource = command.source;
     const dataRoot = resolveAgoraDataRoot(runtime);
     fs.mkdirSync(dataRoot, { recursive: true });
     const child = spawn(command.command, command.args, {
@@ -579,6 +805,17 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
         this.resources = [];
       }
       this.doctorPayload = await this.callJsonTool('doctor', {}, undefined, false);
+      if (command.trust === 'verified') {
+        const expectedVersion = command.lock?.version;
+        const actualVersion = this.doctorPayload.version;
+        const actualMajor = this.doctorPayload.contract?.host_protocol_major;
+        if (actualVersion !== expectedVersion || actualMajor !== command.lock?.host_protocol_major) {
+          throw new Error(
+            `Agora runtime contract mismatch: expected ${expectedVersion}/host-v${command.lock?.host_protocol_major}, ` +
+            `got ${actualVersion}/host-v${actualMajor}`
+          );
+        }
+      }
       this.modelsPayload = await this.callJsonTool('models_list', {}, undefined, false);
     } catch (err) {
       await this.close();
@@ -592,6 +829,21 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
     }
   }
 
+  private requireTools(...names: string[]): void {
+    const missing = names.filter((name) => !this.toolNames.has(name));
+    if (missing.length > 0) {
+      throw new Error(`Agora capability unavailable: ${missing.join(', ')}`);
+    }
+  }
+
+  private requireSessionId(): string {
+    const sessionId = this.lastState?.agora_session_id;
+    if (!sessionId) {
+      throw new Error('Agora session is not established yet; run one Agora chat turn first.');
+    }
+    return sessionId;
+  }
+
   private async callJsonTool(
     toolName: string,
     args: Record<string, any>,
@@ -602,6 +854,9 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
     if (waitForReady) await this.ready();
     if (!this.mcp) throw new Error('Agora MCP runtime is not running');
     const result = await this.mcp.call(toolName, args, signal, onProgress);
+    if (result.isError) {
+      throw new Error(result.content || `Agora MCP tool ${toolName} failed`);
+    }
     let payload: unknown;
     try {
       payload = JSON.parse(result.content || '{}');
@@ -612,7 +867,7 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
       throw new Error(`Agora MCP tool ${toolName} returned invalid JSON payload`);
     }
     const record = payload as Record<string, any>;
-    if (result.isError || isErrorPayload(record)) throw new Error(errorText(record));
+    if (isErrorPayload(record)) throw new Error(errorText(record));
     return record;
   }
 
@@ -644,6 +899,8 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
         : undefined
     );
     this.lastState = stateFromChatPayload(payload);
+    this.lastState.runtime_trust = this.runtimeTrust;
+    this.lastState.runtime_source = this.runtimeSource;
     return payload;
   }
 
@@ -749,7 +1006,8 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
   private async upsertProfile(
     profileId: string,
     activePatchIds: string[] | undefined,
-    memoryEnabled: boolean
+    memoryEnabled: boolean,
+    options: { name?: string; writablePatchFamily?: string | null } = {}
   ): Promise<void> {
     const listed = await this.callJsonTool('memory_profiles_list', { base_model_id: this.model.model });
     const profiles = Array.isArray(listed.profiles) ? listed.profiles : [];
@@ -758,6 +1016,10 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
       await this.callJsonTool('memory_profiles_update', {
         profile_id: profileId,
         ...(activePatchIds !== undefined ? { active_memory_patch_ids: activePatchIds } : {}),
+        ...(options.name ? { name: options.name } : {}),
+        ...(options.writablePatchFamily !== undefined
+          ? { writable_patch_family: options.writablePatchFamily }
+          : {}),
         memory_enabled: memoryEnabled,
       });
       return;
@@ -767,59 +1029,38 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
     }
     await this.callJsonTool('memory_profiles_create', {
       id: profileId,
+      name: options.name || profileId,
       base_model_id: this.model.model,
       active_memory_patch_ids: activePatchIds,
+      ...(options.writablePatchFamily !== undefined
+        ? { writable_patch_family: options.writablePatchFamily }
+        : {}),
+      auto_intake_policy: { enabled: false },
       memory_enabled: memoryEnabled,
     });
   }
 
-  private async ensureBinding(profileId: string): Promise<string | undefined> {
+  private async ensureBinding(
+    profileId: string,
+    scope: 'project' | 'conversation' = 'project'
+  ): Promise<string | undefined> {
     const metadata = this.buildMetadata(undefined, { memory_profile: profileId });
     const listed = await this.callJsonTool('memory_profile_bindings_list', { profile_id: profileId });
     const bindings = Array.isArray(listed.bindings) ? listed.bindings : [];
-    const match = bindings.find((binding: any) =>
-      binding?.user_id === metadata.user_id &&
-      binding?.project_id === metadata.project_id &&
-      binding?.conversation_id === metadata.conversation_id
-    );
+    const match = bindings.find((binding: any) => {
+      if (binding?.scope_type !== scope || binding?.user_id !== metadata.user_id) return false;
+      if (binding?.project_id !== metadata.project_id) return false;
+      return scope === 'project' || binding?.conversation_id === metadata.conversation_id;
+    });
     if (match?.id) return String(match.id);
     const created = await this.callJsonTool('memory_profile_bindings_create', {
       profile_id: profileId,
+      scope_type: scope,
       user_id: metadata.user_id,
       project_id: metadata.project_id,
-      conversation_id: metadata.conversation_id,
+      ...(scope === 'conversation' ? { conversation_id: metadata.conversation_id } : {}),
     });
     return typeof created.binding?.id === 'string' ? created.binding.id : undefined;
-  }
-
-  private async verifyMemoryState(input: {
-    profileId: string;
-    expectedPatchIds?: string[];
-  }): Promise<ProviderSessionState> {
-    await this.chatCompletePayload(
-      {
-        model: this.model.model,
-        messages: [{ role: 'user', content: 'Verify Agora memory state.' }],
-        stream: false,
-        max_tokens: 4,
-      } as ChatCompletionCreateParamsNonStreaming,
-      undefined,
-      { memory_profile: input.profileId }
-    );
-    const state = this.lastState;
-    if (!state) throw new Error('Agora verification did not produce provider state');
-    if (state.memory?.profile_id !== input.profileId) {
-      throw new Error(`Agora verification did not mount requested profile ${input.profileId}`);
-    }
-    if (input.expectedPatchIds !== undefined) {
-      const actual = state.memory?.active_memory_patch_ids ?? [];
-      if (JSON.stringify(actual) !== JSON.stringify(input.expectedPatchIds)) {
-        throw new Error(
-          `Agora verification patch mismatch: expected ${JSON.stringify(input.expectedPatchIds)}, got ${JSON.stringify(actual)}`
-        );
-      }
-    }
-    return state;
   }
 
   private async resolveRollbackPatchId(): Promise<string | null> {

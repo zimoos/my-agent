@@ -7,9 +7,10 @@ import * as path from 'node:path';
 import { AgoraProviderRuntime } from '../src/provider/agora.js';
 import type { ModelConfig } from '../src/mcp/types.js';
 
-const AGORA_DEV_ROOT = '/Users/zhuqingyu/dev/agora';
-const AGORA_DEV_COMMAND = path.join(AGORA_DEV_ROOT, '.venv/bin/agora');
-const AGORA_DEV_PYTHON = path.join(AGORA_DEV_ROOT, '.venv/bin/python');
+const AGORA_DEV_ROOT = process.env.MA_TEST_AGORA_ROOT || '';
+const AGORA_DEV_COMMAND = process.env.MA_TEST_AGORA_COMMAND || '';
+const AGORA_DEV_PYTHON = process.env.MA_TEST_AGORA_PYTHON || '';
+const AGORA_REAL_MODELS = process.env.MA_TEST_AGORA_REAL_MODELS || '';
 
 const MEMORY_TOOLS = [
   'doctor',
@@ -25,6 +26,9 @@ const MEMORY_TOOLS = [
   'memory_sources_get',
   'memory_intake_run',
   'memory_intake_get',
+  'memory_intake_status',
+  'memory_patches_list',
+  'memory_lineage_advance',
   'memory_patch_versions',
 ];
 
@@ -105,7 +109,31 @@ function runtimeWithFakeCalls(
         active_memory_patch_ids: patchIds,
       };
     }
-    if (name === 'memory_profiles_list') return { service: 'agora', status: 'ok', profiles: [] };
+    if (name === 'memory_profiles_list') return {
+      service: 'agora',
+      status: 'ok',
+      profiles: [{
+        id: 'profile-a',
+        name: 'Profile A',
+        base_model_id: 'base-a',
+        active_memory_patch_ids: ['patch-a'],
+        writable_patch_family: 'project-memory',
+        auto_intake_policy: { enabled: true, activation_mode: 'auto' },
+      }],
+    };
+    if (name === 'memory_patches_list') return {
+      service: 'agora',
+      status: 'ok',
+      patches: [{
+        id: 'patch-a',
+        name: 'Patch A',
+        base_model_id: 'base-a',
+        family: 'project-memory',
+        version: 'v1',
+        mountable: true,
+        status: 'available',
+      }],
+    };
     if (name === 'memory_profiles_create') return { service: 'agora', status: 'available', profile: { id: args.id } };
     if (name === 'memory_profiles_update') return { service: 'agora', status: 'available', profile: { id: args.profile_id } };
     if (name === 'memory_profile_bindings_list') return { service: 'agora', status: 'ok', bindings: [] };
@@ -117,7 +145,11 @@ function runtimeWithFakeCalls(
         job_id: 'job-a',
         source_id: 'source-a',
         output_memory_patch_id: 'patch-a',
-        job: { id: 'job-a', output_memory_patch_id: 'patch-a' },
+        job: {
+          id: 'job-a',
+          output_memory_patch_id: 'patch-a',
+          result: { lineage: { family: 'project-memory', previous_patch_id: 'patch-a' } },
+        },
       };
     }
     if (name === 'memory_intake_get') {
@@ -127,8 +159,15 @@ function runtimeWithFakeCalls(
         job_id: args.job_id,
         source_id: 'source-a',
         output_memory_patch_id: 'patch-a',
-        job: { id: args.job_id, output_memory_patch_id: 'patch-a' },
+        job: {
+          id: args.job_id,
+          output_memory_patch_id: 'patch-a',
+          result: { lineage: { family: 'project-memory', previous_patch_id: 'patch-a' } },
+        },
       };
+    }
+    if (name === 'memory_lineage_advance') {
+      return { service: 'agora', status: 'activated', active_memory_patch_ids: ['patch-a'] };
     }
     if (name === 'memory_patch_versions') return { service: 'agora', status: 'ok', patches: [{ id: 'patch-a' }, { id: 'patch-previous' }] };
     return { service: 'agora', status: 'ok' };
@@ -444,12 +483,15 @@ test('agora provider runtime wraps non-streaming chat_complete as streaming chun
   assert.deepEqual(runtime.getProviderState()?.memory?.active_memory_patch_ids, ['patch-a']);
 });
 
-test('agora provider runtime disables memory controller when required memory MCP tools are missing', async () => {
+test('agora provider runtime exposes granular capability gaps without disabling chat', async () => {
   const runtime = runtimeWithFakeCalls([], ['doctor', 'models_list', 'chat_complete']);
-  assert.equal(runtime.getMemoryController(), null);
+  assert.ok(runtime.getMemoryController());
+  assert.equal(runtime.getCapabilities().chat, true);
+  assert.equal(runtime.getCapabilities().profileRead, false);
+  assert.equal(runtime.getCapabilities().intake, false);
 });
 
-test('agora memory internalize runs intake, updates profile, binds scope, and verifies via chat metadata', async () => {
+test('agora memory internalize queues intake without blocking or overwriting overlays', async () => {
   const calls: Array<{ name: string; args: Record<string, any> }> = [];
   const runtime = runtimeWithFakeCalls(calls);
   await runtime.createChatCompletion({
@@ -461,26 +503,98 @@ test('agora memory internalize runs intake, updates profile, binds scope, and ve
   const result = await runtime.internalize({ profile_id: 'profile-a' });
   assert.equal(result.isError, false);
   const payload = JSON.parse(result.content);
-  assert.equal(payload.output_memory_patch_id, 'patch-a');
+  assert.equal(payload.status, 'queued');
+  assert.equal(payload.job_id, 'job-a');
   assert.deepEqual(
     calls.map((call) => call.name),
     [
       'chat_complete',
-      'memory_intake_run',
       'memory_profiles_list',
-      'memory_profiles_create',
-      'memory_profile_bindings_list',
-      'memory_profile_bindings_create',
-      'chat_complete',
+      'memory_patches_list',
+      'memory_intake_run',
     ]
   );
-  assert.equal(calls.at(-1)?.args.metadata.memory_profile, 'profile-a');
   assert.deepEqual(runtime.getProviderState()?.memory?.active_memory_patch_ids, ['patch-a']);
+});
+
+test('agora profile switch persists project/session scope and waits for a real chat boundary', async () => {
+  const calls: Array<{ name: string; args: Record<string, any> }> = [];
+  const runtime = runtimeWithFakeCalls(calls);
+
+  const project = await runtime.selectProfile('profile-a');
+  assert.equal(project.mount_status, 'pending_next_chat');
+  assert.equal(calls.some((call) => call.name === 'chat_complete'), false);
+  assert.deepEqual(
+    calls.find((call) => call.name === 'memory_profile_bindings_create')?.args,
+    {
+      profile_id: 'profile-a',
+      scope_type: 'project',
+      user_id: 'user-a',
+      project_id: 'project-a',
+    }
+  );
+
+  calls.length = 0;
+  const conversation = await runtime.selectProfile('profile-a', 'conversation');
+  assert.equal(conversation.scope, 'conversation');
+  assert.equal(calls.some((call) => call.name === 'chat_complete'), false);
+  assert.equal(
+    calls.find((call) => call.name === 'memory_profile_bindings_create')?.args.conversation_id,
+    'conv-a'
+  );
 });
 
 const agoraDevE2eTest = fs.existsSync(AGORA_DEV_COMMAND) && fs.existsSync(AGORA_DEV_PYTHON)
   ? test
   : test.skip;
+
+const agoraPackagedE2eTest = fs.existsSync(AGORA_DEV_COMMAND) && fs.existsSync(AGORA_REAL_MODELS)
+  ? test
+  : test.skip;
+
+agoraPackagedE2eTest('packaged Agora serves a real whitelist model over MCP stdio', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ma-agora-packaged-e2e-'));
+  const dataRoot = path.join(tmp, 'agora-data');
+  fs.mkdirSync(dataRoot, { recursive: true });
+  fs.symlinkSync(path.resolve(AGORA_REAL_MODELS), path.join(dataRoot, 'models'));
+  let runtime: AgoraProviderRuntime | null = null;
+  try {
+    runtime = new AgoraProviderRuntime(
+      {
+        provider: 'agora',
+        baseURL: 'mcp-stdio://agora',
+        apiKey: 'agora-mcp',
+        model: 'qwen2.5-7b-fp16',
+        agoraRuntime: {
+          command: AGORA_DEV_COMMAND,
+          args: ['mcp', 'serve'],
+          dataRoot,
+          env: { HF_HUB_OFFLINE: '1', TRANSFORMERS_OFFLINE: '1' },
+        },
+        agoraMemory: {
+          userId: 'user-packaged-e2e',
+          projectId: 'my-agent',
+          conversationId: 'conv-packaged-e2e',
+        },
+      },
+      { requestTimeoutMs: 30000, streamIdleTimeoutMs: 30000, maxRetries: 0 },
+      { sessionId: 'ma-packaged-e2e-session', cwd: tmp }
+    );
+    await runtime.ready();
+    assert.ok((await runtime.listModels()).some((item) => item.id === 'qwen2.5-7b-fp16'));
+    await runtime.createChatCompletion({
+      model: 'qwen2.5-7b-fp16',
+      messages: [{ role: 'user', content: '只回答OK' }],
+      stream: false,
+      max_tokens: 2,
+      temperature: 0,
+    } as any);
+    assert.ok(runtime.getProviderState()?.agora_session_id);
+  } finally {
+    await runtime?.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
 
 agoraDevE2eTest('agora provider runtime uses real MCP stdio for mount, internalize, rollback, and disable', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ma-agora-provider-e2e-'));
@@ -523,9 +637,11 @@ agoraDevE2eTest('agora provider runtime uses real MCP stdio for mount, internali
     const mounted = await controller.mount({
       profile_id: 'profile-e2e',
       active_memory_patch_ids: ['patch-old'],
+      writable_patch_family: 'ma-e2e-memory',
     });
     assert.equal(mounted.isError, false, mounted.content);
-    assert.deepEqual(runtime.getProviderState()?.memory?.active_memory_patch_ids, ['patch-old']);
+    assert.equal(JSON.parse(mounted.content).mount_status, 'pending_next_chat');
+    assert.equal(runtime.getProviderState(), null, 'profile selection must not inject a synthetic verification turn');
 
     await runtime.createChatCompletion({
       model: 'qwen2.5-7b-fp16',
@@ -538,16 +654,46 @@ agoraDevE2eTest('agora provider runtime uses real MCP stdio for mount, internali
     const internalized = await controller.internalize({ profile_id: 'profile-e2e' });
     assert.equal(internalized.isError, false, internalized.content);
     const internalizedPayload = JSON.parse(internalized.content);
-    const patchId = internalizedPayload.output_memory_patch_id;
+    assert.equal(internalizedPayload.status, 'queued');
+    let finalized: Record<string, any> = {};
+    for (let i = 0; i < 120; i++) {
+      finalized = await controller.finalizeIntake(internalizedPayload.job_id, 'profile-e2e');
+      if (finalized.outcome) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const patchId = finalized.active_memory_patch_ids?.find((id: string) => id !== 'patch-old')
+      ?? finalized.profile?.active_memory_patch_ids?.find((id: string) => id !== 'patch-old');
     assert.match(patchId, /^memory-intake-/);
+    assert.equal(finalized.mount_status, 'pending_next_chat');
+    assert.deepEqual(runtime.getProviderState()?.memory?.active_memory_patch_ids, ['patch-old']);
+    await runtime.createChatCompletion({
+      model: 'qwen2.5-7b-fp16',
+      messages: [{ role: 'user', content: '使用内化后的记忆继续。' }],
+      stream: false,
+      max_tokens: 8,
+    } as any);
     assert.deepEqual(runtime.getProviderState()?.memory?.active_memory_patch_ids, [patchId]);
 
     const rolledBack = await controller.rollback({ profile_id: 'profile-e2e', patch_id: 'patch-old' });
     assert.equal(rolledBack.isError, false, rolledBack.content);
+    assert.equal(JSON.parse(rolledBack.content).mount_status, 'pending_next_chat');
+    await runtime.createChatCompletion({
+      model: 'qwen2.5-7b-fp16',
+      messages: [{ role: 'user', content: '回滚后继续。' }],
+      stream: false,
+      max_tokens: 8,
+    } as any);
     assert.deepEqual(runtime.getProviderState()?.memory?.active_memory_patch_ids, ['patch-old']);
 
     const disabled = await controller.disable({ profile_id: 'profile-e2e' });
     assert.equal(disabled.isError, false, disabled.content);
+    assert.equal(JSON.parse(disabled.content).mount_status, 'pending_next_chat');
+    await runtime.createChatCompletion({
+      model: 'qwen2.5-7b-fp16',
+      messages: [{ role: 'user', content: '禁用记忆后继续。' }],
+      stream: false,
+      max_tokens: 8,
+    } as any);
     assert.deepEqual(runtime.getProviderState()?.memory?.active_memory_patch_ids, []);
     assert.equal(runtime.getProviderState()?.memory?.status, 'disabled');
 

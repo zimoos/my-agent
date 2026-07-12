@@ -24,6 +24,8 @@ import {
   type SessionPickerSession,
 } from './components/SessionPicker.js';
 import { ModelPicker } from './components/ModelPicker.js';
+import { MemoryConsole } from './components/MemoryConsole.js';
+import type { AgoraMemoryPatch, AgoraMemoryProfile } from '../provider/agora.js';
 import type { PendingConfirm } from './hooks/useAgent.js';
 import { isCommand, executeCommand } from './utils/commands.js';
 import {
@@ -72,10 +74,65 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
     agent.getProviderState?.() ??
     sessionStore.list(100).find((session) => session.id === currentSessionId)?.providerState ??
     null;
+  const memoryController = agent.getMemoryController?.() ?? null;
 
   const [pendingImages, setPendingImages] = useState<UiImage[]>([]);
   const [sessionPickerSessions, setSessionPickerSessions] = useState<SessionPickerSession[] | null>(null);
   const [modelPickerModels, setModelPickerModels] = useState<ModelChoice[] | null>(null);
+  const [memoryConsole, setMemoryConsole] = useState<{
+    profiles: AgoraMemoryProfile[];
+    patches: AgoraMemoryPatch[];
+  } | null>(null);
+  const [memoryActivity, setMemoryActivity] = useState('');
+  const lastUserActivityRef = useRef(Date.now());
+  const intakeInFlightRef = useRef(false);
+
+  const refreshMemoryConsole = useCallback(async () => {
+    if (!memoryController) throw new Error('Agora memory controller is unavailable');
+    const [profiles, patches] = await Promise.all([
+      memoryController.listProfiles(),
+      memoryController.listPatches(true),
+    ]);
+    setMemoryConsole({ profiles, patches });
+  }, [memoryController]);
+
+  const openMemoryConsole = useCallback(async () => {
+    try {
+      await refreshMemoryConsole();
+    } catch (err) {
+      store.pushMessage({ kind: 'system', id: nextSysId(), text: `Memory error: ${(err as Error).message}` });
+    }
+  }, [refreshMemoryConsole, store]);
+
+  const runMemoryIntake = useCallback(async (profileId: string) => {
+    if (!memoryController || intakeInFlightRef.current) return;
+    intakeInFlightRef.current = true;
+    try {
+      const submitted = await memoryController.startIntake({ profile_id: profileId });
+      const jobId = String(submitted.job_id ?? submitted.job?.id ?? '');
+      if (!jobId) throw new Error('Agora did not return an intake job id');
+      setMemoryActivity(`queued · ${jobId}`);
+      for (;;) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        const current = await memoryController.finalizeIntake(jobId, profileId);
+        const status = String(current.status ?? current.job?.status ?? '');
+        const stage = String(current.stage ?? current.job?.stage ?? status);
+        setMemoryActivity(stage);
+        if (status === 'failed') throw new Error(current.error?.message ?? current.job?.error ?? stage);
+        if (status === 'completed' || current.outcome) {
+          setMemoryActivity(current.outcome === 'review_required' ? 'review required' : current.outcome ?? 'completed');
+          const nextState = agent.getProviderState?.();
+          if (nextState) sessionStore.updateProviderState(currentSessionId, nextState);
+          await refreshMemoryConsole().catch(() => undefined);
+          break;
+        }
+      }
+    } catch (err) {
+      setMemoryActivity(`failed · ${(err as Error).message}`);
+    } finally {
+      intakeInFlightRef.current = false;
+    }
+  }, [agent, currentSessionId, memoryController, refreshMemoryConsole, sessionStore]);
 
   const handleConfirm = useCallback(
     (approved: boolean) => {
@@ -97,7 +154,25 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
   const openModelPicker = useCallback(async () => {
     try {
       store.pushMessage({ kind: 'system', id: nextSysId(), text: '[正在查询模型列表...]' });
-      const choices = await listModelChoices(config);
+      let choices = await listModelChoices(config);
+      if (memoryController?.getCapabilities().modelCatalog) {
+        const models = await memoryController.listModels();
+        const liveChoices: ModelChoice[] = models
+          .filter((item) => typeof item.id === 'string')
+          .map((item) => ({
+            id: `agora-local/${item.id}`,
+            credentialId: 'agora-local',
+            provider: 'agora',
+            baseURL: 'mcp-stdio://agora',
+            model: String(item.id),
+            label: `Agora/${item.name ?? item.id}`,
+            current: config.model.provider === 'agora' && config.model.model === item.id,
+            source: 'remote',
+            status: typeof item.status === 'string' ? item.status : undefined,
+          }));
+        const liveIds = new Set(liveChoices.map((item) => item.id));
+        choices = [...liveChoices, ...choices.filter((item) => !liveIds.has(item.id))];
+      }
       setModelPickerModels(choices);
     } catch (err) {
       store.pushMessage({
@@ -106,9 +181,25 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
         text: `Failed to list models: ${(err as Error).message}`,
       });
     }
-  }, [config, store]);
+  }, [config, memoryController, store]);
 
-  const switchModelChoice = useCallback((model: ModelChoice) => {
+  const switchModelChoice = useCallback(async (model: ModelChoice) => {
+    if (model.provider === 'agora' && model.status && model.status !== 'available') {
+      if (!memoryController?.getCapabilities().modelDownload) {
+        store.pushMessage({ kind: 'system', id: nextSysId(), text: '[Agora runtime 不支持模型下载，请升级 Agora]' });
+        return;
+      }
+      setMemoryActivity(`下载模型 ${model.model}`);
+      try {
+        await memoryController.downloadModel(model.model, (event) => {
+          setMemoryActivity(`下载模型 ${model.model} · ${event.progress ?? '?'}${event.total ? `/${event.total}` : ''}`);
+        });
+        setMemoryActivity(`模型 ${model.model} 已下载`);
+      } catch (err) {
+        setMemoryActivity(`下载失败 · ${(err as Error).message}`);
+        return;
+      }
+    }
     setModelPickerModels(null);
     saveDefaultModelChoice(model);
     store.pushMessage({
@@ -119,10 +210,11 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
     log(`switch model: ${model.id}`);
     onRestartSession?.(currentSessionId);
     app.exit();
-  }, [app, currentSessionId, log, onRestartSession, store]);
+  }, [app, currentSessionId, log, memoryController, onRestartSession, store]);
 
   const handleSubmit = useCallback(
     (text: string) => {
+      lastUserActivityRef.current = Date.now();
       log(`submit: ${text}`);
       if (isCommand(text)) {
         (async () => {
@@ -133,6 +225,7 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
             exit: () => app.exit(),
             revertLastTurn: handleRevertLastTurn,
             openModelPicker,
+            openMemoryConsole,
             switchModelChoice,
           });
           if (text === '/clear') {
@@ -158,8 +251,34 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
         send(text);
       }
     },
-    [agent, connections, app, store, send, log, pendingImages, handleRevertLastTurn, config, openModelPicker, switchModelChoice]
+    [agent, connections, app, store, send, log, pendingImages, handleRevertLastTurn, config, openModelPicker, openMemoryConsole, switchModelChoice]
   );
+
+  useEffect(() => {
+    if (!memoryController || config.model.provider?.toLowerCase() !== 'agora') return;
+    const timer = setInterval(async () => {
+      if (intakeInFlightRef.current || thinkingRef.current || pendingConfirm || sessionPickerSessions || modelPickerModels || memoryConsole) return;
+      const profileId = agent.getProviderState?.()?.memory?.profile_id;
+      if (!profileId) return;
+      try {
+        const profiles = await memoryController.listProfiles();
+        const profile = profiles.find((item) => item.id === profileId);
+        const policy = profile?.auto_intake_policy;
+        if (!profile || !profile.writable_patch_family || !policy?.enabled) return;
+        const idleSeconds = policy.idle_seconds ?? 60;
+        if (Date.now() - lastUserActivityRef.current < idleSeconds * 1000) return;
+        const status = await memoryController.getIntakeStatus();
+        if (status.active_job) return;
+        const turnsReady = Number(status.pending_user_turns ?? 0) >= Number(policy.min_user_turns ?? 4);
+        const tokensReady = Number(status.pending_tokens ?? 0) >= Number(policy.min_pending_tokens ?? 2000);
+        if (!turnsReady && !tokensReady) return;
+        void runMemoryIntake(profileId);
+      } catch (err) {
+        setMemoryActivity(`stale · ${(err as Error).message}`);
+      }
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [agent, config.model.provider, memoryConsole, memoryController, modelPickerModels, pendingConfirm, runMemoryIntake, sessionPickerSessions]);
 
   const openSessionPicker = useCallback(() => {
     const allSessions = sessionStore.list(50);
@@ -325,9 +444,43 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
         />
       ) : null}
 
+      {memoryConsole ? (
+        <MemoryConsole
+          project={process.cwd()}
+          profiles={memoryConsole.profiles}
+          patches={memoryConsole.patches}
+          activeProfileId={providerState?.memory?.profile_id}
+          activity={memoryActivity}
+          onUse={(profileId) => {
+            void memoryController?.selectProfile(profileId).then(() => {
+              setMemoryActivity('已选择 · 下一次真实对话生效');
+              return refreshMemoryConsole();
+            });
+          }}
+          onApply={(profileId, patchIds, writableFamily) => {
+            void memoryController?.applyPatchSelection(profileId, patchIds, writableFamily).then(() => {
+              setMemoryActivity('Patch 已更新 · 下一次真实对话生效');
+              return refreshMemoryConsole();
+            });
+          }}
+          onCreate={(name) => {
+            const profileId = `ma-${name.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-').replace(/^-|-$/g, '') || 'memory'}-${Date.now().toString(36)}`;
+            void memoryController?.createProfile({ profile_id: profileId, name }).then(() => refreshMemoryConsole());
+          }}
+          onRename={(profileId, name) => {
+            void memoryController?.renameProfile(profileId, name).then(() => refreshMemoryConsole());
+          }}
+          onAuto={(profileId, enabled) => {
+            void memoryController?.setAutoPolicy(profileId, enabled).then(() => refreshMemoryConsole());
+          }}
+          onInternalize={(profileId) => { void runMemoryIntake(profileId); }}
+          onCancel={() => setMemoryConsole(null)}
+        />
+      ) : null}
+
       <InputBox
         onSubmit={handleSubmit}
-        disabled={!!thinking || !!pendingConfirm || !!sessionPickerSessions || !!modelPickerModels}
+        disabled={!!thinking || !!pendingConfirm || !!sessionPickerSessions || !!modelPickerModels || !!memoryConsole}
         pendingImages={pendingImages}
         onClearPendingImages={() => setPendingImages([])}
         onOpenSessionPicker={openSessionPicker}
@@ -343,6 +496,7 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
         contextTotal={contextUsage.total}
         contextThreshold={contextUsage.compactThreshold}
         contextSource={contextUsage.source}
+        memoryActivity={memoryActivity}
       />
     </Box>
   );

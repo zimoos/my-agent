@@ -6,11 +6,11 @@ DeepSeek in minutes. Local small models turned into real productivity.
 
 MA is a terminal coding agent built around two practical promises: remote setup should be brainless, and local small models should become useful production tools. DeepSeek config is interactive and direct. LM Studio/Qwen gets long-context handling, tool hardening, model switching, and benchmark-driven fixes so small models can do real repo work.
 
-`v0.2.0-alpha.1` supports LM Studio local models, DeepSeek official API, and Agora through MCP stdio. Agora is MA's local-first provider integration: it exposes real model-loading and MemoryPatch state instead of pretending memory was added to a prompt.
+`v0.3.0` supports LM Studio local models, DeepSeek official API, and Agora through MCP stdio. Agora is MA's local-first provider integration: it exposes real model-loading and MemoryPatch state instead of pretending memory was added to a prompt.
 
 Website: https://zimoos.github.io/my-agent/
 
-Release: https://github.com/zimoos/my-agent/releases/tag/v0.2.0-alpha.1
+Release: https://github.com/zimoos/my-agent/releases/tag/v0.3.0
 
 [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Discussions](https://github.com/zimoos/my-agent/discussions)
 
@@ -132,6 +132,7 @@ Inside MA:
 ```text
 /          show slash command suggestions
 /model     switch model/profile with arrow keys
+/memory    open the project memory console
 Tab        complete selected command
 Enter      run selected slash command
 ESC ESC    switch session
@@ -144,6 +145,7 @@ User-facing slash commands:
 | Command | Purpose |
 | --- | --- |
 | `/model` | Open the model/profile picker |
+| `/memory` | Manage named profiles, patch selection, writable memory, automatic intake, and rollback |
 | `/help` | Show user-facing commands |
 | `/clear` | Clear current conversation |
 | `/exit` | Exit MA |
@@ -183,6 +185,12 @@ DeepSeek/deepseek-v4-flash
 MA can run Agora as a provider-owned MCP stdio subprocess instead of asking users to manage a local HTTP server. The TUI reports real provider stages such as local-model loading, memory mounting, and generation.
 
 When the active provider is Agora, MA can expose verified MemoryPatch operations: mount, disable, internalize, roll back, and inspect state. MA treats a memory module as active only after Agora returns matching response metadata; it never fakes memory by injecting facts into a prompt.
+
+`/memory` controls named MemoryProfiles stored in Agora. A profile may mount one writable family plus multiple read-only overlays. Automatic intake advances only the writable family, preserves overlays, and runs in the background after 4 new user turns or about 2,000 pending tokens and 60 seconds of idle time.
+
+Context Usage remains independent from MemoryPatch state: the TUI continues to show used/trigger/window/source from `agent.getContextUsage()`. Internalization never clears context, and compaction never claims to internalize memory.
+
+The MA portable release pins the exact Agora `0.2.0` Mach-O artifact. Agora npm user artifacts contain no `.py`, `.pyc`, `.js`, or source maps and require no login or device activation.
 
 ## Built-In Tools
 

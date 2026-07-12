@@ -1,6 +1,6 @@
 {
   "name": "my-agent",
-  "version": "0.2.0-alpha.1",
+  "version": "0.3.0",
   "description": "Local-first multi-model terminal coding agent",
   "homepage": "https://zimoos.github.io/my-agent/",
   "type": "module",
@@ -15,6 +15,7 @@
     "LICENSE"
   ],
   "scripts": {
+    "postinstall": "node scripts/fix-node-pty.mjs",
     "start": "tsx src/cli/index.tsx",
     "build": "tsc && chmod +x dist/src/cli/index.js bin/ma scripts/package-portable.mjs",
     "package:portable": "npm run build && node scripts/package-portable.mjs --out release",

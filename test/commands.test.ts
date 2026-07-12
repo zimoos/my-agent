@@ -67,6 +67,28 @@ test('/model opens the model picker when no args are provided', async () => {
   });
 });
 
+test('/memory opens the console and lists named writable profiles', async () => {
+  await withTempCwd(async () => {
+    let opened = 0;
+    const controller = {
+      listProfiles: async () => [{
+        id: 'profile-a',
+        name: 'MA 核心记忆',
+        active_memory_patch_ids: ['patch-a', 'overlay-a'],
+        writable_patch_family: 'project-memory',
+        auto_intake_policy: { enabled: true },
+      }],
+    };
+    const agent = { getMemoryController: () => controller };
+    assert.equal(await executeCommand('/memory', baseContext({ agent, openMemoryConsole: () => { opened++; } })), null);
+    assert.equal(opened, 1);
+    const listed = await executeCommand('/memory list', baseContext({ agent }));
+    assert.match(String(listed), /MA 核心记忆/);
+    assert.match(String(listed), /writable=project-memory/);
+    assert.match(String(listed), /auto=on/);
+  });
+});
+
 test('/context routes inspection, search, recall, and pin commands to the agent', async () => {
   await withTempCwd(async () => {
     const calls: string[] = [];
@@ -124,7 +146,7 @@ test('slash suggestions only include user-facing commands', async () => {
 
     assert.deepEqual(
       Array.from(suggestions.keys()).sort(),
-      ['/clear', '/exit', '/help', '/model']
+      ['/clear', '/exit', '/help', '/memory', '/model']
     );
 
     const all = await getAllCommands();

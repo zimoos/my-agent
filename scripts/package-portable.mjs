@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf-8'));
@@ -27,6 +28,43 @@ function copyRequired(src, dest) {
   fs.cpSync(src, dest, { recursive: true });
 }
 
+function sha256(file) {
+  return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+function copyAgoraRuntime(appDir, target) {
+  if (target !== 'macos-arm64') return;
+  const source = process.env.MA_AGORA_ARTIFACT_DIR
+    ? path.resolve(process.env.MA_AGORA_ARTIFACT_DIR)
+    : path.join(root, 'resources', 'agora');
+  const manifestPath = path.join(source, 'manifest.json');
+  const binaryPath = path.join(source, 'bin', 'agora');
+  if (!fs.existsSync(manifestPath) || !fs.existsSync(binaryPath)) {
+    throw new Error('macos-arm64 portable release requires MA_AGORA_ARTIFACT_DIR with Agora 0.2.0 native artifact');
+  }
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  if (manifest.version !== '0.2.0' || manifest.host_protocol_major !== 1) {
+    throw new Error(`unexpected Agora contract: ${manifest.version}/host-v${manifest.host_protocol_major}`);
+  }
+  if (manifest.files?.['bin/agora'] !== sha256(binaryPath)) {
+    throw new Error('Agora binary SHA-256 does not match manifest');
+  }
+  const destination = path.join(appDir, 'resources', 'agora');
+  copyRequired(source, destination);
+  fs.writeFileSync(
+    path.join(destination, 'runtime-lock.json'),
+    JSON.stringify({
+      version: '0.2.0',
+      package: '@zimoos/agora-darwin-arm64',
+      platform: 'darwin-arm64',
+      host_protocol_major: 1,
+      native_core_abi: 1,
+      manifest_sha256: sha256(manifestPath),
+    }, null, 2) + '\n',
+    'utf8'
+  );
+}
+
 const outRoot = path.resolve(root, arg('--out', 'release'));
 const target = arg('--target', platformId());
 const name = `ma-${pkg.version}-${target}`;
@@ -42,6 +80,7 @@ copyRequired(path.join(root, 'dist'), path.join(app, 'dist'));
 copyRequired(path.join(root, 'node_modules'), path.join(app, 'node_modules'));
 copyRequired(path.join(root, 'package.json'), path.join(app, 'package.json'));
 copyRequired(path.join(root, 'README.md'), path.join(app, 'README.md'));
+copyAgoraRuntime(app, target);
 if (fs.existsSync(path.join(root, 'LICENSE'))) {
   fs.copyFileSync(path.join(root, 'LICENSE'), path.join(app, 'LICENSE'));
 }

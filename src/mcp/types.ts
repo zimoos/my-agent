@@ -170,6 +170,7 @@ export interface Agent {
   revertLastTurnContextOnly(): number;
   respondConfirm(requestId: string, approved: boolean): void;
   getProviderState?(): ProviderSessionState | null;
+  getMemoryController?(): import('../provider/agora.js').AgoraMemoryController | null;
   getContextUsage(): { used: number; total: number; compactThreshold: number; source: string };
   inspectContext(): string;
   searchContext(query: string): SessionPoolEntry[];

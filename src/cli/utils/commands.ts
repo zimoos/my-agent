@@ -13,6 +13,7 @@ interface CommandContext {
   exit: () => void;
   setModel?: (model: string) => void;
   openModelPicker?: () => Promise<void> | void;
+  openMemoryConsole?: () => Promise<void> | void;
   switchModelChoice?: (choice: ModelChoice) => void;
   revertLastTurn?: () => boolean;
 }
@@ -249,12 +250,94 @@ commands.set('/model', {
   },
 });
 
+commands.set('/memory', {
+  description: 'Open Agora Memory console or manage profiles',
+  suggest: true,
+  handler: async (args, ctx) => {
+    const controller = ctx.agent.getMemoryController?.();
+    if (!controller) return 'Agora memory requires the Agora provider.';
+    const trimmed = args.trim();
+    if (!trimmed) {
+      await ctx.openMemoryConsole?.();
+      return ctx.openMemoryConsole ? null : 'Memory console is unavailable in this UI.';
+    }
+    try {
+      if (trimmed === 'list') {
+        const profiles = await controller.listProfiles();
+        if (profiles.length === 0) return 'No Agora MemoryProfiles.';
+        return profiles.map((profile) => {
+          const writable = profile.writable_patch_family ? ` · writable=${profile.writable_patch_family}` : '';
+          const auto = profile.auto_intake_policy?.enabled ? ' · auto=on' : ' · auto=off';
+          return `${profile.id}  ${profile.name} · ${profile.active_memory_patch_ids.length} patches${writable}${auto}`;
+        }).join('\n');
+      }
+      if (trimmed === 'status') return (await controller.status()).content;
+      const newMatch = trimmed.match(/^new\s+(.+)$/);
+      if (newMatch) {
+        const name = newMatch[1].trim();
+        const id = `ma-${name.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-').replace(/^-|-$/g, '') || 'memory'}-${Date.now().toString(36)}`;
+        return JSON.stringify(await controller.createProfile({ profile_id: id, name }), null, 2);
+      }
+      const renameMatch = trimmed.match(/^rename\s+(\S+)\s+(.+)$/);
+      if (renameMatch) {
+        return JSON.stringify(await controller.renameProfile(renameMatch[1], renameMatch[2].trim()), null, 2);
+      }
+      const useMatch = trimmed.match(/^use\s+(\S+)(?:\s+(--session))?$/);
+      if (useMatch) {
+        return JSON.stringify(
+          await controller.selectProfile(useMatch[1], useMatch[2] ? 'conversation' : 'project'),
+          null,
+          2
+        );
+      }
+      const intakeMatch = trimmed.match(/^internalize(?:\s+--into\s+(\S+))?$/);
+      if (intakeMatch) {
+        const profileId = ctx.agent.getProviderState?.()?.memory?.profile_id;
+        if (!profileId) return 'No verified MemoryProfile is selected.';
+        const result = await controller.startIntake({ profile_id: profileId, into: intakeMatch[1] });
+        return `Memory intake queued: ${result.job_id ?? result.job?.id}`;
+      }
+      const autoMatch = trimmed.match(/^auto\s+(on|off)$/);
+      if (autoMatch) {
+        const profileId = ctx.agent.getProviderState?.()?.memory?.profile_id;
+        if (!profileId) return 'No verified MemoryProfile is selected.';
+        return JSON.stringify(await controller.setAutoPolicy(profileId, autoMatch[1] === 'on'), null, 2);
+      }
+      if (trimmed === 'history') {
+        const profileId = ctx.agent.getProviderState?.()?.memory?.profile_id;
+        const profiles = await controller.listProfiles();
+        const profile = profiles.find((item) => item.id === profileId);
+        if (!profile?.writable_patch_family) return 'Current profile has no writable memory family.';
+        const patches = await controller.listPatches(true);
+        return patches
+          .filter((patch) => patch.family === profile.writable_patch_family)
+          .map((patch) => `${patch.id}  ${patch.name} · ${patch.version} · ${patch.status}`)
+          .join('\n') || 'No versions found.';
+      }
+      const rollbackMatch = trimmed.match(/^rollback\s+(\S+)$/);
+      if (rollbackMatch) {
+        const profileId = ctx.agent.getProviderState?.()?.memory?.profile_id;
+        if (!profileId) return 'No verified MemoryProfile is selected.';
+        return (await controller.rollback({ profile_id: profileId, patch_id: rollbackMatch[1] })).content;
+      }
+      if (trimmed === 'disable') {
+        const profileId = ctx.agent.getProviderState?.()?.memory?.profile_id;
+        if (!profileId) return 'No verified MemoryProfile is selected.';
+        return (await controller.disable({ profile_id: profileId })).content;
+      }
+      return 'usage: /memory | list | new <name> | rename <id> <name> | use <id> [--session] | status | internalize [--into <family>] | auto on|off | history | rollback <patch> | disable';
+    } catch (err) {
+      return `Memory error: ${(err as Error).message}`;
+    }
+  },
+});
+
 commands.set('/skills', {
   description: 'List all available skills',
   handler: async (_, ctx) => {
     await loadSkills();
     const skillCommands = Array.from(commands.entries())
-      .filter(([name, cmd]) => name.startsWith('/') && !['/quit', '/exit', '/tools', '/stack', '/abort', '/archive', '/context', '/clear', '/help', '/revert', '/undo', '/models', '/model', '/skills'].includes(name));
+      .filter(([name, cmd]) => name.startsWith('/') && !['/quit', '/exit', '/tools', '/stack', '/abort', '/archive', '/context', '/clear', '/help', '/revert', '/undo', '/models', '/model', '/memory', '/skills'].includes(name));
 
     if (skillCommands.length === 0) {
       return 'No custom skills found. Create skills in .ma/skills/ directory.';

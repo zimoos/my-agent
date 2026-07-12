@@ -1849,6 +1849,10 @@ export async function createAgent(
     }
   }
 
+  function getMemoryController(): AgoraMemoryController | null {
+    return agoraMemoryController;
+  }
+
   function inspectContext(): string {
     return contextManager.inspect();
   }
@@ -1894,6 +1898,7 @@ export async function createAgent(
     revertLastTurnContextOnly,
     respondConfirm,
     getProviderState,
+    getMemoryController,
     getContextUsage,
     inspectContext,
     searchContext,
