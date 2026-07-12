@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
+import agoraReleaseLock from './agora-runtime-lock.json' with { type: 'json' };
 import type {
   ChatCompletion,
   ChatCompletionCreateParamsNonStreaming,
@@ -267,9 +268,18 @@ interface ResolvedAgoraCommand {
   lock?: Record<string, any>;
 }
 
+export function parseDeveloperIdSignature(details: string): boolean {
+  return details.split(/\r?\n/).some((line) => line.startsWith('Authority=Developer ID Application:')) &&
+    details.split(/\r?\n/).some((line) => line.startsWith('TeamIdentifier=') && line !== 'TeamIdentifier=not set');
+}
+
 function verifyNativeSignature(command: string): boolean {
   if (process.platform !== 'darwin') return true;
-  return spawnSync('/usr/bin/codesign', ['--verify', '--strict', '--verbose=2', command], { stdio: 'ignore' }).status === 0;
+  if (spawnSync('/usr/bin/codesign', ['--verify', '--strict', '--verbose=2', command], { stdio: 'ignore' }).status !== 0) {
+    return false;
+  }
+  const details = spawnSync('/usr/bin/codesign', ['-d', '--verbose=4', command], { encoding: 'utf8' });
+  return details.status === 0 && parseDeveloperIdSignature(`${details.stdout ?? ''}\n${details.stderr ?? ''}`);
 }
 
 function sha256File(file: string): string {
@@ -296,10 +306,14 @@ function verifyBundledAgora(command: string): Record<string, any> | null {
   try {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    if (agoraReleaseLock.published !== true || lock.published !== true) return null;
     if (!verifyAgoraManifestFiles(root, manifest)) return null;
     if (manifest.version !== lock.version || manifest.host_protocol_major !== lock.host_protocol_major) return null;
     if (lock.native_core_abi !== undefined && manifest.native_core_abi !== lock.native_core_abi) return null;
     if (lock.manifest_sha256 && sha256File(manifestPath) !== lock.manifest_sha256) return null;
+    if (lock.manifest_sha256 !== agoraReleaseLock.manifest_sha256) return null;
+    if (lock.package_integrity !== agoraReleaseLock.packages['@zimoos/agora-darwin-arm64'].integrity) return null;
+    if (lock.notarization_id !== agoraReleaseLock.notarization_id) return null;
     if (!verifyNativeSignature(command)) return null;
     return lock;
   } catch {
@@ -309,29 +323,46 @@ function verifyBundledAgora(command: string): Record<string, any> | null {
 
 function resolveInstalledAgoraPackage(): ResolvedAgoraCommand | null {
   try {
+    if (agoraReleaseLock.published !== true) return null;
     const require = createRequire(import.meta.url);
     const packageJsonPath = require.resolve('@zimoos/agora/package.json');
     const packageRoot = path.dirname(packageJsonPath);
+    const platformPackageJsonPath = require.resolve('@zimoos/agora-darwin-arm64/package.json');
+    const platformRoot = path.dirname(platformPackageJsonPath);
     const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
-    const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot, 'manifest.json'), 'utf8'));
+    const platformPackageJson = JSON.parse(fs.readFileSync(platformPackageJsonPath, 'utf8'));
+    const manifestPath = path.join(platformRoot, 'manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     const command = path.join(packageRoot, 'bin', 'agora');
+    const platformCommand = path.join(platformRoot, 'bin', 'agora');
     const requiredCapabilities = ['mcp-stdio', 'memory-profile-v2', 'memory-intake-v2'];
     if (
       packageJson.version !== '0.2.0' ||
       packageJson.dependencies?.['@zimoos/agora-darwin-arm64'] !== '0.2.0' ||
+      platformPackageJson.version !== '0.2.0' ||
       manifest.version !== '0.2.0' ||
       manifest.host_protocol_major !== 1 ||
       manifest.native_core_abi !== 1 ||
       !requiredCapabilities.every((capability) => manifest.capabilities?.includes(capability)) ||
+      sha256File(manifestPath) !== agoraReleaseLock.manifest_sha256 ||
+      !verifyAgoraManifestFiles(platformRoot, manifest) ||
       !commandExists(command) ||
-      !verifyNativeSignature(command)
+      !commandExists(platformCommand) ||
+      !verifyNativeSignature(command) ||
+      !verifyNativeSignature(platformCommand)
     ) return null;
     return {
       command,
       args: ['mcp', 'serve'],
       trust: 'verified',
       source: 'npm',
-      lock: { version: '0.2.0', host_protocol_major: 1, native_core_abi: 1 },
+      lock: {
+        version: '0.2.0',
+        host_protocol_major: 1,
+        native_core_abi: 1,
+        manifest_sha256: agoraReleaseLock.manifest_sha256,
+        notarization_id: agoraReleaseLock.notarization_id,
+      },
     };
   } catch {
     return null;

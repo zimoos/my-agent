@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf-8'));
+const agoraLock = JSON.parse(fs.readFileSync(path.join(root, 'src', 'provider', 'agora-runtime-lock.json'), 'utf-8'));
 
 function arg(name, fallback) {
   const idx = process.argv.indexOf(name);
@@ -43,6 +44,9 @@ function copyAgoraRuntime(appDir, target) {
     throw new Error('macos-arm64 portable release requires MA_AGORA_ARTIFACT_DIR with Agora 0.2.0 native artifact');
   }
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  if (agoraLock.published !== true) {
+    throw new Error('macos-arm64 portable release requires a published, notarized Agora release lock');
+  }
   if (manifest.version !== '0.2.0' || manifest.host_protocol_major !== 1) {
     throw new Error(`unexpected Agora contract: ${manifest.version}/host-v${manifest.host_protocol_major}`);
   }
@@ -69,8 +73,13 @@ function copyAgoraRuntime(appDir, target) {
     throw new Error(`Agora user artifact contains source-like files: ${sourceLike.join(', ')}`);
   }
   const packageIntegrity = process.env.MA_AGORA_PACKAGE_INTEGRITY?.trim();
-  if (!packageIntegrity?.startsWith('sha512-')) {
-    throw new Error('macos-arm64 portable release requires MA_AGORA_PACKAGE_INTEGRITY from the exact npm tarball');
+  const expectedIntegrity = agoraLock.packages?.['@zimoos/agora-darwin-arm64']?.integrity;
+  if (packageIntegrity !== expectedIntegrity) {
+    throw new Error('macos-arm64 portable release package integrity does not match the pinned Agora release');
+  }
+  const manifestSha = sha256(manifestPath);
+  if (manifestSha !== agoraLock.manifest_sha256) {
+    throw new Error('macos-arm64 portable release manifest SHA does not match the pinned Agora release');
   }
   const destination = path.join(appDir, 'resources', 'agora');
   copyRequired(source, destination);
@@ -82,8 +91,10 @@ function copyAgoraRuntime(appDir, target) {
       platform: 'darwin-arm64',
       host_protocol_major: 1,
       native_core_abi: 1,
+      published: true,
+      notarization_id: agoraLock.notarization_id,
       package_integrity: packageIntegrity,
-      manifest_sha256: sha256(manifestPath),
+      manifest_sha256: manifestSha,
     }, null, 2) + '\n',
     'utf8'
   );

@@ -20,6 +20,7 @@
     "start": "tsx src/cli/index.tsx",
     "build": "tsc && chmod +x dist/src/cli/index.js bin/ma scripts/package-portable.mjs",
     "package:portable": "npm run build && node scripts/package-portable.mjs --out release",
+    "sync:agora-release": "node scripts/sync-agora-release.mjs",
     "release:check": "npm test && npm run package:portable",
     "dev": "tsx watch src/cli/index.tsx",
     "test": "tsx --test test/*.test.ts",

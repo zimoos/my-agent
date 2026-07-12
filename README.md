@@ -191,6 +191,9 @@ When the active provider is Agora, users operate uniquely named, independently v
 Context Usage remains independent from MemoryPatch state: the TUI continues to show used/trigger/window/source from `agent.getContextUsage()`. Internalization never clears context, and compaction never claims to internalize memory.
 
 The MA portable release pins the exact Agora `0.2.0` Mach-O artifact. Agora npm user artifacts contain no `.py`, `.pyc`, `.js`, or source maps and require no login or device activation.
+MA marks an npm/bundled runtime as verified only when its Developer ID signature,
+published npm integrity, accepted notarization evidence, and platform manifest SHA
+match `src/provider/agora-runtime-lock.json`; ad-hoc candidates remain development-only.
 
 ## Built-In Tools
 
