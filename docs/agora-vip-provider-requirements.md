@@ -37,6 +37,7 @@ MA 将 Agora 作为内部 VIP provider 适配：Agora 不再只是一个 OpenAI-
 4. MemoryPatch 状态
    - Session meta 保留 `providerState`，字段包括 `provider_id`、`agora_session_id`、`memory.status`、`profile_id`、`binding_id`、`active_memory_patch_ids`、`last_verified_at`。
    - MA 只能从 Agora `chat_complete` 响应 metadata 更新 mounted 证据。
+   - Memory 控制策略、Patch 状态和管理工具只属于宿主 Controller/TUI，不得进入普通对话的 system prompt、tool schema 或 transcript。
    - mount、disable、internalize、rollback 必须验证下一次 `chat_complete` metadata 后才报告成功。
    - `/memory` 以具名 Memory 为第一层，提供多 Memory 挂载、新建/重命名、混合多目标内化、显式自动目标、历史和 CAS 回滚；Profile 仅作为后台 binding 实现。
    - 自动 intake 一次提交显式目标列表；completed/noop 不重复，review/conflict/failed 只重试未完成目标；后台任务不得禁用输入框或写入 transcript。

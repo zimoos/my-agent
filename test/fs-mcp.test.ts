@@ -25,6 +25,16 @@ function textOf(result: ToolResult): string {
   return first?.type === 'text' ? first.text ?? '' : '';
 }
 
+function bodyOf(result: ToolResult): string {
+  return textOf(result).split('\n[read_file receipt] ', 1)[0];
+}
+
+function pageReceiptOf(result: ToolResult): Record<string, unknown> {
+  const receipt = evidenceOf(result).read_file_page;
+  assert.ok(receipt && typeof receipt === 'object' && !Array.isArray(receipt));
+  return receipt as Record<string, unknown>;
+}
+
 function evidenceOf(result: ToolResult): Record<string, unknown> {
   assert.ok(
     result.structuredContent,
@@ -104,16 +114,31 @@ test('read_file: keeps the existing numbered text response and adds complete str
     const result = await callFsTool('read_file', { path });
 
     assert.equal(result.isError, false);
-    assert.equal(textOf(result), '1│alpha\n2│beta\n3│gamma');
-    assert.deepEqual(evidenceOf(result), {
-      offset: 1,
-      limit: null,
-      totalLines: 3,
-      start: 1,
-      end: 3,
+    assert.equal(bodyOf(result), '1│alpha\n2│beta\n3│gamma');
+    const evidence = evidenceOf(result);
+    assert.equal(evidence.offset, 1);
+    assert.equal(evidence.limit, null);
+    assert.equal(evidence.totalLines, 3);
+    assert.equal(evidence.start, 1);
+    assert.equal(evidence.end, 3);
+    assert.equal(evidence.complete, true);
+    assert.equal(evidence.nextOffset, null);
+    assert.equal(evidence.nextCursor, null);
+    assert.equal(evidence.hash, sha256(content));
+    assert.deepEqual(pageReceiptOf(result), {
+      kind: 'read_file_page',
+      canonical_path: path,
+      file_hash: sha256(content),
+      cursor: '1:0',
+      start_line: 1,
+      start_column: 0,
+      end_line: 3,
+      end_column: 5,
+      total_lines: 3,
       complete: true,
-      nextOffset: null,
-      hash: sha256(content),
+      next_offset: null,
+      next_cursor: null,
+      body_chars: bodyOf(result).length,
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -130,7 +155,7 @@ test('read_file: reports precise evidence for a partial page', async () => {
     const result = await callFsTool('read_file', { path, offset: 3, limit: 2 });
     const evidence = evidenceOf(result);
 
-    assert.equal(textOf(result), '3│line-3\n4│line-4');
+    assert.equal(bodyOf(result), '3│line-3\n4│line-4');
     assert.equal(evidence.offset, 3);
     assert.equal(evidence.limit, 2);
     assert.equal(evidence.totalLines, 8);
@@ -160,7 +185,7 @@ test('read_file: nextOffset paginates without gaps or overlap and preserves one 
     while (offset !== null) {
       const result = await callFsTool('read_file', { path, offset, limit: 3 });
       const evidence = evidenceOf(result);
-      const pageLines = textOf(result).split('\n');
+      const pageLines = bodyOf(result).split('\n');
       received.push(...pageLines.map((line) => line.replace(/^\s*\d+│/, '')));
       hashes.add(String(evidence.hash));
       pageCount++;
@@ -181,6 +206,105 @@ test('read_file: nextOffset paginates without gaps or overlap and preserves one 
     assert.equal(pageCount, 3);
     assert.deepEqual(received, sourceLines);
     assert.deepEqual([...hashes], [sha256(content)]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('read_file: normalizes positive integer strings and rejects invalid pagination instead of restarting at line one', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fs-mcp-'));
+  try {
+    const path = join(dir, 'numeric.txt');
+    const content = Array.from({ length: 120 }, (_, i) => `line-${i + 1}`).join('\n');
+    writeFileSync(path, content);
+
+    const numeric = await callFsTool('read_file', { path, offset: 100, limit: 2 });
+    const stringified = await callFsTool('read_file', { path, offset: '100', limit: '2' });
+    assert.equal(bodyOf(stringified), bodyOf(numeric));
+    assert.equal(evidenceOf(stringified).offset, 100);
+    assert.equal(evidenceOf(stringified).limit, 2);
+
+    for (const [field, value] of [['offset', 'abc'], ['offset', 0], ['offset', -1], ['limit', 'NaN'], ['limit', null]] as const) {
+      const failed = await callFsTool('read_file', { path, [field]: value });
+      assert.equal(failed.isError, true);
+      const error = failed.structuredContent?.error as Record<string, unknown>;
+      assert.equal(error.kind, 'invalid_pagination_argument');
+      assert.equal(error.field, field);
+      assert.doesNotMatch(textOf(failed), /1│line-1/);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('read_file: 198-line and 212-line sources reconstruct through bounded pages without gaps', async () => {
+  for (const lineCount of [198, 212]) {
+    const dir = mkdtempSync(join(tmpdir(), 'fs-mcp-'));
+    try {
+      const path = join(dir, `large-${lineCount}.ts`);
+      const sourceLines = Array.from({ length: lineCount }, (_, i) => `export const value${i + 1} = ${JSON.stringify('x'.repeat(24))};`);
+      const content = sourceLines.join('\n');
+      writeFileSync(path, content);
+
+      const received: string[] = [];
+      let cursor: string | null = '1:0';
+      const hashes = new Set<string>();
+      while (cursor !== null) {
+        const result = await callFsTool('read_file', { path, cursor });
+        const receipt = pageReceiptOf(result);
+        assert.ok(Number(receipt.body_chars) <= 3200);
+        received.push(...bodyOf(result).split('\n').map((line) => line.replace(/^\s*\d+│/, '')));
+        hashes.add(String(receipt.file_hash));
+        cursor = receipt.next_cursor as string | null;
+      }
+      assert.equal(received.join('\n'), content, `${lineCount}-line source must reconstruct exactly`);
+      assert.deepEqual([...hashes], [sha256(content)]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('read_file: a 20K single line reconstructs exactly through column cursors', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fs-mcp-'));
+  try {
+    const path = join(dir, 'minified.js');
+    const content = `const payload=${JSON.stringify('z'.repeat(20_000))};`;
+    writeFileSync(path, content);
+
+    let cursor: string | null = '1:0';
+    let rebuilt = '';
+    let pages = 0;
+    while (cursor !== null) {
+      const result = await callFsTool('read_file', { path, cursor });
+      const receipt = pageReceiptOf(result);
+      rebuilt += bodyOf(result).replace(/^\s*1│/, '');
+      cursor = receipt.next_cursor as string | null;
+      pages++;
+    }
+    assert.ok(pages > 1);
+    assert.equal(rebuilt, content);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('read_file: files above 256KB remain available through explicit pagination', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fs-mcp-'));
+  try {
+    const path = join(dir, 'oversized-generated.ts');
+    const content = Array.from({ length: 12_000 }, (_, i) => `export const generated_${i} = ${i};`).join('\n');
+    writeFileSync(path, content);
+    assert.ok(Buffer.byteLength(content) > 256 * 1024);
+
+    const unpaged = await callFsTool('read_file', { path });
+    assert.equal(unpaged.isError, true);
+    assert.match(textOf(unpaged), /offset\/limit 或 cursor/);
+
+    const paged = await callFsTool('read_file', { path, offset: '1', limit: '2' });
+    assert.equal(paged.isError, false);
+    assert.match(bodyOf(paged), /1│export const generated_0/);
+    assert.equal(evidenceOf(paged).nextOffset, 3);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
