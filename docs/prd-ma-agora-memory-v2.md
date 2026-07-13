@@ -69,6 +69,7 @@ Agora v2 已提供：
 
 - 不在 MA 重新实现 Memory 编译、gate、segment、CAS 或回滚算法。
 - 不把记忆事实注入 system prompt 模拟 Agora Memory。
+- 不把 MemoryPatch 管理策略、状态或工具 schema 暴露给普通对话模型。
 - 不支持生成到一半的 mid-token 热插拔；切换在下一次 chat 边界生效。
 - 不支持跨不同 base model 挂载不兼容 Patch。
 - 不引入账号、登录、机器绑定、许可证、云同步或 ZimoOS 依赖。
@@ -250,7 +251,7 @@ conversation override > project default > user default > no memory
 
 ### 9.5 手动内化
 
-入口：`i`、`/memory internalize` 或 agent memory tool。
+入口：`i`、`/memory internalize` 或 Memory Console。
 
 步骤：
 
@@ -331,7 +332,7 @@ conversation override > project default > user default > no memory
 | `/memory status` | 查看 ids、binding、batch、revision 和 capability 详情 |
 | `/memory disable` | 当前 scope 不使用记忆 |
 
-命令、TUI 和 agent tool 必须调用同一个 Controller，禁止三套业务逻辑。
+命令和 TUI 必须调用同一个宿主 Controller，禁止重复业务逻辑；Controller 不作为对话模型工具暴露。
 
 ## 11. MA 状态模型
 
@@ -381,7 +382,7 @@ type AgoraMemoryV2State = {
 
 ## 12. Controller 改造
 
-现有 `AgoraMemoryController` 升级为 v2，TUI、命令和 agent tool 共同复用：
+现有 `AgoraMemoryController` 升级为 v2，由 TUI 和命令在宿主控制面共同复用：
 
 ```text
 capabilities()
@@ -577,7 +578,7 @@ v2 必需 capability：
 ## 20. 关闭标准
 
 - MA 不再以 `writable_patch_family` 作为 Memory Console 主交互。
-- TUI、命令、agent tool 全部复用同一个 v2 Controller。
+- TUI 和命令全部复用同一个 v2 Controller，普通模型请求不包含该 Controller 的工具 schema。
 - 具名 Memory、多挂载、多目标内化、自动目标、回滚、revision 验证全部可用。
 - 所有挂载成功都有真实 chat metadata 证据。
 - Patch-only 切换不重启 Agora、不显示模型重新加载。
@@ -616,7 +617,7 @@ Agora v2 当前证据：
 - `providerState` 持久化框架。
 - StatusBar 第一行 Context Usage。
 - Memory Console 的 modal、键盘导航和 Activity 区域。
-- 命令注册和 agent tool 暴露框架。
+- 命令注册和宿主 Controller 调用框架。
 - 现有 PTY、provider runtime、普通 Provider 和 Context Usage 测试基础。
 
 ### 22.2 必须替换
@@ -652,7 +653,7 @@ Agora v2 当前证据：
 - [ ] 名称冲突保留输入并允许原地重试。
 - [ ] StatusBar 显示 Memory 名称、版本、+N、verified/pending/stale 和 Activity。
 - [ ] 实现 mounted badge 流动高光及 NO_COLOR/reduced-motion 降级。
-- [ ] 重写 `/memory` 命令并确保与 TUI、agent tool 共用 Controller。
+- [ ] 重写 `/memory` 命令并确保与 TUI 共用宿主 Controller，且不进入模型工具列表。
 
 ### Automatic intake
 

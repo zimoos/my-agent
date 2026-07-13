@@ -183,7 +183,7 @@ DeepSeek/deepseek-v4-flash
 
 MA 可以把 Agora 作为 provider 自己管理的 MCP stdio 子进程运行，不要求用户维护本地 HTTP 服务。TUI 会展示真实的本地模型加载、记忆挂载和生成阶段。
 
-当 Agora 是当前 provider 时，用户操作的是名称唯一、可持续迭代的 Memory；MemoryPatch 是它的不可变版本。只有下一次 Agora 响应 metadata 返回相同的 ordered Patch ids 和更新后的 PatchSet revision，MA 才会显示 `mounted`；不会把一段事实塞进 prompt 伪装成记忆。
+当 Agora 是当前 provider 时，用户操作的是名称唯一、可持续迭代的 Memory；MemoryPatch 是它的不可变版本。只有下一次 Agora 响应 metadata 返回相同的 ordered Patch ids 和更新后的 PatchSet revision，MA 才会显示 `mounted`。记忆管理只存在于宿主侧 `/memory` 控制面：MA 既不会把事实塞进 prompt，也不会向对话模型暴露 MemoryPatch 策略和管理工具。
 
 `/memory` 可在项目或单个会话中同时挂载 0～N 个 Memory，并在下一次请求边界热拔插，不重启基座。内化时可以在一个 batch 中混合“新建 Memory”和“增量到多个旧 Memory”；同一 source 只提取一次，各目标独立报告 completed/noop/review/conflict/failed。自动内化必须显式选择目标，默认在 4 个新增用户回合或约 2000 pending tokens、空闲 60 秒后运行；失败目标可单独重试或明确放弃，输入框和 transcript 不受影响。
 
