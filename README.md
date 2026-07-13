@@ -184,7 +184,7 @@ DeepSeek/deepseek-v4-flash
 
 MA can run Agora as a provider-owned MCP stdio subprocess instead of asking users to manage a local HTTP server. The TUI reports real provider stages such as local-model loading, memory mounting, and generation.
 
-When the active provider is Agora, users operate uniquely named, independently versioned Memories; MemoryPatch is the immutable version object. MA reports `mounted` only after a later Agora response returns the requested ordered Patch ids and an advanced PatchSet revision. It never fakes memory by injecting facts into a prompt.
+When the active provider is Agora, users operate uniquely named, independently versioned Memories; MemoryPatch is the immutable version object. MA reports `mounted` only after a later Agora response returns the requested ordered Patch ids and an advanced PatchSet revision. Memory management stays in the host-side `/memory` control plane: MA neither injects facts into the prompt nor exposes MemoryPatch policy and management tools to the conversational model.
 
 `/memory` can mount zero or more Memories per project or conversation and hot-swap them at the next request boundary without restarting the base model. One intake batch may mix a new Memory with increments to multiple existing Memories; the source is extracted once and each target reports completed/noop/review/conflict/failed independently. Automatic intake requires explicit targets and runs after 4 new user turns or about 2,000 pending tokens plus 60 seconds of idle time. Failed targets can be retried alone or explicitly abandoned without blocking input or adding transcript noise.
 
