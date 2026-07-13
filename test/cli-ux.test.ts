@@ -57,6 +57,7 @@ test('CLI UX PTY: DeepSeek status bar uses provider capability instead of 33k fa
   try {
     await waitFor(() => /win\s+1m\s+registry/.test(stripAnsi(output)), 10_000);
     const plain = stripAnsi(output);
+    assert.match(plain, /v0\.3\.0/);
     assert.match(plain, /ctx:/);
     assert.match(plain, /trigger/);
     assert.match(plain, /win 1m registry/);
