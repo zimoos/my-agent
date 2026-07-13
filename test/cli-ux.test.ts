@@ -165,6 +165,49 @@ test('CLI UX PTY: queued startup message auto-sends once after Agora becomes rea
   }
 });
 
+test('CLI UX PTY: Agora generation uses an indeterminate spinner without fake 65%', async (t) => {
+  if (process.env.MA_RUN_PTY_TESTS !== '1') {
+    t.skip('PTY UI verification runs only in the explicit MA_RUN_PTY_TESTS E2E lane');
+    return;
+  }
+  if (!canSpawnPty()) {
+    t.skip('node-pty cannot spawn a basic /bin/echo process in this environment');
+    return;
+  }
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ma-cli-agora-progress-'));
+  const fakeAgora = path.join(tmp, 'agora-progress.mjs');
+  const configPath = path.join(tmp, 'config.json');
+  fs.writeFileSync(fakeAgora, fakeAgoraV2Source(0, 800), 'utf8');
+  fs.writeFileSync(configPath, JSON.stringify({
+    defaultProfile: '',
+    model: {
+      provider: 'agora', baseURL: 'mcp-stdio://agora', model: 'base-a', apiKey: 'agora-mcp',
+      agoraRuntime: { command: process.execPath, args: [fakeAgora] },
+    },
+    mcpServers: {},
+  }));
+  const builtCli = path.join(repoRoot, 'dist', 'src', 'cli', 'index.js');
+  const child = pty.spawn(process.execPath, [builtCli, 'chat', '--config', configPath], {
+    name: 'xterm-256color', cols: 100, rows: 24, cwd: repoRoot,
+    env: { ...process.env, NO_COLOR: '1' },
+  });
+  let output = '';
+  child.onData((data) => { output += data; });
+  try {
+    await waitFor(() => /runtime ready/.test(stripAnsi(output)) && /❯/.test(stripAnsi(output)), 5000);
+    child.write('show-indeterminate-generation');
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    child.write('\r');
+    await waitFor(() => /Agora · 生成回复/.test(stripAnsi(output)), 5000);
+    const duringGeneration = stripAnsi(output);
+    assert.doesNotMatch(duringGeneration, /生成回复[^\n]*65%/);
+    await waitFor(() => /queued-auto-response/.test(stripAnsi(output)), 5000);
+  } finally {
+    child.kill('SIGINT');
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test('CLI UX PTY: DeepSeek status bar uses provider capability instead of 33k fallback', async (t) => {
   if (process.env.MA_RUN_PTY_TESTS !== '1') {
     t.skip('PTY UI verification runs only in the explicit MA_RUN_PTY_TESTS E2E lane');
@@ -322,7 +365,7 @@ test('CLI UX PTY: Agora Memory v2 console is name-first and readable at 80 colum
   }
 });
 
-function fakeAgoraV2Source(initializeDelayMs = 0): string {
+function fakeAgoraV2Source(initializeDelayMs = 0, generationDelayMs = 0): string {
   return `let buffer = '';
 const names = ${JSON.stringify([
     'doctor', 'runtime_capabilities', 'models_list', 'models_status', 'models_download', 'chat_complete',
@@ -357,6 +400,18 @@ process.stdin.on('data', (chunk) => {
     else if (req.method === 'tools/call') result = { content: [{ type: 'text', text: JSON.stringify(payloads[req.params.name] || { status: 'ok' }) }] };
     const send = () => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: req.id, result }) + '\\n');
     if (req.method === 'initialize' && ${initializeDelayMs} > 0) setTimeout(send, ${initializeDelayMs});
+    else if (req.method === 'tools/call' && req.params.name === 'chat_complete' && ${generationDelayMs} > 0) {
+      const progressToken = req.params?._meta?.progressToken;
+      if (progressToken !== undefined) {
+        process.stdout.write(JSON.stringify({
+          jsonrpc: '2.0', method: 'notifications/progress', params: {
+            progressToken, progress: 65, total: 100,
+            message: JSON.stringify({ event: { operation: 'chat.complete', phase: 'generation', progress: 65, details: { session_id: 'session-a' } } }),
+          },
+        }) + '\\n');
+      }
+      setTimeout(send, ${generationDelayMs});
+    }
     else send();
   }
 });
