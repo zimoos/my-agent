@@ -335,14 +335,16 @@ function resolveInstalledAgoraPackage(): ResolvedAgoraCommand | null {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     const command = path.join(packageRoot, 'bin', 'agora');
     const platformCommand = path.join(platformRoot, 'bin', 'agora');
-    const requiredCapabilities = ['mcp-stdio', 'memory-profile-v2', 'memory-intake-v2'];
+    const expectedVersion = agoraReleaseLock.version;
+    const requiredCapabilities = agoraReleaseLock.capabilities ?? [];
     if (
-      packageJson.version !== '0.2.0' ||
-      packageJson.dependencies?.['@zimoos/agora-darwin-arm64'] !== '0.2.0' ||
-      platformPackageJson.version !== '0.2.0' ||
-      manifest.version !== '0.2.0' ||
-      manifest.host_protocol_major !== 1 ||
-      manifest.native_core_abi !== 1 ||
+      packageJson.version !== expectedVersion ||
+      packageJson.dependencies?.['@zimoos/agora-darwin-arm64'] !== expectedVersion ||
+      platformPackageJson.version !== expectedVersion ||
+      manifest.version !== expectedVersion ||
+      manifest.host_protocol_major !== agoraReleaseLock.host_protocol_major ||
+      manifest.native_core_abi !== agoraReleaseLock.native_core_abi ||
+      manifest.runtime_layout !== agoraReleaseLock.runtime_layout ||
       !requiredCapabilities.every((capability) => manifest.capabilities?.includes(capability)) ||
       sha256File(manifestPath) !== agoraReleaseLock.manifest_sha256 ||
       !verifyAgoraManifestFiles(platformRoot, manifest) ||
@@ -357,9 +359,9 @@ function resolveInstalledAgoraPackage(): ResolvedAgoraCommand | null {
       trust: 'verified',
       source: 'npm',
       lock: {
-        version: '0.2.0',
-        host_protocol_major: 1,
-        native_core_abi: 1,
+        version: expectedVersion,
+        host_protocol_major: agoraReleaseLock.host_protocol_major,
+        native_core_abi: agoraReleaseLock.native_core_abi,
         manifest_sha256: agoraReleaseLock.manifest_sha256,
         notarization_id: agoraReleaseLock.notarization_id,
       },

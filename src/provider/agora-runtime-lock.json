@@ -3,6 +3,7 @@
   "platform": "darwin-arm64",
   "host_protocol_major": 1,
   "native_core_abi": 1,
+  "runtime_layout": "legacy-onefile-v1",
   "published": false,
   "notarization_id": null,
   "manifest_sha256": "5af44c6ed85e3bafc55c1ef83f574fb40aae4cdc5a6e5920841411808cdd35dc",

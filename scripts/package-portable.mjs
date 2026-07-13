@@ -41,16 +41,21 @@ function copyAgoraRuntime(appDir, target) {
   const manifestPath = path.join(source, 'manifest.json');
   const binaryPath = path.join(source, 'bin', 'agora');
   if (!fs.existsSync(manifestPath) || !fs.existsSync(binaryPath)) {
-    throw new Error('macos-arm64 portable release requires MA_AGORA_ARTIFACT_DIR with Agora 0.2.0 native artifact');
+    throw new Error(`macos-arm64 portable release requires MA_AGORA_ARTIFACT_DIR with Agora ${agoraLock.version} native artifact`);
   }
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   if (agoraLock.published !== true) {
     throw new Error('macos-arm64 portable release requires a published, notarized Agora release lock');
   }
-  if (manifest.version !== '0.2.0' || manifest.host_protocol_major !== 1) {
+  if (
+    manifest.version !== agoraLock.version ||
+    manifest.host_protocol_major !== agoraLock.host_protocol_major ||
+    manifest.native_core_abi !== agoraLock.native_core_abi ||
+    manifest.runtime_layout !== agoraLock.runtime_layout
+  ) {
     throw new Error(`unexpected Agora contract: ${manifest.version}/host-v${manifest.host_protocol_major}`);
   }
-  const requiredCapabilities = ['mcp-stdio', 'memory-profile-v2', 'memory-intake-v2'];
+  const requiredCapabilities = agoraLock.capabilities ?? [];
   if (!requiredCapabilities.every((capability) => manifest.capabilities?.includes(capability))) {
     throw new Error('Agora artifact is missing required Memory v2 capabilities');
   }
@@ -86,7 +91,7 @@ function copyAgoraRuntime(appDir, target) {
   fs.writeFileSync(
     path.join(destination, 'runtime-lock.json'),
     JSON.stringify({
-      version: '0.2.0',
+      version: agoraLock.version,
       package: '@zimoos/agora-darwin-arm64',
       platform: 'darwin-arm64',
       host_protocol_major: 1,
