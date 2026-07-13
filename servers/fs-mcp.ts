@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, lstatSync, readlinkSync, existsSync, openSync, readSync, closeSync } from 'node:fs';
-import { dirname, extname, join, relative } from 'node:path';
+import { dirname, extname, join, relative, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { createHash, randomUUID } from 'node:crypto';
 import pico from 'picocolors';
@@ -9,6 +9,7 @@ interface Req { jsonrpc: '2.0'; id?: Id; method: string; params?: unknown }
 interface Res { jsonrpc: '2.0'; id: Id; result?: unknown; error?: { code: number; message: string } }
 
 const MAX_FILE_BYTES = 256 * 1024;
+const READ_PAGE_BODY_CHARS = 3200;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const IGNORED = new Set(['node_modules', '.git', 'dist']);
 const IMG_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico', '.svg']);
@@ -18,8 +19,9 @@ const TOOLS = [
   { name: 'read_file', description: '读取文件内容，带行号输出。支持 offset/limit 分段读取，二进制文件拒绝，大文件保护 256KB。',
     inputSchema: { type: 'object', required: ['path'], properties: {
       path: { type: 'string', description: '文件路径（必填）。例如: ./package.json' },
-      offset: { type: 'number', description: '起始行（1-indexed，可选）' },
-      limit: { type: 'number', description: '读取行数（可选）' } } } },
+      offset: { type: ['number', 'string'], description: '起始行（1-indexed，可选；正整数字符串会规范化）' },
+      limit: { type: ['number', 'string'], description: '最多读取行数（可选；仍受 3200 字符预算约束）' },
+      cursor: { type: 'string', description: '超长单行续读位置，格式 line:column；与 offset 互斥' } } } },
   { name: 'write_file', description: '写入文件，自动创建父目录。行尾统一为 LF。',
     inputSchema: { type: 'object', required: ['path', 'content'],
       properties: { path: { type: 'string' }, content: { type: 'string' } } } },
@@ -68,14 +70,108 @@ function isBinary(path: string): boolean {
   } catch { return false; } finally { if (fd !== null) try { closeSync(fd); } catch { /* */ } }
 }
 
-function formatLines(s: string, offset: number, limit: number | null): string {
-  const all = s.split('\n');
-  const start = Math.max(1, offset) - 1;
-  const end = limit !== null ? Math.min(all.length, start + limit) : all.length;
-  const width = String(end).length;
-  const out: string[] = [];
-  for (let i = start; i < end; i++) out.push(`${String(i + 1).padStart(width, ' ')}│${all[i]}`);
-  return out.join('\n');
+function invalidPagination(field: string, value: unknown, expected: string) {
+  return ok(
+    `read_file: invalid ${field}; expected ${expected}`,
+    true,
+    { error: { kind: 'invalid_pagination_argument', field, value, expected } },
+  );
+}
+
+function positiveInteger(field: string, value: unknown): number | null | ReturnType<typeof invalidPagination> {
+  if (value === undefined) return null;
+  const parsed = typeof value === 'string' && /^[1-9]\d*$/.test(value.trim())
+    ? Number(value.trim())
+    : value;
+  if (typeof parsed !== 'number' || !Number.isSafeInteger(parsed) || parsed <= 0) {
+    return invalidPagination(field, value, 'a positive integer');
+  }
+  return parsed;
+}
+
+function parseCursor(value: unknown): { line: number; column: number } | null | ReturnType<typeof invalidPagination> {
+  if (value === undefined) return null;
+  if (typeof value !== 'string') return invalidPagination('cursor', value, 'line:column');
+  const match = /^([1-9]\d*):(0|[1-9]\d*)$/.exec(value.trim());
+  if (!match) return invalidPagination('cursor', value, 'line:column');
+  const line = Number(match[1]);
+  const column = Number(match[2]);
+  if (!Number.isSafeInteger(line) || !Number.isSafeInteger(column)) {
+    return invalidPagination('cursor', value, 'safe integer line:column');
+  }
+  return { line, column };
+}
+
+function isToolError(value: unknown): value is ReturnType<typeof invalidPagination> {
+  return Boolean(value && typeof value === 'object' && 'isError' in value);
+}
+
+interface ReadPage {
+  body: string;
+  startLine: number;
+  startColumn: number;
+  endLine: number;
+  endColumn: number;
+  complete: boolean;
+  nextOffset: number | null;
+  nextCursor: string | null;
+}
+
+function buildReadPage(
+  lines: string[],
+  startLine: number,
+  startColumn: number,
+  limit: number | null,
+): ReadPage {
+  const width = String(lines.length).length;
+  const fragments: string[] = [];
+  let bodyChars = 0;
+  let lineIndex = startLine - 1;
+  let column = startColumn;
+  let touchedLines = 0;
+  let endLine = startLine;
+  let endColumn = startColumn;
+
+  while (lineIndex < lines.length && (limit === null || touchedLines < limit)) {
+    const lineNumber = lineIndex + 1;
+    const line = lines[lineIndex] ?? '';
+    if (column > line.length) break;
+    const separatorChars = fragments.length > 0 ? 1 : 0;
+    const prefix = `${String(lineNumber).padStart(width, ' ')}│`;
+    const available = READ_PAGE_BODY_CHARS - bodyChars - separatorChars - prefix.length;
+    if (available < 0 || (available === 0 && line.length > column)) break;
+    const remaining = line.length - column;
+    // Keep ordinary source lines atomic. Column pagination is reserved for a
+    // line that cannot fit on an otherwise empty page (minified/generated code).
+    if (remaining > available && fragments.length > 0 && column === 0) break;
+    const consumed = Math.min(remaining, available);
+    const fragment = prefix + line.slice(column, column + consumed);
+    fragments.push(fragment);
+    bodyChars += separatorChars + fragment.length;
+    touchedLines++;
+    endLine = lineNumber;
+    endColumn = column + consumed;
+
+    if (consumed < remaining) {
+      column += consumed;
+      break;
+    }
+    lineIndex++;
+    column = 0;
+  }
+
+  const complete = lineIndex >= lines.length;
+  const nextCursor = complete ? null : `${lineIndex + 1}:${column}`;
+  return {
+    body: fragments.join('\n'),
+    startLine,
+    startColumn,
+    endLine,
+    endColumn,
+    complete,
+    nextOffset: complete || column !== 0 ? null : lineIndex + 1,
+    nextCursor,
+  };
 }
 
 function fsErr(op: string, path: string, e: unknown) {
@@ -89,30 +185,64 @@ function handleReadFile(args: Record<string, unknown>) {
   if (typeof args.path !== 'string' || !args.path.trim()) return ok('Error: path parameter is required', true);
   const path = args.path.trim();
   if (DEVICES.has(path)) return ok(`拒绝读取设备文件: ${path}`, true);
-  const offset = typeof args.offset === 'number' && args.offset > 0 ? Math.floor(args.offset) : 1;
-  const limit = typeof args.limit === 'number' && args.limit > 0 ? Math.floor(args.limit) : null;
+  const parsedOffset = positiveInteger('offset', args.offset);
+  if (isToolError(parsedOffset)) return parsedOffset;
+  const parsedLimit = positiveInteger('limit', args.limit);
+  if (isToolError(parsedLimit)) return parsedLimit;
+  const parsedCursor = parseCursor(args.cursor);
+  if (isToolError(parsedCursor)) return parsedCursor;
+  if (parsedCursor && parsedOffset !== null) {
+    return invalidPagination('cursor', args.cursor, 'line:column without offset');
+  }
+  const offset = parsedCursor?.line ?? parsedOffset ?? 1;
+  const startColumn = parsedCursor?.column ?? 0;
+  const limit = parsedLimit;
   const ext = extname(path).toLowerCase();
   try {
     const st = statSync(path);
     if (st.isDirectory()) return ok(`不是文件（是目录）: ${path}`, true);
     if (IMG_EXTS.has(ext)) return ok(`[图片文件] ${path}\n格式: ${mime(ext)}\n大小: ${Math.round(st.size / 1024)}KB\n提示: 这是图片文件，无法以文本形式读取。请使用 read_image 获取 base64 data URL。`);
-    if (st.size > MAX_FILE_BYTES && offset === 1 && limit === null) return ok(`文件过大（${Math.round(st.size / 1024)}KB），请指定 offset 和 limit 参数读取部分内容`, true);
+    const hasExplicitPagination = parsedOffset !== null || parsedLimit !== null || parsedCursor !== null;
+    if (st.size > MAX_FILE_BYTES && !hasExplicitPagination) {
+      return ok(`文件过大（${Math.round(st.size / 1024)}KB），请使用 offset/limit 或 cursor 分页读取`, true);
+    }
     if (isBinary(path)) return ok(`二进制文件，无法读取: ${path}`, true);
     const raw = readFileSync(path, 'utf-8');
     const content = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
     const lines = content.split('\n');
-    const start = Math.max(1, offset);
-    const end = limit === null ? lines.length : Math.min(lines.length, start + limit - 1);
-    const complete = end >= lines.length;
-    return ok(formatLines(content, offset, limit), false, {
+    if (offset > lines.length || startColumn > (lines[offset - 1]?.length ?? 0)) {
+      return invalidPagination('cursor', parsedCursor ? args.cursor : `${offset}:${startColumn}`, 'an in-range line:column');
+    }
+    const page = buildReadPage(lines, offset, startColumn, limit);
+    const canonicalPath = resolve(path);
+    const hash = createHash('sha256').update(raw, 'utf8').digest('hex');
+    const receipt = {
+      kind: 'read_file_page',
+      canonical_path: canonicalPath,
+      file_hash: hash,
+      cursor: `${page.startLine}:${page.startColumn}`,
+      start_line: page.startLine,
+      start_column: page.startColumn,
+      end_line: page.endLine,
+      end_column: page.endColumn,
+      total_lines: lines.length,
+      complete: page.complete,
+      next_offset: page.nextOffset,
+      next_cursor: page.nextCursor,
+      body_chars: page.body.length,
+    };
+    const modelText = `${page.body}\n[read_file receipt] ${JSON.stringify(receipt)}`;
+    return ok(modelText, false, {
       offset,
       limit,
       totalLines: lines.length,
-      start,
-      end,
-      complete,
-      nextOffset: complete ? null : end + 1,
-      hash: createHash('sha256').update(raw, 'utf8').digest('hex'),
+      start: page.startLine,
+      end: page.endLine,
+      complete: page.complete,
+      nextOffset: page.nextOffset,
+      nextCursor: page.nextCursor,
+      hash,
+      read_file_page: receipt,
     });
   } catch (e) { return fsErr('read_file', path, e); }
 }

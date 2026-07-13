@@ -14,6 +14,7 @@ interface StatusBarProps {
   contextSource?: string;
   memoryActivity?: string;
   animateMemory?: boolean;
+  runtimeStatus?: string;
 }
 
 export function StatusBar({
@@ -28,6 +29,7 @@ export function StatusBar({
   contextSource,
   memoryActivity,
   animateMemory = true,
+  runtimeStatus,
 }: StatusBarProps) {
   const isAgora = provider?.toLowerCase() === 'agora';
   let ctxLabel = '';
@@ -71,6 +73,7 @@ export function StatusBar({
         {ctxColor ? <Text color={ctxColor}>{ctxLabel}</Text> : ctxLabel}
         {taskCount ? ` · tasks: ${taskCount}` : ''}
         {debug ? ' · 🔧 debug' : ''}
+        {runtimeStatus ? ` · runtime ${runtimeStatus}` : ''}
       </Text>
       {isAgora ? (
         <Text dimColor>

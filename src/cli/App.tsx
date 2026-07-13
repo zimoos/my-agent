@@ -50,6 +50,9 @@ export interface AppProps {
   debug?: boolean;
   onSwitchSession?: (sessionId: string) => void;
   onRestartSession?: (sessionId: string) => void;
+  initialPrompt?: string;
+  initialDraft?: string;
+  startupStatus?: string;
 }
 
 let sysMsgCounter = 0;
@@ -57,7 +60,7 @@ function nextSysId() {
   return `sys_${++sysMsgCounter}`;
 }
 
-export function App({ config, connections, agent, sessionStore, currentSessionId, debug, onSwitchSession, onRestartSession }: AppProps) {
+export function App({ config, connections, agent, sessionStore, currentSessionId, debug, onSwitchSession, onRestartSession, initialPrompt, initialDraft, startupStatus }: AppProps) {
   const app = useApp();
   const store = useMemo(() => {
     const s = createUiStore();
@@ -345,6 +348,13 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
     },
     [agent, connections, app, store, send, log, pendingImages, handleRevertLastTurn, config, memoryProfileId, openModelPicker, openMemoryConsole, startMemoryBatch, switchModelChoice]
   );
+
+  const initialPromptSentRef = useRef(false);
+  useEffect(() => {
+    if (!initialPrompt || initialPromptSentRef.current) return;
+    initialPromptSentRef.current = true;
+    handleSubmit(initialPrompt);
+  }, [handleSubmit, initialPrompt]);
 
   useEffect(() => {
     if (!memoryController || config.model.provider?.toLowerCase() !== 'agora') return;
@@ -674,6 +684,7 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
 
       <InputBox
         onSubmit={handleSubmit}
+        initialValue={initialDraft}
         disabled={!!thinking || !!pendingConfirm || !!sessionPickerSessions || !!modelPickerModels || !!memoryConsole}
         pendingImages={pendingImages}
         onClearPendingImages={() => setPendingImages([])}
@@ -692,6 +703,7 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
         contextSource={contextUsage.source}
         memoryActivity={memoryActivity}
         animateMemory={!thinking && !pendingConfirm}
+        runtimeStatus={startupStatus}
       />
     </Box>
   );

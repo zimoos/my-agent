@@ -1,4 +1,6 @@
-export type CompletionObligationKind = 'test' | 'browser';
+import type { FileReadCoverage } from './file-read-ledger.js';
+
+export type CompletionObligationKind = 'test' | 'browser' | 'file_read_coverage';
 
 export interface CompletionToolEvidence {
   toolName: string;
@@ -18,6 +20,7 @@ const MAX_COMPLETION_RETRIES = 2;
 const OBLIGATION_LABELS: Record<CompletionObligationKind, string> = {
   test: '运行测试并取得成功结果',
   browser: '使用真实浏览器自动化完成验证',
+  file_read_coverage: '用 read_file receipt 证明目标文件已连续完整读取',
 };
 
 function asksToRunTests(prompt: string): boolean {
@@ -42,12 +45,51 @@ function asksForBrowserVerification(prompt: string): boolean {
   ].some((pattern) => pattern.test(prompt));
 }
 
+function asksForCompleteFileReading(prompt: string): boolean {
+  if (
+    extractExplicitFileHints(prompt).length > 0 &&
+    /(?:完整|全部|全量|逐行)\s*(?:阅读|读取|查看|审阅|检查)|\b(?:fully|completely)\s+(?:read|review|inspect)\b/i.test(prompt)
+  ) return true;
+  return [
+    /(?:完整|全部|全量|逐行).{0,24}(?:阅读|读取|查看|审阅|检查).{0,24}(?:文件|源码|代码|项目)/i,
+    /(?:阅读|读取|查看|审阅|检查).{0,24}(?:完整|全部|全量).{0,24}(?:文件|源码|代码|项目)/i,
+    /\b(?:fully|completely)\s+(?:read|review|inspect)\b.{0,40}\b(?:file|source|code|project)/i,
+    /\b(?:read|review|inspect)\s+(?:all|every|the\s+entire)\b.{0,40}\b(?:file|source|code|project)/i,
+  ].some((pattern) => pattern.test(prompt));
+}
+
+function claimsCompleteFileReading(text: string): boolean {
+  return [
+    /(?:已经|已|我已).{0,8}(?:完整|全部|全量).{0,16}(?:阅读|读取|查看|审阅|检查)/i,
+    /(?:完整|全部|全量).{0,12}(?:看过|读过|审阅完|检查完)/i,
+    /\b(?:fully|completely)\s+(?:read|reviewed|inspected)\b/i,
+    /\b(?:read|reviewed|inspected)\s+(?:all|every|the\s+entire)\b/i,
+  ].some((pattern) => pattern.test(text));
+}
+
+export function extractExplicitFileHints(prompt: string): string[] {
+  const withoutUrls = prompt.replace(/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, ' ');
+  const candidates = withoutUrls.match(/[A-Za-z0-9_@./\\:+-]{1,512}/g) ?? [];
+  const matches = candidates
+    .map((value) => value.replace(/\\/g, '/').replace(/^\.\//, ''))
+    .filter((value) => /^(?:[A-Za-z]:\/|\/)?(?:[A-Za-z0-9_@.+-]+\/)*[A-Za-z0-9_@+-]+\.[A-Za-z][A-Za-z0-9]{0,11}$/.test(value));
+  return [...new Set(matches)];
+}
+
+function coverageMatchesHint(path: string, hint: string): boolean {
+  const normalizedPath = path.replace(/\\/g, '/');
+  const normalizedHint = hint.replace(/\\/g, '/').replace(/^\.\//, '');
+  if (hint.startsWith('/')) return normalizedPath === normalizedHint;
+  return normalizedPath === normalizedHint || normalizedPath.endsWith(`/${normalizedHint}`);
+}
+
 export function extractCompletionObligations(
   rootPrompt: string
 ): CompletionObligationKind[] {
   const obligations: CompletionObligationKind[] = [];
   if (asksToRunTests(rootPrompt)) obligations.push('test');
   if (asksForBrowserVerification(rootPrompt)) obligations.push('browser');
+  if (asksForCompleteFileReading(rootPrompt)) obligations.push('file_read_coverage');
   return obligations;
 }
 
@@ -99,11 +141,19 @@ function isBrowserAutomationTool(toolName: string): boolean {
 
 export class CompletionObligationAudit {
   private readonly required: Set<CompletionObligationKind>;
+  private readonly explicitFileHints: string[];
   private readonly completed = new Set<CompletionObligationKind>();
   private retryCount = 0;
+  private fileReadCoverage: FileReadCoverage = {
+    files: [],
+    trackedFiles: 0,
+    completeFiles: 0,
+    allComplete: false,
+  };
 
   constructor(rootPrompt: string) {
     this.required = new Set(extractCompletionObligations(rootPrompt));
+    this.explicitFileHints = extractExplicitFileHints(rootPrompt);
   }
 
   recordToolEvidence(evidence: CompletionToolEvidence): void {
@@ -119,12 +169,26 @@ export class CompletionObligationAudit {
     if (isBrowserVerificationCommand(command)) this.completed.add('browser');
   }
 
-  missing(): CompletionObligationKind[] {
-    return [...this.required].filter((kind) => !this.completed.has(kind));
+  setFileReadCoverage(coverage: FileReadCoverage): void {
+    this.fileReadCoverage = coverage;
+    const allExplicitFilesComplete = this.explicitFileHints.every((hint) =>
+      coverage.files.some((file) => file.complete && coverageMatchesHint(file.path, hint)),
+    );
+    const targetCoverageComplete = this.explicitFileHints.length > 0
+      ? allExplicitFilesComplete
+      : coverage.allComplete;
+    if (targetCoverageComplete) this.completed.add('file_read_coverage');
+    else this.completed.delete('file_read_coverage');
   }
 
-  inspectFinalAttempt(): CompletionAuditDecision {
-    const missing = this.missing();
+  missing(candidateText = ''): CompletionObligationKind[] {
+    const required = new Set(this.required);
+    if (claimsCompleteFileReading(candidateText)) required.add('file_read_coverage');
+    return [...required].filter((kind) => !this.completed.has(kind));
+  }
+
+  inspectFinalAttempt(candidateText = ''): CompletionAuditDecision {
+    const missing = this.missing(candidateText);
     if (missing.length === 0) return { status: 'complete', missing };
 
     if (this.retryCount < MAX_COMPLETION_RETRIES) {
@@ -145,11 +209,23 @@ export class CompletionObligationAudit {
 
   private buildRetryMessage(missing: CompletionObligationKind[]): string {
     const details = missing.map((kind) => OBLIGATION_LABELS[kind]).join('；');
+    const absentHints = this.explicitFileHints.filter((hint) =>
+      !this.fileReadCoverage.files.some((file) => file.complete && coverageMatchesHint(file.path, hint)),
+    );
+    const partialFiles = this.fileReadCoverage.files
+      .filter((file) => !file.complete)
+      .map((file) => `${file.path} next_cursor=${file.nextCursor}`);
+    const unread = missing.includes('file_read_coverage')
+      ? this.fileReadCoverage.files.length === 0
+        ? `当前没有任何可信 read_file page receipt。${absentHints.length > 0 ? ` 用户点名但尚未证明：${absentHints.join('；')}` : ''}`
+        : `未覆盖：${[...absentHints.map((hint) => `${hint} 尚无完整回执`), ...partialFiles].join('；')}`
+      : '';
     return [
       `[MA completion audit] 不能完成任务：仍缺少 ${details}。`,
-      '请现在直接调用工具补齐验证。测试必须由成功的测试命令证明；浏览器验证必须由真实浏览器自动化或明确的 Playwright/Puppeteer/browser verification 命令证明。',
-      'web_fetch/HTTP 200、只写验证脚本、以及文字自述都不算完成证据。',
-    ].join('\n');
+      unread,
+      '请现在直接调用工具补齐验证。测试必须由成功的测试命令证明；浏览器验证必须由真实浏览器自动化证明；完整读取必须由同一文件 hash 上从 1:0 连续到 EOF 的 read_file receipt 证明。',
+      'exec cat/sed/head/tail、web_fetch/HTTP 200、只写验证脚本、以及文字自述都不算对应完成证据。',
+    ].filter(Boolean).join('\n');
   }
 
   private buildFailureMessage(missing: CompletionObligationKind[]): string {

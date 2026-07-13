@@ -58,6 +58,8 @@ import {
 } from './agent/context-manager.js';
 import { RuntimeContextSlotStore } from './agent/runtime-context-slots.js';
 import { CompletionObligationAudit } from './agent/completion-obligations.js';
+import { FileReadLedger } from './agent/file-read-ledger.js';
+import { join } from 'node:path';
 
 export interface CreateAgentOptions {
   resumeMessages?: ChatCompletionMessageParam[];
@@ -1035,6 +1037,11 @@ export async function createAgent(
     sessionStore?.getSessionDir()
   );
   const runtimeSlots = new RuntimeContextSlotStore();
+  const fileReadLedger = new FileReadLedger(
+    sessionStore && sessionId
+      ? join(sessionStore.getSessionDir(), `${sessionId}.reads.json`)
+      : undefined,
+  );
   if (options.resumeMessages) {
     contextManager.ensureIndexed(
       options.resumeMessages.filter((m) => m.role !== 'system')
@@ -1261,7 +1268,8 @@ export async function createAgent(
       config,
       connections,
       activeBuiltinTools,
-      { nextId: nextConfirmId, awaitApproval: awaitConfirm }
+      { nextId: nextConfirmId, awaitApproval: awaitConfirm },
+      fileReadLedger,
     );
 
     let openingContent: ChatCompletionUserMessageParam['content'];
@@ -1509,7 +1517,8 @@ export async function createAgent(
           message: 'Model repeated prior truncated output after continuation; stopped automatic continuation to avoid runaway repetition.',
         };
         if (!task.parentId) {
-          const completionDecision = completionAudit.inspectFinalAttempt();
+          completionAudit.setFileReadCoverage(fileReadLedger.coverage());
+          const completionDecision = completionAudit.inspectFinalAttempt(contentBuf || lastLengthContinuationContent);
           if (completionDecision.status === 'retry') {
             store.appendUser(completionDecision.message!);
             persistPending();
@@ -1564,7 +1573,8 @@ export async function createAgent(
           finalText = contentBuf || lastLengthContinuationContent;
           persistPending();
           if (!task.parentId) {
-            const completionDecision = completionAudit.inspectFinalAttempt();
+            completionAudit.setFileReadCoverage(fileReadLedger.coverage());
+            const completionDecision = completionAudit.inspectFinalAttempt(contentBuf);
             if (completionDecision.status === 'retry') {
               store.appendUser(completionDecision.message!);
               persistPending();
@@ -1624,7 +1634,8 @@ export async function createAgent(
           continue;
         }
         if (!task.parentId && contentBuf.trim().length > 0) {
-          const completionDecision = completionAudit.inspectFinalAttempt();
+          completionAudit.setFileReadCoverage(fileReadLedger.coverage());
+          const completionDecision = completionAudit.inspectFinalAttempt(contentBuf);
           if (completionDecision.status === 'retry') {
             await completePendingZimoosOperationSummaries(contentBuf);
             store.appendAssistant(contentBuf, undefined, { reasoningContent });
@@ -1746,6 +1757,8 @@ export async function createAgent(
           isError,
           runtimeSlotUpdate,
           actionEvidence,
+          fileReadCoverage,
+          progressSummary,
         } = yield* toolExecutor.execute(
           tc,
           toolCtx,
@@ -1757,6 +1770,7 @@ export async function createAgent(
           succeeded: !isError,
           verifiedAction: actionEvidence?.status === 'verified',
         });
+        if (fileReadCoverage) completionAudit.setFileReadCoverage(fileReadCoverage);
         if (actionEvidence?.status === 'verified') {
           incompleteActionEvidence.delete(actionEvidence.key);
         } else if (actionEvidence) {
@@ -1776,7 +1790,7 @@ export async function createAgent(
         persistProviderState();
         store.appendToolResult(tc.id, result);
         errorTracker.record(fullName, args, isError);
-        const progress = recordToolProgress(fullName, args, !isError, result);
+        const progress = recordToolProgress(fullName, args, !isError, progressSummary ?? result);
         if (progress) yield progress;
       }
       // A local model can spend a truncated turn only updating its plan, then

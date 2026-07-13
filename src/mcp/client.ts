@@ -337,20 +337,30 @@ export class McpClient implements McpConnection {
       /* ignore */
     }
     if (this.process.exitCode === null && this.process.signalCode === null) {
-      this.process.kill('SIGTERM');
       await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(t);
+          this.process.off('exit', finish);
+          resolve();
+        };
         const t = setTimeout(() => {
           try {
             this.process.kill('SIGKILL');
           } catch {
             /* ignore */
           }
-          resolve();
+          finish();
         }, 2000);
-        this.process.once('exit', () => {
-          clearTimeout(t);
-          resolve();
-        });
+        this.process.once('exit', finish);
+        try {
+          this.process.kill('SIGTERM');
+        } catch {
+          finish();
+        }
+        if (this.process.exitCode !== null || this.process.signalCode !== null) finish();
       });
     }
   }
