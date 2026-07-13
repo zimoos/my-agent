@@ -6,6 +6,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { buildMcpEnv, McpClient } from '../src/mcp/client.js';
+import { VERSION } from '../src/version.js';
 
 function fakeProc() {
   const stdin = new PassThrough();
@@ -83,6 +84,28 @@ test('McpClient.request: round-trip via id matching', async () => {
 
   const result = await pending;
   assert.deepEqual(result, { pong: true });
+});
+
+test('McpClient.initialize advertises the package version', async () => {
+  const proc = fakeProc();
+  const client = new McpClient('exec', proc);
+  const seen: any[] = [];
+  proc.stdin.on('data', (chunk: Buffer) => {
+    for (const line of chunk.toString('utf-8').split('\n')) {
+      if (!line.trim()) continue;
+      const message = JSON.parse(line);
+      seen.push(message);
+      if (message.method === 'initialize') {
+        proc.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: message.id, result: {} })}\n`);
+      }
+    }
+  });
+
+  await client.initialize();
+
+  const initialize = seen.find((message) => message.method === 'initialize');
+  assert.deepEqual(initialize.params.clientInfo, { name: 'my-agent', version: VERSION });
+  assert.ok(seen.some((message) => message.method === 'notifications/initialized'));
 });
 
 test('McpClient.request: error response rejects', async () => {

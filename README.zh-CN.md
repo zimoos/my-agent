@@ -5,11 +5,11 @@ DeepSeek 无脑配置，本地小模型也能变生产力。
 
 MA 的核心不是“又接了一个模型”，而是两件事：远程模型配置必须无脑，本地小模型必须能做真实项目。DeepSeek 走交互式配置，LM Studio/Qwen 则通过长上下文、工具调用加固、模型切换和 benchmark 驱动修复，把小模型转化成能持续工作的生产力。
 
-`v0.2.0-alpha.1` 当前支持 LM Studio 本地模型、DeepSeek 官方 API，以及通过 MCP stdio 接入的 Agora。Agora 是 MA 的本地优先深度适配：它展示真实的模型加载和 MemoryPatch 状态，不会把记忆伪装成一段 prompt。
+`v0.3.0` 当前支持 LM Studio 本地模型、DeepSeek 官方 API，以及通过 MCP stdio 接入的 Agora。Agora 是 MA 的本地优先深度适配：它展示真实的模型加载和 MemoryPatch 状态，不会把记忆伪装成一段 prompt。
 
 官网：https://zimoos.github.io/my-agent/
 
-发布页：https://github.com/zimoos/my-agent/releases/tag/v0.2.0-alpha.1
+发布页：https://github.com/zimoos/my-agent/releases/tag/v0.3.0
 
 [路线图](ROADMAP.md) · [变更记录](CHANGELOG.md) · [参与贡献](CONTRIBUTING.md) · [Discussions](https://github.com/zimoos/my-agent/discussions)
 
@@ -131,6 +131,7 @@ DeepSeek official -> Base URL -> credential name -> Keychain API key -> 发现 D
 ```text
 /          显示斜杠指令提示
 /model     用上下键切换模型/profile
+/memory    打开项目记忆控制台
 Tab        补全当前选中的指令
 Enter      执行当前选中的斜杠指令
 ESC ESC    切换历史会话
@@ -143,6 +144,7 @@ ESC ESC    切换历史会话
 | 指令 | 用途 |
 | --- | --- |
 | `/model` | 打开模型/profile 选择器 |
+| `/memory` | 管理具名 Memory、多记忆挂载、多目标内化、自动策略和回滚 |
 | `/help` | 查看用户可用指令 |
 | `/clear` | 清空当前对话 |
 | `/exit` | 退出 MA |
@@ -181,7 +183,16 @@ DeepSeek/deepseek-v4-flash
 
 MA 可以把 Agora 作为 provider 自己管理的 MCP stdio 子进程运行，不要求用户维护本地 HTTP 服务。TUI 会展示真实的本地模型加载、记忆挂载和生成阶段。
 
-当 Agora 是当前 provider 时，MA 会提供经过验证的 MemoryPatch 操作：挂载、停用、内化、回滚和状态查看。只有 Agora 响应 metadata 返回匹配的状态，MA 才会说明记忆已生效；不会把一段事实塞进 prompt 伪装成记忆。
+当 Agora 是当前 provider 时，用户操作的是名称唯一、可持续迭代的 Memory；MemoryPatch 是它的不可变版本。只有下一次 Agora 响应 metadata 返回相同的 ordered Patch ids 和更新后的 PatchSet revision，MA 才会显示 `mounted`；不会把一段事实塞进 prompt 伪装成记忆。
+
+`/memory` 可在项目或单个会话中同时挂载 0～N 个 Memory，并在下一次请求边界热拔插，不重启基座。内化时可以在一个 batch 中混合“新建 Memory”和“增量到多个旧 Memory”；同一 source 只提取一次，各目标独立报告 completed/noop/review/conflict/failed。自动内化必须显式选择目标，默认在 4 个新增用户回合或约 2000 pending tokens、空闲 60 秒后运行；失败目标可单独重试或明确放弃，输入框和 transcript 不受影响。
+
+Context Usage 与 MemoryPatch 是两条独立状态：底栏始终从 `agent.getContextUsage()` 显示 used/trigger/window/source；内化不会清空 context，compact 也不会冒充记忆内化。
+
+正式 MA portable 包锁定 Agora `0.2.0` 的 Mach-O 平台制品。Agora npm 用户制品不包含 `.py/.pyc/.js/.map`；用户无需登录或机器授权即可运行。
+MA 只有在 Developer ID 签名、已发布 npm integrity、Apple 公证证据和平台
+manifest SHA 均与 `src/provider/agora-runtime-lock.json` 一致时才显示 verified；
+ad-hoc 候选包只能用于开发联调。
 
 ## 内置工具
 

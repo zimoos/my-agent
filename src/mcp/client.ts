@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { setMaxListeners } from 'node:events';
 import * as fs from 'node:fs';
+import { VERSION } from '../version.js';
 import type {
   McpConnection,
   McpServerConfig,
@@ -268,7 +269,7 @@ export class McpClient implements McpConnection {
     await this.request('initialize', {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: { tools: {} },
-      clientInfo: { name: 'my-agent', version: '1.0.0' },
+      clientInfo: { name: 'my-agent', version: VERSION },
     });
     try {
       this.notify('notifications/initialized');

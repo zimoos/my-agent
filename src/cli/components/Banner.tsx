@@ -1,5 +1,6 @@
 import React from 'react';
 import { Box, Text } from 'ink';
+import { VERSION } from '../../version.js';
 
 interface BannerProps {
   model: string;
@@ -26,7 +27,7 @@ export function Banner({ model, baseURL, mcp }: BannerProps) {
       ))}
       <Text>
         <Text bold color="magenta">{LOGO[LOGO.length - 1]}</Text>
-        <Text dimColor>  v1.0.0</Text>
+        <Text dimColor>  v{VERSION}</Text>
       </Text>
       <Text> </Text>
       <Text dimColor>

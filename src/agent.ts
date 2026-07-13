@@ -660,17 +660,18 @@ function registerAgoraMemoryTools(
   tools: Map<string, BuiltinTool>,
   controller: AgoraMemoryController
 ): void {
-  const profilePatchParameters = {
+  const memoryMountParameters = {
     type: 'object',
     properties: {
       profile_id: { type: 'string', description: 'Agora MemoryProfile id' },
-      patch_id: { type: 'string', description: 'MemoryPatch id to select' },
-      active_memory_patch_ids: {
+      memory_ids: {
         type: 'array',
         items: { type: 'string' },
-        description: 'MemoryPatch ids to select',
+        description: 'Named Memory ids to mount together',
       },
+      scope: { type: 'string', enum: ['user', 'project', 'conversation'] },
     },
+    required: ['memory_ids'],
     additionalProperties: false,
   };
   tools.set(
@@ -682,12 +683,107 @@ function registerAgoraMemoryTools(
       (args) => controller.status(args)
     )
   );
+  if (!controller.getCapabilities().memoryV2) {
+    tools.set(
+      'agora_memory_mount',
+      agoraMemoryTool(
+        'agora_memory_mount',
+        'Legacy Agora MemoryProfile/MemoryPatch 挂载；能力受限，成功后仍需下一次 chat metadata 验证。',
+        {
+          type: 'object',
+          properties: {
+            profile_id: { type: 'string' },
+            active_memory_patch_ids: { type: 'array', items: { type: 'string' } },
+            writable_patch_family: { type: 'string' },
+          },
+          required: ['profile_id', 'active_memory_patch_ids'],
+          additionalProperties: false,
+        },
+        (args) => controller.mount(args)
+      )
+    );
+    tools.set(
+      'agora_memory_internalize',
+      agoraMemoryTool(
+        'agora_memory_internalize',
+        'Legacy 单目标 Memory intake；必须显式提供 Profile 和 writable family。',
+        {
+          type: 'object',
+          properties: { profile_id: { type: 'string' }, into: { type: 'string' } },
+          required: ['profile_id', 'into'],
+          additionalProperties: false,
+        },
+        (args) => controller.internalize(args)
+      )
+    );
+    tools.set(
+      'agora_memory_disable',
+      agoraMemoryTool(
+        'agora_memory_disable',
+        'Legacy MemoryProfile disable。',
+        { type: 'object', properties: { profile_id: { type: 'string' } }, required: ['profile_id'], additionalProperties: false },
+        (args) => controller.disable(args)
+      )
+    );
+    tools.set(
+      'agora_memory_rollback',
+      agoraMemoryTool(
+        'agora_memory_rollback',
+        'Legacy MemoryPatch rollback。',
+        {
+          type: 'object',
+          properties: { profile_id: { type: 'string' }, patch_id: { type: 'string' } },
+          required: ['profile_id', 'patch_id'],
+          additionalProperties: false,
+        },
+        (args) => controller.rollback(args)
+      )
+    );
+    return;
+  }
+  tools.set(
+    'agora_memory_list',
+    agoraMemoryTool(
+      'agora_memory_list',
+      '列出当前 Agora base model 下的具名 Memory 和 current head。',
+      { type: 'object', properties: {}, additionalProperties: false },
+      async () => ({ content: JSON.stringify({ memories: await controller.listMemories() }, null, 2), isError: false })
+    )
+  );
+  tools.set(
+    'agora_memory_create',
+    agoraMemoryTool(
+      'agora_memory_create',
+      '创建一个名称唯一的 Agora Memory。重名必须把冲突返回给用户，不得自动改名。',
+      {
+        type: 'object',
+        properties: { name: { type: 'string' } },
+        required: ['name'],
+        additionalProperties: false,
+      },
+      async (args) => ({ content: JSON.stringify({ memory: await controller.createMemory(String(args.name)) }, null, 2), isError: false })
+    )
+  );
+  tools.set(
+    'agora_memory_rename',
+    agoraMemoryTool(
+      'agora_memory_rename',
+      '重命名具名 Agora Memory；名称冲突时保留用户选择并请求新名称。',
+      {
+        type: 'object',
+        properties: { memory_id: { type: 'string' }, name: { type: 'string' } },
+        required: ['memory_id', 'name'],
+        additionalProperties: false,
+      },
+      async (args) => ({ content: JSON.stringify({ memory: await controller.renameMemory(String(args.memory_id), String(args.name)) }, null, 2), isError: false })
+    )
+  );
   tools.set(
     'agora_memory_mount',
     agoraMemoryTool(
       'agora_memory_mount',
-      '挂载或切换 Agora MemoryProfile/MemoryPatch，并通过一次 Agora chat_complete metadata 验证成功。',
-      profilePatchParameters,
+      '挂载 0 到多个具名 Agora Memory。配置后只可声称 pending；下一次 chat_complete 返回相同 ordered patch ids 和 revision 后才可声称 mounted。',
+      memoryMountParameters,
       (args) => controller.mount(args)
     )
   );
@@ -710,29 +806,87 @@ function registerAgoraMemoryTools(
     'agora_memory_internalize',
     agoraMemoryTool(
       'agora_memory_internalize',
-      '将当前 Agora runtime session 的新增对话提交 memory_intake_run，产出 MemoryPatch 后挂载并验证。',
+      '把当前 Agora session 的一份增量 source 同时内化到一个或多个显式目标；可混合新建 Memory 和增量 Memory。',
       {
         type: 'object',
         properties: {
-          profile_id: { type: 'string', description: 'Agora MemoryProfile id' },
+          targets: {
+            type: 'array',
+            minItems: 1,
+            items: {
+              type: 'object',
+              properties: {
+                mode: { type: 'string', enum: ['create', 'increment'] },
+                name: { type: 'string' },
+                memory_id: { type: 'string' },
+                expected_parent_patch_id: { type: ['string', 'null'] },
+                output_name: { type: 'string' },
+              },
+              required: ['mode', 'output_name'],
+              additionalProperties: false,
+            },
+          },
+          source_message_start: { type: 'integer', minimum: 0 },
+          source_message_end: { type: 'integer', minimum: 1 },
         },
+        required: ['targets'],
         additionalProperties: false,
       },
       (args) => controller.internalize(args)
     )
   );
   tools.set(
-    'agora_memory_rollback',
+    'agora_memory_batch_status',
     agoraMemoryTool(
-      'agora_memory_rollback',
-      '回滚 Agora MemoryProfile 到指定或唯一上一版 MemoryPatch，并通过 chat_complete metadata 验证。',
+      'agora_memory_batch_status',
+      '查询多目标 Memory 内化 batch 的逐目标状态；completed/noop 与 review/conflict/failed 必须分别解释。',
+      {
+        type: 'object',
+        properties: { batch_id: { type: 'string' } },
+        required: ['batch_id'],
+        additionalProperties: false,
+      },
+      async (args) => ({ content: JSON.stringify(await controller.getBatchIntake(String(args.batch_id)), null, 2), isError: false })
+    )
+  );
+  tools.set(
+    'agora_memory_auto_policy',
+    agoraMemoryTool(
+      'agora_memory_auto_policy',
+      '设置当前 Memory 组合的自动内化开关和显式具名 Memory 目标；开启时目标列表不能为空。',
       {
         type: 'object',
         properties: {
-          profile_id: { type: 'string', description: 'Agora MemoryProfile id' },
-          patch_id: { type: 'string', description: 'target MemoryPatch id' },
+          profile_id: { type: 'string' },
+          enabled: { type: 'boolean' },
+          target_memory_ids: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['profile_id', 'enabled', 'target_memory_ids'],
+        additionalProperties: false,
+      },
+      async (args) => ({
+        content: JSON.stringify(await controller.setAutoPolicy(
+          String(args.profile_id),
+          Boolean(args.enabled),
+          Array.isArray(args.target_memory_ids) ? args.target_memory_ids.map(String) : []
+        ), null, 2),
+        isError: false,
+      })
+    )
+  );
+  tools.set(
+    'agora_memory_rollback',
+    agoraMemoryTool(
+      'agora_memory_rollback',
+      '用 expected current head 执行具名 Memory 的 CAS 回滚。回滚不会自动覆盖当前会话挂载组合。',
+      {
+        type: 'object',
+        properties: {
+          memory_id: { type: 'string', description: 'Named Memory id' },
+          expected_head_patch_id: { type: 'string', description: 'Current head used for CAS' },
           target_patch_id: { type: 'string', description: 'target MemoryPatch id' },
         },
+        required: ['memory_id', 'expected_head_patch_id', 'target_patch_id'],
         additionalProperties: false,
       },
       (args) => controller.rollback(args)
@@ -849,8 +1003,10 @@ export async function createAgent(
       ? [
           '',
           '# Agora Memory',
-          '- Agora memory is provider-scoped. Use agora_memory_status/mount/disable/internalize/rollback only when the user asks to inspect or change Agora MemoryPatch state.',
-          '- Treat Agora memory as mounted only when agora_memory_status or a memory action reports providerState from Agora chat_complete metadata.',
+          '- Agora memory is provider-scoped. The user-facing object is a uniquely named Memory; MemoryPatch is its immutable version. Use the agora_memory_* tools only when the user asks to inspect or change Agora memory.',
+          '- Mount can contain zero or multiple Memory ids. Internalization requires explicit targets and may mix create and increment in one batch; never guess the first mounted target.',
+          '- A mount action only means pending. Treat memory as mounted only after a later Agora chat_complete returns the requested ordered patch ids and PatchSet revision.',
+          '- Retry only review/conflict/failed batch targets; never resubmit completed/noop targets.',
           '- Do not simulate memory by inserting facts into the prompt.',
         ].join('\n')
       : [
@@ -1849,6 +2005,10 @@ export async function createAgent(
     }
   }
 
+  function getMemoryController(): AgoraMemoryController | null {
+    return agoraMemoryController;
+  }
+
   function inspectContext(): string {
     return contextManager.inspect();
   }
@@ -1894,6 +2054,7 @@ export async function createAgent(
     revertLastTurnContextOnly,
     respondConfirm,
     getProviderState,
+    getMemoryController,
     getContextUsage,
     inspectContext,
     searchContext,
