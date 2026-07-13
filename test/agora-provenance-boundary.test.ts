@@ -52,6 +52,8 @@ test('Agora keeps memory control metadata outside the conversational model reque
       modelVisibleRequest,
       /Agora Memory|MemoryPatch|MemoryProfile|PatchSet|agora_memory_/,
     );
+    const systemMessage = request.messages.find((message) => message.role === 'system');
+    assert.match(String(systemMessage?.content), /cannot inspect its origin/);
     assert.equal(request.metadata?.memory_profile, 'profile-a');
     assert.equal(request.metadata?.memory_enabled, true);
   } finally {
