@@ -54,7 +54,7 @@ const REQUIRED_MEMORY_TOOLS = new Set([
   'memory_patch_versions',
 ]);
 
-const TERMINAL_INTAKE_STATUSES = new Set(['completed', 'failed']);
+const TERMINAL_INTAKE_STATUSES = new Set(['completed', 'failed', 'noop', 'review', 'conflict']);
 const DEFAULT_AGORA_MAX_TOKENS = 4096;
 const AGORA_TIMEOUT_CAP_SECONDS = 300;
 const AGORA_TIMEOUT_HEADROOM_MS = 5000;
@@ -479,21 +479,38 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
       const submitted = await this.callJsonTool('memory_intake_run', { session_id: sessionId });
       const jobId = typeof submitted.job_id === 'string' ? submitted.job_id : submitted.job?.id;
       if (typeof jobId !== 'string' || !jobId) throw new Error('memory_intake_run did not return job_id');
+      const batchId = typeof submitted.batch_id === 'string' ? submitted.batch_id : undefined;
+      const usesMultiTargetIntake = Boolean(batchId && this.toolNames.has('memory_intake_batch_get'));
       let current = submitted;
       for (let i = 0; i < 120; i++) {
         if (TERMINAL_INTAKE_STATUSES.has(String(current.status))) break;
         await sleep(500);
-        current = await this.callJsonTool('memory_intake_get', { job_id: jobId });
+        if (usesMultiTargetIntake) {
+          const batch = await this.callJsonTool('memory_intake_batch_get', { batch_id: batchId });
+          const targets = Array.isArray(batch.targets) ? batch.targets : [];
+          const target = targets.find((item: any) => item?.id === jobId) ?? targets[0];
+          current = target && typeof target === 'object'
+            ? {
+                ...target,
+                batch_id: batchId,
+                source_id: batch.batch?.source_snapshot_id,
+              }
+            : batch;
+        } else {
+          current = await this.callJsonTool('memory_intake_get', { job_id: jobId });
+        }
       }
-      if (String(current.status) === 'failed') {
+      if (['failed', 'review', 'conflict'].includes(String(current.status))) {
         throw new Error(errorText(current));
       }
       const patchId =
         typeof current.output_memory_patch_id === 'string'
           ? current.output_memory_patch_id
-          : typeof current.job?.output_memory_patch_id === 'string'
-            ? current.job.output_memory_patch_id
-            : undefined;
+          : typeof current.output_patch_id === 'string'
+            ? current.output_patch_id
+            : typeof current.job?.output_memory_patch_id === 'string'
+              ? current.job.output_memory_patch_id
+              : undefined;
       if (!patchId) {
         return this.ok({
           action: 'internalize',

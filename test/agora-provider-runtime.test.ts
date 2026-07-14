@@ -163,9 +163,16 @@ class FakeModel:
         self.layers = [FakeLayer() for _ in range(80)]
 
     def __call__(self, tokens, *args, **kwargs):
+        import hashlib
         import mlx.core as mx
+        import numpy as np
 
-        hidden = mx.ones((1, 1, 8), dtype=mx.float32)
+        values = np.zeros((1, 1, 4096), dtype="float32")
+        token_values = np.array(tokens).reshape(-1).astype("int64")
+        digest = hashlib.sha256(token_values.tobytes()).digest()
+        bucket = int.from_bytes(digest[:4], "little") % 4096
+        values[0, 0, bucket] = 1.0
+        hidden = mx.array(values)
         for layer in self.layers:
             hidden = layer(hidden)
         return hidden
@@ -270,9 +277,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
+
 from agora_lab.paths import DB_PATH
 from agora_lab.registry import Registry
-from agora_lab.schemas import AdapterRecord, BaseModelRecord, MemoryPatchRecord
+from agora_lab.schemas import BaseModelRecord, MemoryPatchRecord
 
 
 root = Path(DB_PATH).parent
@@ -296,36 +305,39 @@ registry.upsert_base_model(
         architecture="dense",
     )
 )
-adapter_dir = root / "adapter-old"
-adapter_dir.mkdir(parents=True, exist_ok=True)
-(adapter_dir / "adapters.safetensors").write_text("old adapter weights", encoding="utf-8")
-adapter_manifest = adapter_dir / "manifest.json"
-adapter_manifest.write_text(json.dumps({"adapter_id": "adapter-old"}), encoding="utf-8")
-adapter_eval = adapter_dir / "eval_report.json"
-adapter_eval.write_text(json.dumps({"status": "seeded"}), encoding="utf-8")
-registry.upsert_adapter(
-    AdapterRecord(
-        id="adapter-old",
-        name="adapter-old",
-        base_model_id="qwen2.5-7b-fp16",
-        method="lora",
-        artifact_path=str(adapter_dir),
-        manifest_path=str(adapter_manifest),
-        training_job_id="train-adapter-old",
-        dataset_id="dataset-old",
-        training_profile={"rank": 4},
-        eval_report_path=str(adapter_eval),
-        status="experimental",
-        family="ma-e2e-memory",
-        version="0.0.0-old",
-        base_architecture="dense",
-        weights_file="adapters.safetensors",
-    )
-)
 patch_dir = root / "patch-old"
 patch_dir.mkdir(parents=True, exist_ok=True)
+np.savez_compressed(
+    patch_dir / "arrays.npz",
+    positive=np.ones(4096, dtype="float32"),
+    negative=-np.ones(4096, dtype="float32"),
+    step=np.array([8.0, 8.0], dtype="float32"),
+)
 patch_manifest = patch_dir / "manifest.json"
-patch_manifest.write_text(json.dumps({"kind": "lora_adapter_memory_patch_v0"}), encoding="utf-8")
+patch_manifest.write_text(
+    json.dumps(
+        {
+            "kind": "multifact_trainable_sequence_memory_patch_v1",
+            "base_model_id": "qwen2.5-7b-fp16",
+            "facts": [
+                {
+                    "id": "fact-old",
+                    "target_text": "利博是我的同事。",
+                    "target_token_ids": [100, 101],
+                    "step_biases_array_key": "step",
+                    "gate": {
+                        "layer": 39,
+                        "event": 0,
+                        "threshold": 0.0,
+                        "positive_array_keys": ["positive"],
+                        "negative_array_keys": ["negative"],
+                    },
+                }
+            ],
+        }
+    ),
+    encoding="utf-8",
+)
 patch_eval = patch_dir / "eval_report.json"
 patch_eval.write_text(json.dumps({"status": "seeded"}), encoding="utf-8")
 registry.upsert_memory_patch(
@@ -333,8 +345,8 @@ registry.upsert_memory_patch(
         id="patch-old",
         name="patch-old",
         base_model_id="qwen2.5-7b-fp16",
-        patch_type="lora_adapter",
-        compiler_backend="qlora_train",
+        patch_type="model_delta",
+        compiler_backend="model_delta",
         artifact_path=str(patch_dir),
         manifest_path=str(patch_manifest),
         eval_report_path=str(patch_eval),
@@ -342,7 +354,6 @@ registry.upsert_memory_patch(
         family="ma-e2e-memory",
         version="0.0.0-old",
         source_ids=["seed-source"],
-        adapter_id="adapter-old",
         mountable=True,
     )
 )
@@ -539,7 +550,7 @@ agoraDevE2eTest('agora provider runtime uses real MCP stdio for mount, internali
     assert.equal(internalized.isError, false, internalized.content);
     const internalizedPayload = JSON.parse(internalized.content);
     const patchId = internalizedPayload.output_memory_patch_id;
-    assert.match(patchId, /^memory-intake-/);
+    assert.match(patchId, /^patch_/);
     assert.deepEqual(runtime.getProviderState()?.memory?.active_memory_patch_ids, [patchId]);
 
     const rolledBack = await controller.rollback({ profile_id: 'profile-e2e', patch_id: 'patch-old' });
