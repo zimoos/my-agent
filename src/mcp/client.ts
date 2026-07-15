@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { setMaxListeners } from 'node:events';
 import * as fs from 'node:fs';
+import { VERSION } from '../version.js';
 import type {
   McpConnection,
   McpServerConfig,
@@ -268,7 +269,7 @@ export class McpClient implements McpConnection {
     await this.request('initialize', {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: { tools: {} },
-      clientInfo: { name: 'my-agent', version: '1.0.0' },
+      clientInfo: { name: 'my-agent', version: VERSION },
     });
     try {
       this.notify('notifications/initialized');
@@ -336,20 +337,30 @@ export class McpClient implements McpConnection {
       /* ignore */
     }
     if (this.process.exitCode === null && this.process.signalCode === null) {
-      this.process.kill('SIGTERM');
       await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(t);
+          this.process.off('exit', finish);
+          resolve();
+        };
         const t = setTimeout(() => {
           try {
             this.process.kill('SIGKILL');
           } catch {
             /* ignore */
           }
-          resolve();
+          finish();
         }, 2000);
-        this.process.once('exit', () => {
-          clearTimeout(t);
-          resolve();
-        });
+        this.process.once('exit', finish);
+        try {
+          this.process.kill('SIGTERM');
+        } catch {
+          finish();
+        }
+        if (this.process.exitCode !== null || this.process.signalCode !== null) finish();
       });
     }
   }

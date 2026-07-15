@@ -33,12 +33,14 @@ wss.on('connection', (ws) => {
   console.log(`[server] client connected, spawn: ${SHELL_CMD} ${SHELL_ARGS.join(' ')} (cwd=${TEST_CWD})`);
   let shell: pty.IPty;
   try {
+    const childEnv = { ...process.env, TERM: 'xterm-256color', FORCE_COLOR: '1' };
+    delete childEnv.NO_COLOR;
     shell = pty.spawn(SHELL_CMD, SHELL_ARGS, {
       name: 'xterm-256color',
       cols: 120,
       rows: 30,
       cwd: TEST_CWD,
-      env: { ...process.env, TERM: 'xterm-256color', FORCE_COLOR: '1' },
+      env: childEnv,
     });
   } catch (err) {
     const msg = `[server] failed to spawn shell: ${(err as Error).message}\r\n`;

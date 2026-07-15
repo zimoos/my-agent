@@ -96,7 +96,7 @@ test('applyAgentEvent: retry attempts keep n/5 semantics after the first wait', 
   assert.equal(store.getState().thinking?.event, '等待模型响应（重试 2/5）· 180s 超时');
 });
 
-test('applyAgentEvent: provider progress updates transient status without thinking label', () => {
+test('applyAgentEvent: Agora milestones stay indeterminate instead of showing fake percentages', () => {
   const store = createUiStore();
   store.startThinking();
   store.updateThinking({ isThinking: true });
@@ -109,6 +109,7 @@ test('applyAgentEvent: provider progress updates transient status without thinki
       phase: 'model_load',
       message: 'Agora · 加载本地模型 qwen3.6-35b-a3b-q4',
       progress: 40,
+      total: 100,
     },
     {}
   );
@@ -118,6 +119,26 @@ test('applyAgentEvent: provider progress updates transient status without thinki
   assert.equal(state.thinking?.isThinking, false);
   assert.equal(state.thinking?.thoughtDurationMs, null);
   assert.equal(state.messages.length, 0);
+});
+
+test('applyAgentEvent: determinate non-Agora progress still shows a measured percentage', () => {
+  const store = createUiStore();
+  store.startThinking();
+
+  applyAgentEvent(
+    store,
+    {
+      type: 'provider:progress',
+      provider: 'remote-download',
+      phase: 'downloading',
+      message: '下载模型',
+      progress: 40,
+      total: 100,
+    },
+    {}
+  );
+
+  assert.equal(store.getState().thinking?.event, '下载模型 · 40%');
 });
 
 test('applyAgentEvent: progress is rendered as visible system message', () => {

@@ -1,0 +1,12 @@
+{
+  "defaultProfile": "",
+  "model": {
+    "provider": "agora",
+    "baseURL": "mcp-stdio://agora",
+    "model": "qwen2.5-7b-fp16",
+    "apiKey": "agora-mcp",
+    "maxTokens": 8,
+    "temperature": 0
+  },
+  "mcpServers": {}
+}

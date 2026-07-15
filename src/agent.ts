@@ -58,6 +58,8 @@ import {
 } from './agent/context-manager.js';
 import { RuntimeContextSlotStore } from './agent/runtime-context-slots.js';
 import { CompletionObligationAudit } from './agent/completion-obligations.js';
+import { FileReadLedger } from './agent/file-read-ledger.js';
+import { join } from 'node:path';
 
 export interface CreateAgentOptions {
   resumeMessages?: ChatCompletionMessageParam[];
@@ -637,109 +639,6 @@ builtinTools.set('enter_plan_mode', {
   },
 });
 
-function agoraMemoryTool(
-  name: string,
-  description: string,
-  parameters: Record<string, any>,
-  handler: (args: Record<string, any>) => Promise<{ content: string; isError: boolean }>
-): BuiltinTool {
-  return {
-    definition: {
-      type: 'function',
-      function: {
-        name,
-        description,
-        parameters,
-      },
-    },
-    handler,
-  };
-}
-
-function registerAgoraMemoryTools(
-  tools: Map<string, BuiltinTool>,
-  controller: AgoraMemoryController
-): void {
-  const profilePatchParameters = {
-    type: 'object',
-    properties: {
-      profile_id: { type: 'string', description: 'Agora MemoryProfile id' },
-      patch_id: { type: 'string', description: 'MemoryPatch id to select' },
-      active_memory_patch_ids: {
-        type: 'array',
-        items: { type: 'string' },
-        description: 'MemoryPatch ids to select',
-      },
-    },
-    additionalProperties: false,
-  };
-  tools.set(
-    'agora_memory_status',
-    agoraMemoryTool(
-      'agora_memory_status',
-      '查看当前 Agora provider 的真实 MemoryPatch 状态。状态来自最近一次 Agora chat_complete metadata。',
-      { type: 'object', properties: {}, additionalProperties: false },
-      (args) => controller.status(args)
-    )
-  );
-  tools.set(
-    'agora_memory_mount',
-    agoraMemoryTool(
-      'agora_memory_mount',
-      '挂载或切换 Agora MemoryProfile/MemoryPatch，并通过一次 Agora chat_complete metadata 验证成功。',
-      profilePatchParameters,
-      (args) => controller.mount(args)
-    )
-  );
-  tools.set(
-    'agora_memory_disable',
-    agoraMemoryTool(
-      'agora_memory_disable',
-      '禁用 Agora MemoryProfile，并通过一次 Agora chat_complete metadata 验证禁用状态。',
-      {
-        type: 'object',
-        properties: {
-          profile_id: { type: 'string', description: 'Agora MemoryProfile id' },
-        },
-        additionalProperties: false,
-      },
-      (args) => controller.disable(args)
-    )
-  );
-  tools.set(
-    'agora_memory_internalize',
-    agoraMemoryTool(
-      'agora_memory_internalize',
-      '将当前 Agora runtime session 的新增对话提交 memory_intake_run，产出 MemoryPatch 后挂载并验证。',
-      {
-        type: 'object',
-        properties: {
-          profile_id: { type: 'string', description: 'Agora MemoryProfile id' },
-        },
-        additionalProperties: false,
-      },
-      (args) => controller.internalize(args)
-    )
-  );
-  tools.set(
-    'agora_memory_rollback',
-    agoraMemoryTool(
-      'agora_memory_rollback',
-      '回滚 Agora MemoryProfile 到指定或唯一上一版 MemoryPatch，并通过 chat_complete metadata 验证。',
-      {
-        type: 'object',
-        properties: {
-          profile_id: { type: 'string', description: 'Agora MemoryProfile id' },
-          patch_id: { type: 'string', description: 'target MemoryPatch id' },
-          target_patch_id: { type: 'string', description: 'target MemoryPatch id' },
-        },
-        additionalProperties: false,
-      },
-      (args) => controller.rollback(args)
-    )
-  );
-}
-
 function isMutatingTool(name: string): boolean {
   // Exec commands and write/edit/delete tools should never be storm-suppressed
   if (DANGER_EXEC_TOOLS.has(name)) return true;
@@ -786,10 +685,9 @@ export async function createAgent(
   const providerCodec = resolveProviderCodec(config.model);
 
   const agoraMemoryController = providerRuntime.getMemoryController?.() ?? null;
+  // Provider control lives in the host UI/commands. It must never be exposed
+  // to the conversational model as a prompt instruction or tool schema.
   const activeBuiltinTools = new Map(builtinTools);
-  if (agoraMemoryController) {
-    registerAgoraMemoryTools(activeBuiltinTools, agoraMemoryController);
-  }
   const mcpTools = mcpToolsToOpenAI(connections);
   const tools: ChatCompletionTool[] = [
     ...mcpTools,
@@ -844,30 +742,16 @@ export async function createAgent(
       '- Do not write code with security vulnerabilities (injection, XSS, etc.).',
       '- Do not expose internal state (task stack, system messages) to the user.',
     ].join('\n');
-  const providerPrompt = config.model.provider?.toLowerCase() === 'agora'
-    ? agoraMemoryController
-      ? [
-          '',
-          '# Agora Memory',
-          '- Agora memory is provider-scoped. Use agora_memory_status/mount/disable/internalize/rollback only when the user asks to inspect or change Agora MemoryPatch state.',
-          '- Treat Agora memory as mounted only when agora_memory_status or a memory action reports providerState from Agora chat_complete metadata.',
-          '- Do not simulate memory by inserting facts into the prompt.',
-        ].join('\n')
-      : [
-          '',
-          '# Agora Memory',
-          '- Agora provider is active, but Agora MCP memory tools are not all available. Tell the user memory operations require a complete Agora MCP runtime.',
-        ].join('\n')
-    : [
-        '',
-        '# Agora Memory',
-        '- Agora MemoryPatch operations require switching to provider: agora. Do not claim mount/internalize/rollback is available under other providers.',
-      ].join('\n');
+  const epistemicBoundaryPrompt = [
+    '',
+    '# Epistemic boundary',
+    '- You cannot inspect hidden request construction or the internal cause of a generated fact. When asked why you know something, rely only on visible conversation evidence or say that you cannot inspect its origin.',
+  ].join('\n');
   const agentMd = loadAgentMd(cwd);
   const envInfo = `\n\n# Environment\n当前工作目录: ${cwd}\n平台: ${process.platform}\nNode: ${process.version}`;
   const systemPrompt = agentMd
-    ? `${baseSystemPrompt}${providerPrompt}${envInfo}\n\n# Project Context\n${agentMd}`
-    : `${baseSystemPrompt}${providerPrompt}${envInfo}`;
+    ? `${baseSystemPrompt}${epistemicBoundaryPrompt}${envInfo}\n\n# Project Context\n${agentMd}`
+    : `${baseSystemPrompt}${epistemicBoundaryPrompt}${envInfo}`;
 
   const store = new MessageStore();
   store.init(systemPrompt, options.resumeMessages);
@@ -879,6 +763,11 @@ export async function createAgent(
     sessionStore?.getSessionDir()
   );
   const runtimeSlots = new RuntimeContextSlotStore();
+  const fileReadLedger = new FileReadLedger(
+    sessionStore && sessionId
+      ? join(sessionStore.getSessionDir(), `${sessionId}.reads.json`)
+      : undefined,
+  );
   if (options.resumeMessages) {
     contextManager.ensureIndexed(
       options.resumeMessages.filter((m) => m.role !== 'system')
@@ -1105,7 +994,8 @@ export async function createAgent(
       config,
       connections,
       activeBuiltinTools,
-      { nextId: nextConfirmId, awaitApproval: awaitConfirm }
+      { nextId: nextConfirmId, awaitApproval: awaitConfirm },
+      fileReadLedger,
     );
 
     let openingContent: ChatCompletionUserMessageParam['content'];
@@ -1353,7 +1243,8 @@ export async function createAgent(
           message: 'Model repeated prior truncated output after continuation; stopped automatic continuation to avoid runaway repetition.',
         };
         if (!task.parentId) {
-          const completionDecision = completionAudit.inspectFinalAttempt();
+          completionAudit.setFileReadCoverage(fileReadLedger.coverage());
+          const completionDecision = completionAudit.inspectFinalAttempt(contentBuf || lastLengthContinuationContent);
           if (completionDecision.status === 'retry') {
             store.appendUser(completionDecision.message!);
             persistPending();
@@ -1408,7 +1299,8 @@ export async function createAgent(
           finalText = contentBuf || lastLengthContinuationContent;
           persistPending();
           if (!task.parentId) {
-            const completionDecision = completionAudit.inspectFinalAttempt();
+            completionAudit.setFileReadCoverage(fileReadLedger.coverage());
+            const completionDecision = completionAudit.inspectFinalAttempt(contentBuf);
             if (completionDecision.status === 'retry') {
               store.appendUser(completionDecision.message!);
               persistPending();
@@ -1468,7 +1360,8 @@ export async function createAgent(
           continue;
         }
         if (!task.parentId && contentBuf.trim().length > 0) {
-          const completionDecision = completionAudit.inspectFinalAttempt();
+          completionAudit.setFileReadCoverage(fileReadLedger.coverage());
+          const completionDecision = completionAudit.inspectFinalAttempt(contentBuf);
           if (completionDecision.status === 'retry') {
             await completePendingZimoosOperationSummaries(contentBuf);
             store.appendAssistant(contentBuf, undefined, { reasoningContent });
@@ -1590,6 +1483,8 @@ export async function createAgent(
           isError,
           runtimeSlotUpdate,
           actionEvidence,
+          fileReadCoverage,
+          progressSummary,
         } = yield* toolExecutor.execute(
           tc,
           toolCtx,
@@ -1601,6 +1496,7 @@ export async function createAgent(
           succeeded: !isError,
           verifiedAction: actionEvidence?.status === 'verified',
         });
+        if (fileReadCoverage) completionAudit.setFileReadCoverage(fileReadCoverage);
         if (actionEvidence?.status === 'verified') {
           incompleteActionEvidence.delete(actionEvidence.key);
         } else if (actionEvidence) {
@@ -1620,7 +1516,7 @@ export async function createAgent(
         persistProviderState();
         store.appendToolResult(tc.id, result);
         errorTracker.record(fullName, args, isError);
-        const progress = recordToolProgress(fullName, args, !isError, result);
+        const progress = recordToolProgress(fullName, args, !isError, progressSummary ?? result);
         if (progress) yield progress;
       }
       // A local model can spend a truncated turn only updating its plan, then
@@ -1849,6 +1745,10 @@ export async function createAgent(
     }
   }
 
+  function getMemoryController(): AgoraMemoryController | null {
+    return agoraMemoryController;
+  }
+
   function inspectContext(): string {
     return contextManager.inspect();
   }
@@ -1894,6 +1794,7 @@ export async function createAgent(
     revertLastTurnContextOnly,
     respondConfirm,
     getProviderState,
+    getMemoryController,
     getContextUsage,
     inspectContext,
     searchContext,

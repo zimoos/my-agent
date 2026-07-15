@@ -17,7 +17,7 @@ MA 将 Agora 作为内部 VIP provider 适配：Agora 不再只是一个 OpenAI-
 1. Agora provider 运行时
    - `provider: "agora"` 必须使用 MCP stdio runtime。
    - runtime readiness 仍以 `doctor`、`models_list`、`chat_complete` 为基础能力。
-   - memory 能力只有在完整 memory MCP tools 存在时启用。
+   - memory 使用 granular capability matrix；缺少目录、下载或 intake 工具时只降级对应功能，不能关闭 Agora chat。
    - provider-owned Agora subprocess 必须在 MA 退出时关闭。
 
 2. Agora 进度展示
@@ -27,16 +27,20 @@ MA 将 Agora 作为内部 VIP provider 适配：Agora 不再只是一个 OpenAI-
    - 第一次本地模型聊天时，TUI 不能只显示 `thinking`，要显示类似 `Agora · 加载本地模型 ...`。
    - 如果 Agora 只提供阶段级进度，MA 只展示阶段，不伪造文件级、权重级百分比。
 
-3. Agora 底栏状态
-   - 当 active provider 是 Agora 时，TUI 底栏展示 Agora 专属摘要。
-   - 摘要至少包含：provider 标识、当前模型、memory status、已挂载 patch 数、Agora session 简写。
+3. Agora 状态层级
+   - 第一行始终展示 provider、model 和 Context Usage（used/trigger/window/source）。
+   - 第二行仅在 Agora 下展示具名 Memory、版本、`+N`、verified/pending/stale 和后台 intake activity。
+   - session/binding/job/完整 patch id 只放在 `/memory status`，不再堆入主底栏。
    - 该状态来自 runtime 当前 state 或 session meta 的 `providerState`。
    - 普通 provider 不展示 Agora 专属 memory/session 信息。
 
 4. MemoryPatch 状态
    - Session meta 保留 `providerState`，字段包括 `provider_id`、`agora_session_id`、`memory.status`、`profile_id`、`binding_id`、`active_memory_patch_ids`、`last_verified_at`。
    - MA 只能从 Agora `chat_complete` 响应 metadata 更新 mounted 证据。
+   - Memory 控制策略、Patch 状态和管理工具只属于宿主 Controller/TUI，不得进入普通对话的 system prompt、tool schema 或 transcript。
    - mount、disable、internalize、rollback 必须验证下一次 `chat_complete` metadata 后才报告成功。
+   - `/memory` 以具名 Memory 为第一层，提供多 Memory 挂载、新建/重命名、混合多目标内化、显式自动目标、历史和 CAS 回滚；Profile 仅作为后台 binding 实现。
+   - 自动 intake 一次提交显式目标列表；completed/noop 不重复，review/conflict/failed 只重试未完成目标；后台任务不得禁用输入框或写入 transcript。
 
 5. 普通 provider 回归边界
    - DeepSeek、LM Studio、OpenAI-compatible 的请求参数、重试策略、stream parser、tool-call 解析保持不变。

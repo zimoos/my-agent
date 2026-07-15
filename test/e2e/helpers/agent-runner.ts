@@ -52,6 +52,8 @@ export async function runAgent(
         } else {
           toolCalls.push({ name: '<unknown>', args: {}, ok: ev.ok });
         }
+      } else if (ev.type === 'token') {
+        textParts.push(ev.text);
       } else if (ev.type === 'text') {
         textParts.push(ev.content);
       }
@@ -59,7 +61,7 @@ export async function runAgent(
   } finally {
     clearTimeout(timer);
     try {
-      await shutdown(connections);
+      await shutdown(connections, agent);
     } catch {}
     if (opts.cwd) process.chdir(originalCwd);
   }

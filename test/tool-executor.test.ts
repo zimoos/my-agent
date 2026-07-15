@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ToolExecutor } from '../src/agent/tool-executor.js';
+import { FileReadLedger } from '../src/agent/file-read-ledger.js';
 import type { AgentConfig, McpConnection } from '../src/mcp/types.js';
 
 const config: AgentConfig = {
@@ -140,4 +141,64 @@ test('tool executor: confirm asks before a dangerous custom execute_command alia
     if (descriptor) Object.defineProperty(process.stdin, 'isTTY', descriptor);
     else delete (process.stdin as any).isTTY;
   }
+});
+
+test('tool executor: read_file pages use receipt-aware history and suppress duplicate bodies', async () => {
+  const body = `1│${'middle-evidence-'.repeat(180)}`;
+  const receipt = {
+    kind: 'read_file_page',
+    canonical_path: '/tmp/receipt.ts',
+    file_hash: 'd'.repeat(64),
+    cursor: '1:0',
+    start_line: 1,
+    start_column: 0,
+    end_line: 1,
+    end_column: body.length - 2,
+    total_lines: 2,
+    complete: false,
+    next_offset: 2,
+    next_cursor: '2:0',
+    body_chars: body.length,
+  };
+  const connection: McpConnection = {
+    name: 'fs',
+    process: {} as any,
+    tools: [{ name: 'read_file', description: '', inputSchema: { type: 'object', properties: {} } }],
+    call: async () => ({
+      content: `${body}\n[read_file receipt] ${JSON.stringify(receipt)}`,
+      isError: false,
+      structuredContent: { read_file_page: receipt },
+    }),
+    close: async () => {},
+  };
+  const ledger = new FileReadLedger();
+  const executor = new ToolExecutor(
+    config,
+    [connection],
+    new Map(),
+    { nextId: () => 'confirm_read', awaitApproval: async () => true },
+    ledger,
+  );
+
+  const first = await runTool(executor, 'fs__read_file', { path: '/tmp/receipt.ts' });
+  assert.match(first.result.result, /middle-evidence/);
+  assert.doesNotMatch(first.result.result, /tool result truncated/);
+  assert.match(first.result.progressSummary, /页面未读完/);
+  assert.ok(first.events.some((event) => event.type === 'tool:result' && /页面未读完/.test(event.content)));
+
+  const duplicate = await runTool(executor, 'fs__read_file', { path: '/tmp/receipt.ts' });
+  assert.match(duplicate.result.result, /duplicate_page/);
+  assert.doesNotMatch(duplicate.result.result, /middle-evidence/);
+  assert.match(duplicate.result.result, /cursor="2:0"/);
+
+  const nextTaskExecutor = new ToolExecutor(
+    config,
+    [connection],
+    new Map(),
+    { nextId: () => 'confirm_read_again', awaitApproval: async () => true },
+    ledger,
+  );
+  const firstReadInNextTask = await runTool(nextTaskExecutor, 'fs__read_file', { path: '/tmp/receipt.ts' });
+  assert.match(firstReadInNextTask.result.result, /middle-evidence/);
+  assert.doesNotMatch(firstReadInNextTask.result.result, /duplicate_page/);
 });

@@ -70,6 +70,7 @@ export function createSessionStore(sessionDir?: string): SessionStore {
     path.join(dir, `${id}.pool.jsonl`),
     path.join(dir, `${id}.index.jsonl`),
     path.join(dir, `${id}.patch.jsonl`),
+    path.join(dir, `${id}.reads.json`),
   ];
 
   function create(partial: Omit<SessionMeta, 'id' | 'messageCount'>): string {
@@ -108,7 +109,13 @@ export function createSessionStore(sessionDir?: string): SessionStore {
   function updateProviderState(sessionId: string, providerState: ProviderSessionState): void {
     const meta = readMeta(metaPath(sessionId));
     if (!meta) return;
-    meta.providerState = providerState;
+    meta.providerState = {
+      ...(meta.providerState ?? {}),
+      ...providerState,
+      ...(meta.providerState?.memory || providerState.memory
+        ? { memory: { ...(meta.providerState?.memory ?? {}), ...(providerState.memory ?? {}) } }
+        : {}),
+    };
     writeMeta(metaPath(sessionId), meta);
   }
 

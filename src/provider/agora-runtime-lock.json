@@ -1,0 +1,23 @@
+{
+  "version": "0.2.0",
+  "platform": "darwin-arm64",
+  "host_protocol_major": 1,
+  "native_core_abi": 1,
+  "runtime_layout": "legacy-onefile-v1",
+  "published": false,
+  "notarization_id": null,
+  "manifest_sha256": "5af44c6ed85e3bafc55c1ef83f574fb40aae4cdc5a6e5920841411808cdd35dc",
+  "capabilities": [
+    "mcp-stdio",
+    "memory-profile-v2",
+    "memory-intake-v2"
+  ],
+  "packages": {
+    "@zimoos/agora": {
+      "integrity": "sha512-iUCroM4rOS5lXgRSKsXG/S5OyhHDKMssioEW3/fFYkqOptayeImZBMVngmFn1kipnaxe7mhlZ2U+v1Xl8dEEQQ=="
+    },
+    "@zimoos/agora-darwin-arm64": {
+      "integrity": "sha512-/CxLj4ZMjaSaLPGQ9o5OlrN8Yd55sxacvWD3o3djX0hHL8BXTnL3IPcAsJVpG7+yQCuG0i43z1vSBh25O26+8g=="
+    }
+  }
+}

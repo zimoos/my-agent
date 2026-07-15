@@ -38,6 +38,7 @@ export function ModelPicker({ models, onSelect, onCancel }: ModelPickerProps) {
         const suffix = [
           model.current ? '当前' : '',
           model.source === 'cache' ? 'cache' : '',
+          model.status && model.status !== 'available' ? model.status : '',
         ].filter(Boolean).join(' · ');
         return (
           <Text key={model.id} color={active ? 'magenta' : undefined} dimColor={!active && model.current}>
@@ -47,7 +48,7 @@ export function ModelPicker({ models, onSelect, onCancel }: ModelPickerProps) {
           </Text>
         );
       })}
-      <Text dimColor>↑/↓ 选择 · Enter 切换 · Esc 取消</Text>
+      <Text dimColor>↑/↓ 选择 · Enter 下载/切换 · Esc 取消</Text>
     </Box>
   );
 }

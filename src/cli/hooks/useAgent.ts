@@ -25,6 +25,14 @@ function progressLabel(message: string, progress?: number, total?: number): stri
   return message;
 }
 
+function providerProgressLabel(event: Extract<AgentEvent, { type: 'provider:progress' }>): string {
+  // Agora reports coarse lifecycle milestones (5/20/40/55/65), not measured
+  // completion. Rendering those values as percentages makes a non-streaming
+  // generation look frozen at 65% until the whole response arrives.
+  if (event.provider === 'agora') return event.message;
+  return progressLabel(event.message, event.progress, event.total);
+}
+
 export interface PendingConfirm {
   requestId: string;
   cmd: string;
@@ -83,7 +91,7 @@ export function applyAgentEvent(
       break;
     case 'provider:progress':
       store.updateThinking({
-        event: progressLabel(event.message, event.progress, event.total),
+        event: providerProgressLabel(event),
         isThinking: false,
         thoughtDurationMs: null,
       });
