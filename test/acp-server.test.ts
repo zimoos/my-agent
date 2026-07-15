@@ -153,10 +153,10 @@ test('MA ACP rejects non-stdio MCP transports', async () => {
   );
 });
 
-test('ma acp CLI completes a real ACP stdio handshake and exits when the host disconnects', async () => {
+test('MA ACP release entry completes a real stdio handshake and exits when the host disconnects', async () => {
   const child = spawn(
     process.execPath,
-    ['--import', 'tsx', 'src/cli/index.tsx', 'acp'],
+    ['--import', 'tsx', 'src/acp/entry.ts'],
     { cwd: process.cwd(), stdio: ['pipe', 'pipe', 'pipe'] },
   );
   const stderr: Buffer[] = [];

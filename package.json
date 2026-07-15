@@ -16,6 +16,7 @@
     "LICENSE"
   ],
   "scripts": {
+    "prepare": "npm run build",
     "postinstall": "node scripts/fix-node-pty.mjs",
     "start": "tsx src/cli/index.tsx",
     "build": "tsc && chmod +x dist/src/cli/index.js bin/ma scripts/package-portable.mjs",
