@@ -162,6 +162,7 @@ export class MaAcpAgent implements acp.Agent {
       systemPrompt: systemPromptFromMeta(params._meta),
       sessionDir: this.options.sessionDir,
       confirmationChannel: 'host',
+      configMode: 'host-only',
     });
     this.sessions.set(boot.sessionId, {
       boot,

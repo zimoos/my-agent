@@ -110,6 +110,7 @@ test('MA ACP exposes a host-owned session, forwards events, permissions, cancell
     assert.equal(bootstrapCalls[0]?.options?.cwd, cwd);
     assert.equal(bootstrapCalls[0]?.options?.systemPrompt, 'You are the primary MTEAM agent.');
     assert.equal(bootstrapCalls[0]?.options?.confirmationChannel, 'host');
+    assert.equal(bootstrapCalls[0]?.options?.configMode, 'host-only');
     assert.deepEqual(bootstrapCalls[0]?.options?.mcpServers?.zimoos.env, { ROLE_INSTANCE_ID: 'primary' });
 
     const response = await server.prompt({

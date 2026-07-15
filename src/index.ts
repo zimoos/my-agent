@@ -1,4 +1,4 @@
-import { loadConfigDetailed, resolveConfigPath } from './config.js';
+import { loadConfigDetailed, loadHostConfigDetailed, resolveConfigPath } from './config.js';
 import { connectMcpServer } from './mcp/client.js';
 import { createSessionStore } from './session/store.js';
 import { resolveModelCapabilities } from './provider/capabilities.js';
@@ -11,6 +11,7 @@ export interface BootstrapOptions {
   systemPrompt?: string;
   sessionDir?: string;
   confirmationChannel?: 'tty' | 'host';
+  configMode?: 'layered' | 'host-only';
 }
 
 export interface BootstrapResult {
@@ -43,8 +44,12 @@ export function prepareBootstrap(
   configPath?: string,
   opts: BootstrapOptions = {}
 ): BootstrapPreparation {
-  const { config, sources, createdDefault } = loadConfigDetailed(configPath);
-  const resolved = resolveConfigPath(configPath);
+  const { config, sources, createdDefault } = opts.configMode === 'host-only'
+    ? loadHostConfigDetailed(configPath)
+    : loadConfigDetailed(configPath);
+  const resolved = opts.configMode === 'host-only'
+    ? sources[0] ?? null
+    : resolveConfigPath(configPath);
   const cwd = opts.cwd ?? process.cwd();
   if (opts.mcpServers) config.mcpServers = opts.mcpServers;
   if (opts.systemPrompt !== undefined) config.systemPrompt = opts.systemPrompt;

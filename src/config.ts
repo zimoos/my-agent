@@ -62,6 +62,20 @@ export interface ConfigLoadResult {
   createdDefault: boolean;
 }
 
+function finalizeConfig(merged: Record<string, any>): AgentConfig {
+  if (!merged.model || typeof merged.model !== 'object') {
+    merged.model = { ...DEFAULT_MODEL };
+  } else {
+    merged.model = { ...DEFAULT_MODEL, ...merged.model };
+  }
+  applyAgoraMemory(merged.model, merged.model.agoraMemory);
+  normalizeAgoraModel(merged.model);
+  if (!merged.mcpServers || typeof merged.mcpServers !== 'object') {
+    merged.mcpServers = {};
+  }
+  return merged as AgentConfig;
+}
+
 function ensureGlobalDefault(): { created: boolean; path: string } {
   const dir = globalConfigDir();
   const file = globalConfigPath();
@@ -285,21 +299,30 @@ export function loadConfigDetailed(configPath?: string): ConfigLoadResult {
 
   resolveDefaultProfile(merged);
 
-  if (!merged.model || typeof merged.model !== 'object') {
-    merged.model = { ...DEFAULT_MODEL };
-  } else {
-    merged.model = { ...DEFAULT_MODEL, ...merged.model };
-  }
-  applyAgoraMemory(merged.model, merged.model.agoraMemory);
-  normalizeAgoraModel(merged.model);
-  if (!merged.mcpServers || typeof merged.mcpServers !== 'object') {
-    merged.mcpServers = {};
-  }
-
   return {
-    config: merged as AgentConfig,
+    config: finalizeConfig(merged),
     sources,
     createdDefault,
+  };
+}
+
+export function loadHostConfigDetailed(configPath: string | undefined): ConfigLoadResult {
+  if (!configPath) throw new Error('Host-only MA requires an explicit config file');
+  const explicit = path.resolve(configPath);
+  if (!fs.existsSync(explicit)) throw new Error(`Config file not found: ${explicit}`);
+  const merged = readJson(explicit) as Record<string, any>;
+  if (
+    merged.defaultProfile !== undefined
+    || merged.credentials !== undefined
+    || merged.profiles !== undefined
+    || merged.model?.secretRef !== undefined
+  ) {
+    throw new Error('Host-only MA config cannot contain profiles, credentials, or secret references');
+  }
+  return {
+    config: finalizeConfig(merged),
+    sources: [explicit],
+    createdDefault: false,
   };
 }
 
