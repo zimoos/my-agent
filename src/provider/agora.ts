@@ -201,7 +201,7 @@ export interface AgoraMemoryController {
 }
 
 const REQUIRED_TOOLS = new Set(['doctor', 'models_list', 'chat_complete']);
-const TERMINAL_INTAKE_STATUSES = new Set(['completed', 'failed']);
+const TERMINAL_INTAKE_STATUSES = new Set(['completed', 'failed', 'noop', 'review', 'conflict']);
 const DEFAULT_AGORA_MAX_TOKENS = 4096;
 const AGORA_TIMEOUT_CAP_SECONDS = 300;
 const AGORA_TIMEOUT_HEADROOM_MS = 5000;
