@@ -67,6 +67,8 @@ export interface CreateAgentOptions {
   sessionId?: string;
   cwd?: string;
   confirmationChannel?: 'tty' | 'host';
+  loadAgentInstructions?: boolean;
+  debugLogging?: boolean;
 }
 
 const DEFAULT_MAX_LOOPS = 500;
@@ -343,7 +345,8 @@ async function* drainProviderEvents<T>(
   }
 }
 
-async function appendDebugLog(content: string): Promise<void> {
+async function appendDebugLog(content: string, enabled = true): Promise<void> {
+  if (!enabled) return;
   try {
     const fs = await import('node:fs');
     const os = await import('node:os');
@@ -749,7 +752,7 @@ export async function createAgent(
     '# Epistemic boundary',
     '- You cannot inspect hidden request construction or the internal cause of a generated fact. When asked why you know something, rely only on visible conversation evidence or say that you cannot inspect its origin.',
   ].join('\n');
-  const agentMd = loadAgentMd(cwd);
+  const agentMd = options.loadAgentInstructions === false ? '' : loadAgentMd(cwd);
   const envInfo = `\n\n# Environment\n当前工作目录: ${cwd}\n平台: ${process.platform}\nNode: ${process.version}`;
   const systemPrompt = agentMd
     ? `${baseSystemPrompt}${epistemicBoundaryPrompt}${envInfo}\n\n# Project Context\n${agentMd}`
@@ -833,7 +836,8 @@ export async function createAgent(
     if (result.updated === 0 || result.firstUpdatedIndex === null) return;
     rewritePersistedHistoryFrom(result.firstUpdatedIndex);
     await appendDebugLog(
-      `zimoos operation summaries corrected: updated=${result.updated} firstIndex=${result.firstUpdatedIndex}`
+      `zimoos operation summaries corrected: updated=${result.updated} firstIndex=${result.firstUpdatedIndex}`,
+      options.debugLogging !== false,
     );
   }
 
@@ -1190,31 +1194,32 @@ export async function createAgent(
         );
       }
 
-      // Debug: dump messages before API call
-      // Always log API requests for debugging
-      try {
-        const fs = await import('node:fs');
-        const os = await import('node:os');
-        const path = await import('node:path');
-        const logFile = process.env.MA_DEBUG || path.join(os.homedir(), '.my-agent', 'api-debug.log');
-        const dbg = requestMessages.map((m: any, index: number) => {
-          const isLatestRequestOnlyZimoosMessage =
-            index === requestMessages.length - 1 &&
-            m.role === 'user' &&
-            typeof m.content === 'string' &&
-            /<zimoos\b[\s\S]*?<\/zimoos>/.test(m.content);
-          return {
-            role: m.role,
-            content: typeof m.content === 'string'
-              ? (isLatestRequestOnlyZimoosMessage ? m.content : m.content.slice(0, 200))
-              : m.content,
-            reasoning_content: typeof m.reasoning_content === 'string' ? `${m.reasoning_content.length} chars` : undefined,
-            tool_calls: m.tool_calls?.length,
-            tool_call_id: m.tool_call_id,
-          };
-        });
-        fs.appendFileSync(logFile, `[${new Date().toISOString()}] API REQUEST messages (${requestMessages.length}):\n${JSON.stringify(dbg, null, 2)}\n\n`);
-      } catch { /* ignore */ }
+      // Debug: dump messages before API call for the standalone CLI only.
+      if (options.debugLogging !== false) {
+        try {
+          const fs = await import('node:fs');
+          const os = await import('node:os');
+          const path = await import('node:path');
+          const logFile = process.env.MA_DEBUG || path.join(os.homedir(), '.my-agent', 'api-debug.log');
+          const dbg = requestMessages.map((m: any, index: number) => {
+            const isLatestRequestOnlyZimoosMessage =
+              index === requestMessages.length - 1 &&
+              m.role === 'user' &&
+              typeof m.content === 'string' &&
+              /<zimoos\b[\s\S]*?<\/zimoos>/.test(m.content);
+            return {
+              role: m.role,
+              content: typeof m.content === 'string'
+                ? (isLatestRequestOnlyZimoosMessage ? m.content : m.content.slice(0, 200))
+                : m.content,
+              reasoning_content: typeof m.reasoning_content === 'string' ? `${m.reasoning_content.length} chars` : undefined,
+              tool_calls: m.tool_calls?.length,
+              tool_call_id: m.tool_call_id,
+            };
+          });
+          fs.appendFileSync(logFile, `[${new Date().toISOString()}] API REQUEST messages (${requestMessages.length}):\n${JSON.stringify(dbg, null, 2)}\n\n`);
+        } catch { /* ignore */ }
+      }
 
       const parsedTurn = yield* drainProviderEvents((onProviderEvent) =>
         (async function* () {
@@ -1513,7 +1518,8 @@ export async function createAgent(
         if (runtimeSlotUpdate) {
           runtimeSlots.set(runtimeSlotUpdate);
           await appendDebugLog(
-            `runtime slot updated: ${runtimeSlotUpdate.slotId} sourceTool=${fullName} toolCallId=${tc.id} frameId=${runtimeSlotUpdate.value.frame.frameId ?? '(unknown)'} frameCursor=${runtimeSlotUpdate.value.frame.frameCursor}`
+            `runtime slot updated: ${runtimeSlotUpdate.slotId} sourceTool=${fullName} toolCallId=${tc.id} frameId=${runtimeSlotUpdate.value.frame.frameId ?? '(unknown)'} frameCursor=${runtimeSlotUpdate.value.frame.frameCursor}`,
+            options.debugLogging !== false,
           );
         }
         persistProviderState();

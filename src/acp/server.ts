@@ -163,6 +163,8 @@ export class MaAcpAgent implements acp.Agent {
       sessionDir: this.options.sessionDir,
       confirmationChannel: 'host',
       configMode: 'host-only',
+      loadAgentInstructions: false,
+      debugLogging: false,
     });
     this.sessions.set(boot.sessionId, {
       boot,

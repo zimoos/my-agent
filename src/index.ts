@@ -12,6 +12,8 @@ export interface BootstrapOptions {
   sessionDir?: string;
   confirmationChannel?: 'tty' | 'host';
   configMode?: 'layered' | 'host-only';
+  loadAgentInstructions?: boolean;
+  debugLogging?: boolean;
 }
 
 export interface BootstrapResult {
@@ -38,6 +40,8 @@ export interface BootstrapPreparation {
   contextWindowConfigured?: boolean;
   cwd: string;
   confirmationChannel?: 'tty' | 'host';
+  loadAgentInstructions?: boolean;
+  debugLogging?: boolean;
 }
 
 export function prepareBootstrap(
@@ -107,6 +111,8 @@ export function prepareBootstrap(
     contextWindowConfigured,
     cwd,
     confirmationChannel: opts.confirmationChannel,
+    loadAgentInstructions: opts.loadAgentInstructions,
+    debugLogging: opts.debugLogging,
   };
 }
 
@@ -162,6 +168,8 @@ export async function hydrateBootstrap(prepared: BootstrapPreparation): Promise<
       sessionId: prepared.sessionId,
       cwd: prepared.cwd,
       confirmationChannel: prepared.confirmationChannel,
+      loadAgentInstructions: prepared.loadAgentInstructions,
+      debugLogging: prepared.debugLogging,
     });
     return {
       config: prepared.config,
