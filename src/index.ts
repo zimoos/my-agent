@@ -6,6 +6,11 @@ import type { AgentConfig, McpConnection, Agent, McpServerConfig } from './mcp/t
 
 export interface BootstrapOptions {
   resume?: string | true;
+  cwd?: string;
+  mcpServers?: Record<string, McpServerConfig>;
+  systemPrompt?: string;
+  sessionDir?: string;
+  confirmationChannel?: 'tty' | 'host';
 }
 
 export interface BootstrapResult {
@@ -30,6 +35,8 @@ export interface BootstrapPreparation {
   resumeMessages?: any[];
   resumed: boolean;
   contextWindowConfigured?: boolean;
+  cwd: string;
+  confirmationChannel?: 'tty' | 'host';
 }
 
 export function prepareBootstrap(
@@ -38,6 +45,9 @@ export function prepareBootstrap(
 ): BootstrapPreparation {
   const { config, sources, createdDefault } = loadConfigDetailed(configPath);
   const resolved = resolveConfigPath(configPath);
+  const cwd = opts.cwd ?? process.cwd();
+  if (opts.mcpServers) config.mcpServers = opts.mcpServers;
+  if (opts.systemPrompt !== undefined) config.systemPrompt = opts.systemPrompt;
   const contextWindowConfigured = typeof config.model.contextWindow === 'number' && config.model.contextWindow > 0;
   const capabilities = resolveModelCapabilities(config.model);
   config.model.contextWindow = capabilities.contextWindow;
@@ -45,7 +55,7 @@ export function prepareBootstrap(
   config.model.requestBodyByteLimit = capabilities.requestBodyByteLimit;
   config.model.requestBodyByteLimitSource = capabilities.requestBodyByteLimitSource;
 
-  const sessionStore = createSessionStore();
+  const sessionStore = createSessionStore(opts.sessionDir);
   let sessionId: string;
   let resumeMessages: any[] | undefined;
   let resumed = false;
@@ -61,21 +71,21 @@ export function prepareBootstrap(
       } else {
         sessionId = sessionStore.create({
           createdAt: Date.now(),
-          cwd: process.cwd(),
+          cwd,
           model: config.model.model,
         });
       }
     } else {
       sessionId = sessionStore.create({
         createdAt: Date.now(),
-        cwd: process.cwd(),
+        cwd,
         model: config.model.model,
       });
     }
   } else {
     sessionId = sessionStore.create({
       createdAt: Date.now(),
-      cwd: process.cwd(),
+      cwd,
       model: config.model.model,
     });
   }
@@ -90,6 +100,8 @@ export function prepareBootstrap(
     resumeMessages,
     resumed,
     contextWindowConfigured,
+    cwd,
+    confirmationChannel: opts.confirmationChannel,
   };
 }
 
@@ -143,6 +155,8 @@ export async function hydrateBootstrap(prepared: BootstrapPreparation): Promise<
       resumeMessages: prepared.resumeMessages,
       sessionStore: prepared.sessionStore,
       sessionId: prepared.sessionId,
+      cwd: prepared.cwd,
+      confirmationChannel: prepared.confirmationChannel,
     });
     return {
       config: prepared.config,

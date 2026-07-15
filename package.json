@@ -35,6 +35,7 @@
     "benchmark:dry": "tsx test/benchmark/runner/index.ts --dry-run"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "0.20.0",
     "@inkjs/ui": "^2.0.0",
     "@toon-format/toon": "^2.1.0",
     "cli-highlight": "^2.1.11",

@@ -143,6 +143,43 @@ test('tool executor: confirm asks before a dangerous custom execute_command alia
   }
 });
 
+test('tool executor: ACP host confirmation works without a TTY', async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');
+  Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: false });
+  const connection = customShellConnection();
+  let approvalRequests = 0;
+  const executor = new ToolExecutor(
+    { ...config, danger: { mode: 'confirm' } },
+    [connection],
+    new Map(),
+    {
+      nextId: () => 'confirm_host',
+      awaitApproval: async () => {
+        approvalRequests++;
+        return true;
+      },
+    },
+    new FileReadLedger(),
+    true,
+  );
+
+  try {
+    const { events, result } = await runTool(
+      executor,
+      'custom-shell__execute_command',
+      { command: 'rm -rf /' },
+    );
+
+    assert.equal(approvalRequests, 1);
+    assert.equal(connection.calls, 1);
+    assert.equal(result.isError, false);
+    assert.ok(events.some((event) => event.type === 'tool:confirm'));
+  } finally {
+    if (descriptor) Object.defineProperty(process.stdin, 'isTTY', descriptor);
+    else delete (process.stdin as any).isTTY;
+  }
+});
+
 test('tool executor: read_file pages use receipt-aware history and suppress duplicate bodies', async () => {
   const body = `1│${'middle-evidence-'.repeat(180)}`;
   const receipt = {

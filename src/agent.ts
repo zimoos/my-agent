@@ -65,6 +65,8 @@ export interface CreateAgentOptions {
   resumeMessages?: ChatCompletionMessageParam[];
   sessionStore?: SessionStore;
   sessionId?: string;
+  cwd?: string;
+  confirmationChannel?: 'tty' | 'host';
 }
 
 const DEFAULT_MAX_LOOPS = 500;
@@ -676,7 +678,7 @@ export async function createAgent(
   connections: McpConnection[],
   options: CreateAgentOptions = {}
 ): Promise<Agent> {
-  const cwd = process.cwd();
+  const cwd = options.cwd ?? process.cwd();
   const providerRuntime = createProviderRuntime(config.model, undefined, {
     sessionId: options.sessionId,
     cwd,
@@ -996,6 +998,7 @@ export async function createAgent(
       activeBuiltinTools,
       { nextId: nextConfirmId, awaitApproval: awaitConfirm },
       fileReadLedger,
+      options.confirmationChannel === 'host',
     );
 
     let openingContent: ChatCompletionUserMessageParam['content'];

@@ -19,6 +19,7 @@ import { VERSION } from './version.js';
 import { assertInteractiveInput, TerminalInputError } from './terminal.js';
 import { runContextWatch } from './watch.js';
 import { createContextManager } from '../agent/context-manager.js';
+import { runAcpServer } from '../acp/server.js';
 
 let activeConnections: McpConnection[] = [];
 let activeAgent: Agent | undefined;
@@ -234,6 +235,15 @@ async function main(): Promise<void> {
     .option('-c, --config <path>', 'path to config file')
     .action(async (opts: { prompt: string; config?: string }) => {
       await runPrompt(opts.config, opts.prompt);
+    });
+
+  program
+    .command('acp')
+    .description('Run MA as an Agent Client Protocol server over stdio')
+    .option('-c, --config <path>', 'path to host-owned config file')
+    .option('--session-dir <path>', 'path to the host-owned session directory')
+    .action(async (opts: { config?: string; sessionDir?: string }) => {
+      await runAcpServer({ configPath: opts.config, sessionDir: opts.sessionDir });
     });
 
   program

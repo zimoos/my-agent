@@ -77,6 +77,7 @@ test('bootstrap hydration connects five MCP servers in parallel, preserves confi
       sessionId,
       resumed: false,
       contextWindowConfigured: true,
+      cwd: dir,
     };
     const boot = await hydrateBootstrap(prepared);
     try {

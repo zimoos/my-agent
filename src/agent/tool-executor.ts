@@ -162,6 +162,7 @@ export class ToolExecutor {
     private builtinTools: Map<string, BuiltinTool>,
     private confirmProvider: ConfirmProvider,
     private fileReadLedger: FileReadLedger = new FileReadLedger(),
+    private hostConfirmationAvailable = false,
   ) {}
 
   getFileReadCoverage(): FileReadCoverage {
@@ -235,7 +236,7 @@ export class ToolExecutor {
         const result = classifyCommand(cmd);
         if (result.dangerous && !isWhitelisted(cmd, allow)) {
           const reason = result.reason ?? 'dangerous command';
-          if (mode === 'deny' || !isTtyInteractive()) {
+          if (mode === 'deny' || (!this.hostConfirmationAvailable && !isTtyInteractive())) {
             toolResult = `[blocked] ${reason}`;
             isError = true;
             skipExecute = true;
