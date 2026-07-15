@@ -11,6 +11,8 @@ interface InputBoxProps {
   pendingImages?: UiImage[];
   onClearPendingImages?: () => void;
   onOpenSessionPicker?: () => void;
+  initialValue?: string;
+  onValueChange?: (value: string) => void;
 }
 
 const PASTE_JUNK = /\[200~|\[201~|\x1b\[200~|\x1b\[201~/g;
@@ -22,8 +24,8 @@ interface CommandSuggestion {
   description: string;
 }
 
-export function InputBox({ onSubmit, disabled, pendingImages, onClearPendingImages, onOpenSessionPicker }: InputBoxProps) {
-  const [value, setValue] = useState('');
+export function InputBox({ onSubmit, disabled, pendingImages, onClearPendingImages, onOpenSessionPicker, initialValue = '', onValueChange }: InputBoxProps) {
+  const [value, setValue] = useState(initialValue);
   const [history, setHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [savedInput, setSavedInput] = useState('');
@@ -81,9 +83,10 @@ export function InputBox({ onSubmit, disabled, pendingImages, onClearPendingImag
   const handleChange = useCallback((newVal: string) => {
     const clean = newVal.replace(PASTE_JUNK, '');
     setValue(clean);
+    onValueChange?.(clean);
     setCommandIndex(0);
     clearEscapeState();
-  }, [clearEscapeState]);
+  }, [clearEscapeState, onValueChange]);
 
   const handleSubmit = useCallback(
     (text: string) => {
@@ -95,10 +98,11 @@ export function InputBox({ onSubmit, disabled, pendingImages, onClearPendingImag
       setHistoryIndex(-1);
       setSavedInput('');
       setValue('');
+      onValueChange?.('');
       clearEscapeState();
       onSubmit(trimmed);
     },
-    [onSubmit, pendingImages, clearEscapeState]
+    [onSubmit, pendingImages, clearEscapeState, onValueChange]
   );
 
   const handleHistoryUp = useCallback(() => {
@@ -196,24 +200,20 @@ export function InputBox({ onSubmit, disabled, pendingImages, onClearPendingImag
       ) : null}
       <Box borderStyle="single" borderColor="magenta" paddingX={1}>
         <Text color="magenta">❯ </Text>
-        {disabled ? (
-          <Text dimColor>thinking...</Text>
-        ) : (
-          <CustomTextInput
-            value={value}
-            onChange={handleChange}
-            onSubmit={handleSubmit}
-            placeholder="输入消息或 /help 查看命令"
-            disabled={disabled}
-            onHistoryUp={handleHistoryUp}
-            onHistoryDown={handleHistoryDown}
-            onUpArrow={handleCommandUp}
-            onDownArrow={handleCommandDown}
-            onTab={handleCommandTab}
-            onReturn={handleCommandReturn}
-            onEscape={handleEscape}
-          />
-        )}
+        <CustomTextInput
+          value={value}
+          onChange={handleChange}
+          onSubmit={handleSubmit}
+          placeholder={disabled ? 'thinking...' : '输入消息或 /help 查看命令'}
+          disabled={disabled}
+          onHistoryUp={handleHistoryUp}
+          onHistoryDown={handleHistoryDown}
+          onUpArrow={handleCommandUp}
+          onDownArrow={handleCommandDown}
+          onTab={handleCommandTab}
+          onReturn={handleCommandReturn}
+          onEscape={handleEscape}
+        />
       </Box>
       {showCommandSuggestions ? (
         <Box flexDirection="column" paddingX={1}>

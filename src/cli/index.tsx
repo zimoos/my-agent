@@ -7,18 +7,19 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import pc from 'picocolors';
 import figures from 'figures';
-import { bootstrap, shutdown } from '../index.js';
+import { bootstrap, prepareBootstrap, shutdown } from '../index.js';
 import { globalConfigPath } from '../config.js';
 import { deleteSecret, maskSecret, readSecret, repairSecretAccess } from '../secrets/keychain.js';
 import { createSessionStore } from '../session/store.js';
 import { runInit } from '../init.js';
 import type { BootstrapResult } from '../index.js';
 import type { Agent, McpConnection } from '../mcp/types.js';
-import { App } from './App.js';
+import { StartupCoordinator } from './StartupCoordinator.js';
 import { VERSION } from './version.js';
 import { assertInteractiveInput, TerminalInputError } from './terminal.js';
 import { runContextWatch } from './watch.js';
 import { createContextManager } from '../agent/context-manager.js';
+import { runAcpServer } from '../acp/server.js';
 
 let activeConnections: McpConnection[] = [];
 let activeAgent: Agent | undefined;
@@ -99,37 +100,25 @@ async function runChat(configPath: string | undefined, runOpts: RunChatOptions):
   }
 
   for (;;) {
-    let boot: BootstrapResult;
+    let prepared;
     try {
-      boot = await bootstrap(configPath, { resume });
+      prepared = prepareBootstrap(configPath, { resume });
     } catch (err) {
       console.error(pc.red(`[error] ${(err as Error).message}`));
       process.exit(1);
     }
-
-    const { config, createdDefault, connections, agent, sessionId, resumed } = boot;
-    const sessionStore = createSessionStore();
+    let boot: BootstrapResult | undefined;
     let nextSessionId: string | null = null;
-    activeConnections = connections;
-    activeAgent = agent;
-
-    if (createdDefault) {
-      console.log(pc.yellow(`Created ~/.my-agent/config.json — edit model settings there.`));
-    }
-    if (resumed) {
-      console.log(pc.dim(`resumed session ${sessionId}`));
-    } else {
-      console.log(pc.dim(`session ${sessionId}`));
-    }
 
     const { waitUntilExit } = render(
-      <App
-        config={config}
-        connections={connections}
-        agent={agent}
-        sessionStore={sessionStore}
-        currentSessionId={sessionId}
+      <StartupCoordinator
+        prepared={prepared}
         debug={debug}
+        onReady={(ready) => {
+          boot = ready;
+          activeConnections = ready.connections;
+          activeAgent = ready.agent;
+        }}
         onSwitchSession={(id) => {
           nextSessionId = id;
         }}
@@ -141,7 +130,7 @@ async function runChat(configPath: string | undefined, runOpts: RunChatOptions):
 
     const onSigint = (): void => {
       void (async () => {
-        await shutdown(connections, agent);
+        await shutdown(boot?.connections ?? [], boot?.agent);
         process.exit(0);
       })();
     };
@@ -151,7 +140,7 @@ async function runChat(configPath: string | undefined, runOpts: RunChatOptions):
       await waitUntilExit();
     } finally {
       process.off('SIGINT', onSigint);
-      await shutdown(connections, agent);
+      await shutdown(boot?.connections ?? [], boot?.agent);
       activeConnections = [];
       activeAgent = undefined;
     }
@@ -171,6 +160,9 @@ async function runPrompt(configPath: string | undefined, prompt: string): Promis
   }
 
   const { connections, agent } = boot;
+  for (const failure of boot.connectionFailures) {
+    process.stderr.write(`[warn] mcp "${failure.name}" failed to connect: ${failure.error}\n`);
+  }
   activeConnections = connections;
   activeAgent = agent;
   let finalText = '';
@@ -243,6 +235,15 @@ async function main(): Promise<void> {
     .option('-c, --config <path>', 'path to config file')
     .action(async (opts: { prompt: string; config?: string }) => {
       await runPrompt(opts.config, opts.prompt);
+    });
+
+  program
+    .command('acp')
+    .description('Run MA as an Agent Client Protocol server over stdio')
+    .option('-c, --config <path>', 'path to host-owned config file')
+    .option('--session-dir <path>', 'path to the host-owned session directory')
+    .action(async (opts: { config?: string; sessionDir?: string }) => {
+      await runAcpServer({ configPath: opts.config, sessionDir: opts.sessionDir });
     });
 
   program

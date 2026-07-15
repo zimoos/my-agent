@@ -1,11 +1,16 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import {
   defaultE2ECwd,
   e2eConfigSkipReason,
+  REPO_ROOT,
   resolveE2EConfigPath,
 } from './e2e/helpers/real-env.js';
 import { countChinese, hasLlmError, runMaPrompt } from './e2e/helpers/cli-runner.js';
+import { runAgent } from './e2e/helpers/agent-runner.js';
 import {
   canSpawnPty,
   killMa,
@@ -69,6 +74,64 @@ test('real ma run smoke: tool call path lists project files', { timeout: 360000 
   assert.match(result.stderr, /\[tool\]\s+fs__list_directory/, `expected fs list tool. Tail: ${combined.slice(-1000)}`);
   assert.match(result.stdout, /===FINAL_ANSWER===/);
   assert.ok(!hasLlmError(combined), `unexpected LLM error. Tail: ${combined.slice(-1000)}`);
+});
+
+test('real remote provider: bounded read receipts complete two large files without duplicate pages', { timeout: 420000 }, async (t) => {
+  const baseConfigPath = requireConfig(t);
+  if (!baseConfigPath) return;
+  const baseConfig = JSON.parse(fs.readFileSync(baseConfigPath, 'utf8'));
+  if (String(baseConfig.model?.provider ?? '').toLowerCase() === 'agora') {
+    t.skip('requires a real remote OpenAI-compatible provider config');
+    return;
+  }
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ma-issue42-remote-read-'));
+  const configPath = path.join(tmp, 'config.json');
+  try {
+    const writeFixture = (name: string, lineCount: number, marker: string): void => {
+      const lines = Array.from({ length: lineCount }, (_, index) =>
+        `export const ${name}${index + 1} = ${JSON.stringify(`${name}-${index + 1}-${'x'.repeat(24)}`)};`
+      );
+      lines[lineCount - 1] = `// ${marker}`;
+      fs.writeFileSync(path.join(tmp, `${name}.ts`), lines.join('\n'), 'utf8');
+    };
+    writeFixture('alpha', 198, 'ALPHA_END_198');
+    writeFixture('beta', 212, 'BETA_END_212');
+    baseConfig.defaultProfile = '';
+    baseConfig.mcpServers = {
+      fs: {
+        command: process.execPath,
+        args: ['--import', 'tsx', path.join(REPO_ROOT, 'servers', 'fs-mcp.ts')],
+        cwd: REPO_ROOT,
+      },
+    };
+    fs.writeFileSync(configPath, JSON.stringify(baseConfig), 'utf8');
+
+    const result = await runAgent(
+      [
+        '完整阅读当前目录的 alpha.ts 和 beta.ts，必须按 read_file receipt 的 next_cursor 逐页继续到 complete=true。',
+        '不要用 execute_command、cat、sed、head 或 tail 读取。',
+        '最后分别报告两个文件最后一行的标记。',
+      ].join(''),
+      { cwd: tmp, configPath, timeout: 360000 },
+    );
+    const reads = result.toolCalls.filter((call) => call.name === 'fs__read_file' && call.ok);
+    assert.ok(reads.length >= 4, `expected paginated reads, got ${JSON.stringify(reads)}`);
+    const cursors = new Set<string>();
+    for (const read of reads) {
+      const file = path.resolve(tmp, String(read.args.path));
+      const cursor = String(read.args.cursor ?? `${read.args.offset ?? 1}:0`);
+      const key = `${file}:${cursor}`;
+      assert.equal(cursors.has(key), false, `duplicate page reached model context: ${key}`);
+      cursors.add(key);
+    }
+    assert.match(result.finalText, /ALPHA_END_198/);
+    assert.match(result.finalText, /BETA_END_212/);
+    assert.ok(reads.some((call) => path.resolve(tmp, String(call.args.path)).endsWith('alpha.ts')));
+    assert.ok(reads.some((call) => path.resolve(tmp, String(call.args.path)).endsWith('beta.ts')));
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 test('real TUI PTY smoke: starts, accepts input, completes, exits', { timeout: 360000 }, async (t) => {

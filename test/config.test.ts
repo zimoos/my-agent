@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { deepMerge, loadConfigDetailed } from '../src/config.js';
+import { deepMerge, loadConfigDetailed, loadHostConfigDetailed } from '../src/config.js';
 
 function mktmp(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -131,6 +131,42 @@ test('loadConfigDetailed: explicit --config missing throws', () => {
   withEnv({ HOME: home }, () => {
     assert.throws(() => loadConfigDetailed('/nonexistent/path/to/config.json'), /Config file not found/);
   });
+});
+
+test('loadHostConfigDetailed reads only the host file and never creates or merges user config', () => {
+  const home = mktmp('my-agent-host-home-');
+  const proj = mktmp('my-agent-host-proj-');
+  const explicit = path.join(proj, 'mteam-host.json');
+  fs.mkdirSync(path.join(home, '.my-agent'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.my-agent', 'config.json'), JSON.stringify({
+    model: { baseURL: 'https://secret.invalid/v1', model: 'secret-model', apiKey: 'secret' },
+    systemPrompt: 'must-not-leak',
+  }));
+  fs.writeFileSync(path.join(proj, 'config.json'), JSON.stringify({
+    model: { model: 'project-model' },
+  }));
+  fs.writeFileSync(explicit, JSON.stringify({
+    model: { baseURL: 'http://127.0.0.1:1234/v1', model: 'host-model', apiKey: 'mteam-local' },
+  }));
+
+  withEnv({ HOME: home }, () => {
+    process.chdir(proj);
+    const result = loadHostConfigDetailed(explicit);
+    assert.equal(result.config.model.model, 'host-model');
+    assert.equal(result.config.model.baseURL, 'http://127.0.0.1:1234/v1');
+    assert.equal(result.config.systemPrompt, undefined);
+    assert.deepEqual(result.sources, [explicit]);
+    assert.equal(result.createdDefault, false);
+  });
+});
+
+test('loadHostConfigDetailed rejects profiles and secret references', () => {
+  const dir = mktmp('my-agent-host-secret-');
+  const explicit = path.join(dir, 'host.json');
+  fs.writeFileSync(explicit, JSON.stringify({
+    model: { baseURL: 'http://127.0.0.1:1234/v1', model: 'local', secretRef: 'env:SECRET' },
+  }));
+  assert.throws(() => loadHostConfigDetailed(explicit), /cannot contain profiles, credentials, or secret references/);
 });
 
 test('loadConfigDetailed: defaults applied when no model in any source', () => {

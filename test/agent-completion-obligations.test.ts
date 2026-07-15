@@ -2,7 +2,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import OpenAI from 'openai';
 import { createAgent } from '../src/agent.js';
-import { isSemanticTestCommand } from '../src/agent/completion-obligations.js';
+import {
+  CompletionObligationAudit,
+  extractExplicitFileHints,
+  isSemanticTestCommand,
+} from '../src/agent/completion-obligations.js';
 import type { AgentConfig, AgentEvent, McpConnection } from '../src/mcp/types.js';
 
 type StreamChunk = {
@@ -117,6 +121,50 @@ function verifiedExecConnection(): McpConnection {
       },
     },
   });
+}
+
+function readPage(
+  cursor: string,
+  nextCursor: string | null,
+  complete: boolean,
+): { content: string; structuredContent: Record<string, unknown> } {
+  const [line, column] = cursor.split(':').map(Number);
+  const endLine = complete ? 4 : 2;
+  return {
+    content: `${line}│page body\n[read_file receipt] test`,
+    structuredContent: {
+      read_file_page: {
+        kind: 'read_file_page',
+        canonical_path: '/tmp/complete-review.ts',
+        file_hash: 'c'.repeat(64),
+        cursor,
+        start_line: line,
+        start_column: column,
+        end_line: endLine,
+        end_column: 10,
+        total_lines: 4,
+        complete,
+        next_offset: complete ? null : 3,
+        next_cursor: nextCursor,
+        body_chars: 20,
+      },
+    },
+  };
+}
+
+function pagedReadConnection(): McpConnection {
+  const pages = [readPage('1:0', '3:0', false), readPage('3:0', null, true)];
+  return {
+    name: 'fs',
+    process: {} as any,
+    tools: [{
+      name: 'read_file',
+      description: 'read page',
+      inputSchema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } },
+    }],
+    call: async () => ({ ...(pages.shift() ?? readPage('3:0', null, true)), isError: false }),
+    close: async () => {},
+  };
 }
 
 test('completion obligations: ordinary question completes without another provider request', async () => {
@@ -252,4 +300,105 @@ test('completion obligations: repeated unsupported final exhausts bounded retrie
     provider.restore();
     await agent.close();
   }
+});
+
+test('completion obligations: full-file claim is blocked until contiguous read receipts reach EOF', async () => {
+  const provider = installProviderResponses([
+    toolResponse('call_page_1', 'fs__read_file', { path: '/tmp/complete-review.ts' }),
+    textResponse('已经完整查看全部代码。'),
+    toolResponse('call_page_2', 'fs__read_file', { path: '/tmp/complete-review.ts', cursor: '3:0' }),
+    textResponse('已基于完整文件完成审阅。'),
+  ]);
+  const agent = await createAgent(config, [pagedReadConnection()]);
+  try {
+    const events = await drain(agent.chat('请完整审阅 /tmp/complete-review.ts 的全部代码。'));
+    assert.equal(provider.calls(), 4);
+    assert.ok(events.some((event) => event.type === 'warning' && /next_cursor=3:0/.test(event.message)));
+    assert.ok(events.some((event) => event.type === 'task:done'));
+    assert.equal(events.some((event) => event.type === 'task:failed'), false);
+  } finally {
+    provider.restore();
+    await agent.close();
+  }
+});
+
+test('completion obligations: spontaneous full-read prose cannot replace missing receipts', async () => {
+  const provider = installProviderResponses([
+    toolResponse('call_partial', 'fs__read_file', { path: '/tmp/complete-review.ts' }),
+    textResponse('I fully read and reviewed the file.'),
+    textResponse('I completely read it already.'),
+    textResponse('Final: fully read.'),
+  ]);
+  const connection = pagedReadConnection();
+  const agent = await createAgent(config, [connection]);
+  try {
+    const events = await drain(agent.chat('Tell me what this file does.'));
+    assert.equal(provider.calls(), 4);
+    assert.equal(events.some((event) => event.type === 'task:done'), false);
+    assert.ok(events.some((event) => event.type === 'task:failed'));
+  } finally {
+    provider.restore();
+    await agent.close();
+  }
+});
+
+test('completion obligations: every explicitly named file needs its own complete coverage', () => {
+  assert.deepEqual(
+    extractExplicitFileHints('请完整阅读 alpha.ts 和 src/beta.ts，参考 https://github.com/example/repo。'),
+    ['alpha.ts', 'src/beta.ts'],
+  );
+  const audit = new CompletionObligationAudit('请完整阅读 alpha.ts 和 beta.ts。');
+  audit.setFileReadCoverage({
+    files: [{
+      path: '/workspace/alpha.ts', hash: 'a'.repeat(64), totalLines: 10,
+      complete: true, nextCursor: null, pageCount: 1,
+    }],
+    trackedFiles: 1,
+    completeFiles: 1,
+    allComplete: true,
+  });
+  assert.deepEqual(audit.missing(), ['file_read_coverage']);
+  assert.match(audit.inspectFinalAttempt().message ?? '', /beta\.ts 尚无完整回执/);
+
+  audit.setFileReadCoverage({
+    files: [
+      {
+        path: '/workspace/alpha.ts', hash: 'a'.repeat(64), totalLines: 10,
+        complete: true, nextCursor: null, pageCount: 1,
+      },
+      {
+        path: '/workspace/beta.ts', hash: 'b'.repeat(64), totalLines: 20,
+        complete: true, nextCursor: null, pageCount: 2,
+      },
+    ],
+    trackedFiles: 2,
+    completeFiles: 2,
+    allComplete: true,
+  });
+  assert.deepEqual(audit.missing(), []);
+});
+
+test('completion obligations: file hint extraction is bounded for large prose', () => {
+  const prompt = `检查 ${'a'.repeat(200_000)} 然后完整阅读 src/alpha.ts。`;
+  assert.deepEqual(extractExplicitFileHints(prompt), ['src/alpha.ts']);
+});
+
+test('completion obligations: unrelated partial history does not block named-file coverage', () => {
+  const audit = new CompletionObligationAudit('请完整阅读 alpha.ts。');
+  audit.setFileReadCoverage({
+    files: [
+      {
+        path: '/workspace/old.ts', hash: '0'.repeat(64), totalLines: 100,
+        complete: false, nextCursor: '20:0', pageCount: 1,
+      },
+      {
+        path: '/workspace/alpha.ts', hash: 'a'.repeat(64), totalLines: 10,
+        complete: true, nextCursor: null, pageCount: 1,
+      },
+    ],
+    trackedFiles: 2,
+    completeFiles: 1,
+    allComplete: false,
+  });
+  assert.deepEqual(audit.missing(), []);
 });

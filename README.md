@@ -6,11 +6,11 @@ DeepSeek in minutes. Local small models turned into real productivity.
 
 MA is a terminal coding agent built around two practical promises: remote setup should be brainless, and local small models should become useful production tools. DeepSeek config is interactive and direct. LM Studio/Qwen gets long-context handling, tool hardening, model switching, and benchmark-driven fixes so small models can do real repo work.
 
-`v0.2.0-alpha.1` supports LM Studio local models, DeepSeek official API, and Agora through MCP stdio. Agora is MA's local-first provider integration: it exposes real model-loading and MemoryPatch state instead of pretending memory was added to a prompt.
+`v0.3.0` supports LM Studio local models, DeepSeek official API, and Agora through MCP stdio. Agora is MA's local-first provider integration: it exposes real model-loading and MemoryPatch state instead of pretending memory was added to a prompt.
 
 Website: https://zimoos.github.io/my-agent/
 
-Release: https://github.com/zimoos/my-agent/releases/tag/v0.2.0-alpha.1
+Release: https://github.com/zimoos/my-agent/releases/tag/v0.3.0
 
 [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Discussions](https://github.com/zimoos/my-agent/discussions)
 
@@ -132,6 +132,7 @@ Inside MA:
 ```text
 /          show slash command suggestions
 /model     switch model/profile with arrow keys
+/memory    open the project memory console
 Tab        complete selected command
 Enter      run selected slash command
 ESC ESC    switch session
@@ -144,6 +145,7 @@ User-facing slash commands:
 | Command | Purpose |
 | --- | --- |
 | `/model` | Open the model/profile picker |
+| `/memory` | Manage named Memories, multi-memory mounts, multi-target intake, automatic policy, and rollback |
 | `/help` | Show user-facing commands |
 | `/clear` | Clear current conversation |
 | `/exit` | Exit MA |
@@ -182,7 +184,16 @@ DeepSeek/deepseek-v4-flash
 
 MA can run Agora as a provider-owned MCP stdio subprocess instead of asking users to manage a local HTTP server. The TUI reports real provider stages such as local-model loading, memory mounting, and generation.
 
-When the active provider is Agora, MA can expose verified MemoryPatch operations: mount, disable, internalize, roll back, and inspect state. MA treats a memory module as active only after Agora returns matching response metadata; it never fakes memory by injecting facts into a prompt.
+When the active provider is Agora, users operate uniquely named, independently versioned Memories; MemoryPatch is the immutable version object. MA reports `mounted` only after a later Agora response returns the requested ordered Patch ids and an advanced PatchSet revision. Memory management stays in the host-side `/memory` control plane: MA neither injects facts into the prompt nor exposes MemoryPatch policy and management tools to the conversational model.
+
+`/memory` can mount zero or more Memories per project or conversation and hot-swap them at the next request boundary without restarting the base model. One intake batch may mix a new Memory with increments to multiple existing Memories; the source is extracted once and each target reports completed/noop/review/conflict/failed independently. Automatic intake requires explicit targets and runs after 4 new user turns or about 2,000 pending tokens plus 60 seconds of idle time. Failed targets can be retried alone or explicitly abandoned without blocking input or adding transcript noise.
+
+Context Usage remains independent from MemoryPatch state: the TUI continues to show used/trigger/window/source from `agent.getContextUsage()`. Internalization never clears context, and compaction never claims to internalize memory.
+
+The MA portable release pins the exact Agora `0.2.0` Mach-O artifact. Agora npm user artifacts contain no `.py`, `.pyc`, `.js`, or source maps and require no login or device activation.
+MA marks an npm/bundled runtime as verified only when its Developer ID signature,
+published npm integrity, accepted notarization evidence, and platform manifest SHA
+match `src/provider/agora-runtime-lock.json`; ad-hoc candidates remain development-only.
 
 ## Built-In Tools
 

@@ -67,6 +67,51 @@ test('/model opens the model picker when no args are provided', async () => {
   });
 });
 
+test('/memory opens the console and manages named Memory v2 objects', async () => {
+  await withTempCwd(async () => {
+    let opened = 0;
+    const calls: Array<{ name: string; args: unknown[] }> = [];
+    const controller = {
+      getCapabilities: () => ({ memoryV2: true, runtimeMode: 'v2' }),
+      listMemories: async () => [{
+        id: 'memory-a',
+        name: 'MA 核心记忆',
+        base_model_id: 'base-a',
+        head_patch_id: 'patch-a',
+        status: 'available',
+      }],
+      listPatches: async () => [{
+        id: 'patch-a',
+        name: 'MA 核心记忆@v1',
+        version: 'v1',
+        memory_id: 'memory-a',
+      }],
+      listProfiles: async () => [{
+        id: 'profile-a',
+        name: 'project binding',
+        active_memory_patch_ids: ['patch-a'],
+        auto_intake_target_memory_ids: ['memory-a'],
+        auto_intake_policy: { enabled: true },
+      }],
+      createMemory: async (name: string) => { calls.push({ name: 'create', args: [name] }); return { id: 'memory-new', name }; },
+      mountMemories: async (...args: unknown[]) => { calls.push({ name: 'mount', args }); return { mount_status: 'pending_next_chat' }; },
+    };
+    const agent = {
+      getMemoryController: () => controller,
+      getProviderState: () => ({ memory: { profile_id: 'profile-a' } }),
+    };
+    assert.equal(await executeCommand('/memory', baseContext({ agent, openMemoryConsole: () => { opened++; } })), null);
+    assert.equal(opened, 1);
+    const listed = await executeCommand('/memory list', baseContext({ agent }));
+    assert.match(String(listed), /MA 核心记忆/);
+    assert.match(String(listed), /v1/);
+    await executeCommand('/memory new 工程记忆', baseContext({ agent }));
+    await executeCommand('/memory mount MA 核心记忆', baseContext({ agent }));
+    assert.deepEqual(calls[0], { name: 'create', args: ['工程记忆'] });
+    assert.deepEqual(calls[1], { name: 'mount', args: ['profile-a', ['memory-a'], 'project'] });
+  });
+});
+
 test('/context routes inspection, search, recall, and pin commands to the agent', async () => {
   await withTempCwd(async () => {
     const calls: string[] = [];
@@ -124,7 +169,7 @@ test('slash suggestions only include user-facing commands', async () => {
 
     assert.deepEqual(
       Array.from(suggestions.keys()).sort(),
-      ['/clear', '/exit', '/help', '/model']
+      ['/clear', '/exit', '/help', '/memory', '/model']
     );
 
     const all = await getAllCommands();

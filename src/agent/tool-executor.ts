@@ -16,6 +16,12 @@ import {
   sanitizeZimoosToolResultForHistory,
   type RuntimeContextSlotUpdate,
 } from './runtime-context-slots.js';
+import {
+  FileReadLedger,
+  duplicateReadPageText,
+  readPageUiSummary,
+  type FileReadCoverage,
+} from './file-read-ledger.js';
 
 const ASK_USER_PREFIX = '[ask_user] ';
 const PLAN_OPEN = '[plan]\n';
@@ -85,6 +91,8 @@ export interface ToolExecutionResult {
     operation: string;
     status: 'verified' | 'missing' | 'failed';
   };
+  fileReadCoverage?: FileReadCoverage;
+  progressSummary?: string;
 }
 
 function requiresStructuredEvidence(
@@ -146,13 +154,20 @@ export class ToolExecutor {
   private webFetchCount = 0;
   private seenWebSearchQueries = new Set<string>();
   private seenWebFetchUrls = new Set<string>();
+  private seenReadPages = new Set<string>();
 
   constructor(
     private config: AgentConfig,
     private connections: McpConnection[],
     private builtinTools: Map<string, BuiltinTool>,
-    private confirmProvider: ConfirmProvider
+    private confirmProvider: ConfirmProvider,
+    private fileReadLedger: FileReadLedger = new FileReadLedger(),
+    private hostConfirmationAvailable = false,
   ) {}
+
+  getFileReadCoverage(): FileReadCoverage {
+    return this.fileReadLedger.coverage();
+  }
 
   /** Look up the JSON Schema for a tool (exposed for pre-flight validation). */
   getSchema(fullName: string): Record<string, any> | null {
@@ -221,7 +236,7 @@ export class ToolExecutor {
         const result = classifyCommand(cmd);
         if (result.dangerous && !isWhitelisted(cmd, allow)) {
           const reason = result.reason ?? 'dangerous command';
-          if (mode === 'deny' || !isTtyInteractive()) {
+          if (mode === 'deny' || (!this.hostConfirmationAvailable && !isTtyInteractive())) {
             toolResult = `[blocked] ${reason}`;
             isError = true;
             skipExecute = true;
@@ -289,6 +304,21 @@ export class ToolExecutor {
       }
     }
 
+    const recordedReadPage = !isError && executedToolName === 'read_file'
+      ? this.fileReadLedger.record(structuredContent)
+      : null;
+    let readPageRecord = recordedReadPage;
+    if (recordedReadPage) {
+      const key = [
+        recordedReadPage.receipt.canonicalPath,
+        recordedReadPage.receipt.fileHash,
+        recordedReadPage.receipt.cursor,
+      ].join('\0');
+      const duplicateInCurrentTask = this.seenReadPages.has(key);
+      this.seenReadPages.add(key);
+      readPageRecord = { ...recordedReadPage, duplicate: duplicateInCurrentTask };
+    }
+
     const runtimeSlotUpdate = createZimoosRuntimeSlotUpdate({
       rawResult: toolResult,
       isError,
@@ -307,12 +337,18 @@ export class ToolExecutor {
       ? runtimeSlotUpdate.auditText
       : zimoosHistoryAudit
         ? zimoosHistoryAudit
-      : compactToolResult(toolResult);
+      : readPageRecord
+        ? readPageRecord.duplicate
+          ? duplicateReadPageText(readPageRecord)
+          : `${toolResult}${readPageRecord.fileChanged ? '\n[read_file ledger] file_changed: prior coverage for this path was invalidated.' : ''}`
+        : compactToolResult(toolResult);
     const uiResult = runtimeSlotUpdate
       ? runtimeSlotUpdate.auditText
       : zimoosHistoryAudit
         ? zimoosHistoryAudit
-      : toolResult;
+      : readPageRecord
+        ? readPageUiSummary(readPageRecord)
+        : toolResult;
 
     const short = formatToolResultForUi(uiResult);
     const artifact = !isError ? parseToolResultDiff(short) : undefined;
@@ -341,6 +377,8 @@ export class ToolExecutor {
       executionResult.structuredContent = structuredContent;
     }
     if (meta !== undefined) executionResult._meta = meta;
+    if (readPageRecord) executionResult.fileReadCoverage = this.fileReadLedger.coverage();
+    if (readPageRecord) executionResult.progressSummary = readPageUiSummary(readPageRecord);
     if (requiresEvidence) {
       const hasVerifiedEvidence = !isError &&
         hasVerifiedStructuredEvidence(structuredContent, executedToolName);

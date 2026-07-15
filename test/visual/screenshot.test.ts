@@ -44,12 +44,16 @@ test.afterAll(async () => {
 test('ma startup screenshot', async ({ page }) => {
   await page.goto('/');
   await page.waitForFunction(() => (window as any).__wsReady === true, { timeout: 10_000 });
-  // Give ma time to print banner and MCP connect
-  await page.waitForTimeout(5_000);
+  await page.waitForFunction(
+    () => (window as any).__getText().includes('runtime 连接中'),
+    { timeout: 2_000 },
+  );
   const shotPath = path.join(SHOTS_DIR, 'startup.png');
   await page.screenshot({ path: shotPath, fullPage: true });
   expect(fs.existsSync(shotPath)).toBe(true);
   const text = await page.evaluate(() => (window as any).__getText());
+  expect(text).toContain('MA · 可输入 · runtime 连接中');
+  expect(text).toContain('❯');
   console.log('[test] terminal text (startup) first 500 chars:\n', text.slice(0, 500));
 });
 

@@ -13,6 +13,7 @@ export interface ModelChoice {
   label: string;
   current: boolean;
   source: 'remote' | 'cache' | 'config';
+  status?: string;
 }
 
 function unique(values: string[]): string[] {
