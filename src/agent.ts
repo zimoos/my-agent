@@ -93,6 +93,7 @@ const COMPACT_TRIGGER_RATIO = 0.75;
 const PROGRESS_TOOL_STREAK = 4;
 const PROGRESS_IDLE_MS = 10_000;
 const MAX_AUTOMATIC_LENGTH_CONTINUATIONS = 8;
+const MAX_EMPTY_RESPONSE_RECOVERIES = 2;
 const CONTINUATION_NUDGE_PREFIX = '[MA internal continuation request]';
 
 interface ContextUsageSnapshot {
@@ -1043,6 +1044,7 @@ export async function createAgent(
     let lastVisibleAt = Date.now();
     let lengthContinuationCount = 0;
     let lastLengthContinuationContent = '';
+    let emptyResponseRecoveries = 0;
     const incompleteActionEvidence = new Map<string, MissingActionEvidence>();
     lastTaskDiagnostics = { recentTools: [], totalTools: 0 };
 
@@ -1238,6 +1240,9 @@ export async function createAgent(
       if (contentBuf.trim().length > 0) {
         noteVisible();
       }
+      if (contentBuf.trim().length > 0 || (toolCalls?.length ?? 0) > 0) {
+        emptyResponseRecoveries = 0;
+      }
 
       if (
         lengthContinuationCount > 0 &&
@@ -1348,6 +1353,14 @@ export async function createAgent(
       if (!repairedCalls) {
         // If content is empty/whitespace after tool use, nudge model to answer
         if (contentBuf.trim().length === 0 && loop > 0) {
+          if (emptyResponseRecoveries >= MAX_EMPTY_RESPONSE_RECOVERIES) {
+            const message =
+              `Model returned empty content without tool calls after ${MAX_EMPTY_RESPONSE_RECOVERIES} recovery attempts; ` +
+              'stopped automatic retries to prevent a request loop.';
+            yield { type: 'warning', message };
+            throw new Error(message);
+          }
+          emptyResponseRecoveries += 1;
           store.appendNudge();
           persistPending();
           continue;

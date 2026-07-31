@@ -532,6 +532,69 @@ test('messages: append-only transcript sends paired tool protocol to provider', 
   }
 });
 
+test('messages: repeated empty responses after tool use stop after two recoveries', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    const agent = await createAgent(
+      makeConfig({ maxLoops: 500 }),
+      makeConnections()
+    );
+
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({
+        toolCalls: [
+          {
+            id: 'call_empty_response_guard',
+            name: 'todo_write',
+            arguments: JSON.stringify({ action: 'add', text: 'guard empty responses' }),
+          },
+        ],
+      }),
+    });
+    for (let i = 0; i < 3; i++) {
+      state.responses.push({
+        kind: 'stream',
+        chunks: streamChunks({ finishReason: 'stop' }),
+      });
+    }
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({ content: 'must not be requested' }),
+    });
+
+    const events = await drain(agent.chat('please plan'));
+
+    assert.equal(
+      state.calls.length,
+      4,
+      'one tool turn plus three empty turns must exhaust recovery without another model request'
+    );
+    assert.equal(state.responses.length, 1, 'the response after the recovery budget must remain unused');
+
+    const finalRequestNudges = state.calls.at(-1)!.messages.filter(
+      (message: any) =>
+        message.role === 'user' &&
+        message.content === 'Please provide your answer based on the tool results above.'
+    );
+    assert.equal(finalRequestNudges.length, 2, 'only two empty-response nudges may be appended');
+    assert.ok(
+      events.some(
+        (event) =>
+          event.type === 'warning' &&
+          /stopped automatic retries to prevent a request loop/i.test(event.message)
+      ),
+      'recovery exhaustion must emit a clear warning'
+    );
+    const failed = events.find((event) => event.type === 'task:failed');
+    assert.ok(failed && failed.type === 'task:failed');
+    assert.match(failed.error, /empty content without tool calls after 2 recovery attempts/i);
+  } finally {
+    restore();
+  }
+});
+
 test('zimoos request context: current frame is latest-message only and history keeps Action + Summary', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);
