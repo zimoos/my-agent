@@ -48,6 +48,39 @@ function fakeAgent(confirmations: Array<{ requestId: string; approved: boolean }
   };
 }
 
+function eventAgent(events: AgentEvent[]): Agent {
+  return {
+    ...fakeAgent([]),
+    async *chat(): AsyncGenerator<AgentEvent> {
+      for (const event of events) yield event;
+    },
+  };
+}
+
+function bootstrapResult(agent: Agent, sessionId: string): BootstrapResult {
+  return {
+    config: {
+      model: { baseURL: 'http://127.0.0.1:1/v1', model: 'test', apiKey: 'test' },
+      mcpServers: {},
+    },
+    configPath: null,
+    configSources: [],
+    createdDefault: false,
+    connections: [],
+    agent,
+    sessionId,
+    resumed: false,
+    connectionFailures: [],
+  };
+}
+
+function recordingConnection(updates: acp.SessionNotification[]): acp.AgentSideConnection {
+  return {
+    sessionUpdate: async (params: acp.SessionNotification) => { updates.push(params); },
+    requestPermission: async () => ({ outcome: { outcome: 'cancelled' } }),
+  } as acp.AgentSideConnection;
+}
+
 test('MA ACP exposes a host-owned session, forwards events, permissions, cancellation, and close', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'ma-acp-'));
   const updates: acp.SessionNotification[] = [];
@@ -154,6 +187,69 @@ test('MA ACP rejects non-stdio MCP transports', async () => {
     }),
     /supports stdio MCP only/,
   );
+});
+
+test('MA ACP task failure rejects the prompt with a redacted driver error', async () => {
+  const rawSecret = 'sk-live-super-secret';
+  const updates: acp.SessionNotification[] = [];
+  const agent = eventAgent([{
+    type: 'task:failed',
+    taskId: 'task-1',
+    error: `Cloud request failed: 402 Provider quota exhausted; Authorization: Bearer ${rawSecret}; apiKey=second-secret`,
+  }]);
+  const server = new MaAcpAgent(recordingConnection(updates), {
+    bootstrapSession: async () => bootstrapResult(agent, 'ma-failed-session'),
+  });
+
+  try {
+    const created = await server.newSession({ cwd: process.cwd(), mcpServers: [] });
+    await assert.rejects(
+      server.prompt({
+        sessionId: created.sessionId,
+        prompt: [{ type: 'text', text: 'run task' }],
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /MA agent task failed: Cloud request failed: 402 Provider quota exhausted/);
+        assert.match(error.message, /\[REDACTED\]/);
+        assert.doesNotMatch(error.message, new RegExp(rawSecret));
+        assert.doesNotMatch(error.message, /second-secret/);
+        return true;
+      },
+    );
+
+    const serializedUpdates = JSON.stringify(updates);
+    assert.match(serializedUpdates, /\[REDACTED\]/);
+    assert.doesNotMatch(serializedUpdates, new RegExp(rawSecret));
+    assert.doesNotMatch(serializedUpdates, /second-secret/);
+  } finally {
+    await server.shutdown();
+  }
+});
+
+test('MA ACP model refusal text remains a normal completed turn', async () => {
+  const updates: acp.SessionNotification[] = [];
+  const agent = eventAgent([{
+    type: 'text',
+    content: 'I cannot help with that request.',
+  }]);
+  const server = new MaAcpAgent(recordingConnection(updates), {
+    bootstrapSession: async () => bootstrapResult(agent, 'ma-refusal-session'),
+  });
+
+  try {
+    const created = await server.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const response = await server.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: 'text', text: 'disallowed request' }],
+    });
+
+    assert.equal(response.stopReason, 'end_turn');
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0]?.update.sessionUpdate, 'agent_message_chunk');
+  } finally {
+    await server.shutdown();
+  }
 });
 
 test('MA ACP release entry completes a real stdio handshake and exits when the host disconnects', async () => {

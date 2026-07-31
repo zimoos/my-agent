@@ -15,7 +15,7 @@ interface MaAcpSession {
   boot: BootstrapResult;
   pendingPrompt: AbortController | null;
   pendingTool: acp.ToolCall | null;
-  failed: boolean;
+  failureReason: string | null;
 }
 
 export interface MaAcpServerOptions {
@@ -26,6 +26,25 @@ export interface MaAcpServerOptions {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+const MAX_FAILURE_REASON_LENGTH = 500;
+const REDACTED = '[REDACTED]';
+
+function sanitizeFailureReason(reason: string): string {
+  const normalized = reason
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const redacted = normalized
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, `$1${REDACTED}@`)
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, `Bearer ${REDACTED}`)
+    .replace(
+      /((?:["']?(?:api[_-]?key|access[_-]?token|token|secret|password|authorization)["']?)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}\]]+)/gi,
+      `$1${REDACTED}`,
+    )
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, REDACTED);
+  return (redacted || 'Agent task failed without a reason.').slice(0, MAX_FAILURE_REASON_LENGTH);
 }
 
 function systemPromptFromMeta(meta: unknown): string | undefined {
@@ -170,7 +189,7 @@ export class MaAcpAgent implements acp.Agent {
       boot,
       pendingPrompt: null,
       pendingTool: null,
-      failed: false,
+      failureReason: null,
     });
     return { sessionId: boot.sessionId };
   }
@@ -181,14 +200,17 @@ export class MaAcpAgent implements acp.Agent {
     const pending = new AbortController();
     session.pendingPrompt = pending;
     session.pendingTool = null;
-    session.failed = false;
+    session.failureReason = null;
     try {
       for await (const event of session.boot.agent.chat(promptContent(params.prompt), pending.signal)) {
         await this.forwardEvent(params.sessionId, session, event);
+        if (session.failureReason) {
+          throw new Error(`MA agent task failed: ${session.failureReason}`);
+        }
       }
       if (pending.signal.aborted) return { stopReason: 'cancelled', userMessageId: params.messageId };
       return {
-        stopReason: session.failed ? 'refusal' : 'end_turn',
+        stopReason: 'end_turn',
         userMessageId: params.messageId,
       };
     } catch (error) {
@@ -363,10 +385,10 @@ export class MaAcpAgent implements acp.Agent {
         });
         return;
       case 'task:failed':
-        session.failed = true;
+        session.failureReason = sanitizeFailureReason(event.error);
         await this.send(sessionId, {
           sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: event.error },
+          content: { type: 'text', text: session.failureReason },
         });
         return;
       case 'task:aborted':
