@@ -1506,6 +1506,7 @@ export async function createAgent(
           actionEvidence,
           fileReadCoverage,
           progressSummary,
+          terminalTurn,
         } = yield* toolExecutor.execute(
           tc,
           toolCtx,
@@ -1540,6 +1541,13 @@ export async function createAgent(
         errorTracker.record(fullName, args, isError);
         const progress = recordToolProgress(fullName, args, !isError, progressSummary ?? result);
         if (progress) yield progress;
+        if (!isError && terminalTurn) {
+          await completePendingZimoosOperationSummaries(
+            `[terminal tool result] ${terminalTurn.reason}`
+          );
+          persistPending();
+          return taskResult('');
+        }
       }
       // A local model can spend a truncated turn only updating its plan, then
       // announce a real action it still has not performed. Do not let a

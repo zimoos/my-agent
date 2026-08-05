@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ToolExecutor } from '../src/agent/tool-executor.js';
+import { ToolExecutor, terminalTurnDirective } from '../src/agent/tool-executor.js';
 import { FileReadLedger } from '../src/agent/file-read-ledger.js';
 import type { AgentConfig, McpConnection } from '../src/mcp/types.js';
 
@@ -47,6 +47,18 @@ function customShellConnection(): McpConnection & { calls: number } {
     close: async () => {},
   };
 }
+
+test('tool executor: accepts only a bounded explicit terminal-turn MCP directive', () => {
+  assert.deepEqual(terminalTurnDirective({
+    'my-agent/turn': { terminal: true, reason: 'visible_reply_sent' },
+  }), { reason: 'visible_reply_sent' });
+  assert.equal(terminalTurnDirective({
+    'my-agent/turn': { terminal: false, reason: 'visible_reply_sent' },
+  }), undefined);
+  assert.equal(terminalTurnDirective({
+    'my-agent/turn': { terminal: true, reason: '' },
+  }), undefined);
+});
 
 test('tool executor: non-interactive safe custom execute_command aliases execute without approval', async () => {
   const descriptor = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');

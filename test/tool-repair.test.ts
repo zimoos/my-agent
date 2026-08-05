@@ -170,6 +170,18 @@ test('StormBreaker: window slides — old calls drop out', () => {
   assert.equal(sb.inspect(tc('read', '{"p": "a"}')).suppress, true); // 6 — count=2 >= threshold
 });
 
+test('StormBreaker: treats changing ZimoOS frame cursors as the same semantic action', () => {
+  const sb = new StormBreaker(6, 3);
+  const act = (cursor: string) => tc('mteam-primary__zimoos_x2e_act', JSON.stringify({
+    frameCursor: cursor,
+    cmd: 'action:send',
+  }));
+  assert.equal(sb.inspect(act('cursor-1')).suppress, false);
+  assert.equal(sb.inspect(act('cursor-2')).suppress, false);
+  assert.equal(sb.inspect(act('cursor-3')).suppress, false);
+  assert.equal(sb.inspect(act('cursor-4')).suppress, true);
+});
+
 // ── ToolCallRepair pipeline ───────────────────────────────────────────
 
 test('ToolCallRepair: resetStorm delegates to StormBreaker', () => {

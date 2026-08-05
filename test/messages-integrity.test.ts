@@ -487,6 +487,58 @@ test('messages: chat() pushes user message before first model call', async () =>
   }
 });
 
+test('agent: a verified terminal MCP result ends the turn without another model request', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  let toolCalls = 0;
+  const terminalConnection: McpConnection = {
+    name: 'mteam-primary',
+    process: {} as any,
+    tools: [{
+      name: 'zimoos.act',
+      description: 'Execute a ZimoOS action',
+      inputSchema: {
+        type: 'object',
+        required: ['frameCursor', 'cmd'],
+        properties: { frameCursor: { type: 'string' }, cmd: { type: 'string' } },
+      },
+    }],
+    call: async () => {
+      toolCalls += 1;
+      return {
+        content: JSON.stringify(makeZimoosFrame()),
+        isError: false,
+        _meta: {
+          'my-agent/turn': { terminal: true, reason: 'visible_reply_sent' },
+        },
+      };
+    },
+    close: async () => {},
+  };
+  try {
+    const agent = await createAgent(makeConfig(), [terminalConnection]);
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({
+        toolCalls: [{
+          id: 'call_terminal_send',
+          name: 'mteam-primary__zimoos_x2e_act',
+          arguments: JSON.stringify({ frameCursor: 'cursor-1', cmd: 'submit action:send' }),
+        }],
+      }),
+    });
+
+    const events = await drain(agent.chat('send the visible reply'));
+
+    assert.equal(toolCalls, 1);
+    assert.equal(state.calls.length, 1, 'terminal action must not trigger another paid model request');
+    assert.ok(events.some((event) => event.type === 'task:done'));
+    assert.equal(events.some((event) => event.type === 'task:failed'), false);
+  } finally {
+    restore();
+  }
+});
+
 test('messages: append-only transcript sends paired tool protocol to provider', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);

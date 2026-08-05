@@ -93,6 +93,21 @@ export interface ToolExecutionResult {
   };
   fileReadCoverage?: FileReadCoverage;
   progressSummary?: string;
+  terminalTurn?: {
+    reason: string;
+  };
+}
+
+export function terminalTurnDirective(
+  meta: Record<string, unknown> | undefined,
+): { reason: string } | undefined {
+  const raw = meta?.['my-agent/turn'];
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const record = raw as Record<string, unknown>;
+  if (record.terminal !== true) return undefined;
+  const reason = typeof record.reason === 'string' ? record.reason.trim() : '';
+  if (!reason || reason.length > 160 || /[\u0000-\u001f\u007f]/.test(reason)) return undefined;
+  return { reason };
 }
 
 function requiresStructuredEvidence(
@@ -377,6 +392,7 @@ export class ToolExecutor {
       executionResult.structuredContent = structuredContent;
     }
     if (meta !== undefined) executionResult._meta = meta;
+    if (!isError) executionResult.terminalTurn = terminalTurnDirective(meta);
     if (readPageRecord) executionResult.fileReadCoverage = this.fileReadLedger.coverage();
     if (readPageRecord) executionResult.progressSummary = readPageUiSummary(readPageRecord);
     if (requiresEvidence) {

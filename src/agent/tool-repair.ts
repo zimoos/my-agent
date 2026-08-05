@@ -363,7 +363,7 @@ export class StormBreaker {
     reason?: string;
   } {
     const name = tc.function.name;
-    const args = tc.function.arguments;
+    const args = stormArguments(tc.function.name, tc.function.arguments);
 
     // Never suppress mutating calls
     if (this.isMutating?.(name)) return { suppress: false };
@@ -393,6 +393,22 @@ export class StormBreaker {
   /** Reset per turn — fresh intent shouldn't inherit old repetition state. */
   resetStorm(): void {
     this.window = [];
+  }
+}
+
+function stormArguments(name: string, rawArgs: string): string {
+  if (!/zimoos.*act/i.test(name)) return rawArgs;
+  try {
+    const parsed = JSON.parse(rawArgs) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return rawArgs;
+    const record = { ...(parsed as Record<string, unknown>) };
+    if (typeof record.cmd !== 'string') return rawArgs;
+    // A fresh frame cursor is transport state, not a new semantic action. Ignore
+    // it so repeated invalid or no-op ZimoOS actions are stopped within one turn.
+    delete record.frameCursor;
+    return JSON.stringify(record, Object.keys(record).sort());
+  } catch {
+    return rawArgs;
   }
 }
 
