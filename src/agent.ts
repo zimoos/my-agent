@@ -657,6 +657,10 @@ function isStormExemptTool(name: string): boolean {
   return name === 'ask_user' || name === 'enter_plan_mode';
 }
 
+function isZimoosFrameTool(name: string): boolean {
+  return /zimoos.*(?:current|search|act)/i.test(name);
+}
+
 function mcpToolsToOpenAI(connections: McpConnection[]): ChatCompletionTool[] {
   const out: ChatCompletionTool[] = [];
   for (const conn of connections) {
@@ -1485,9 +1489,29 @@ export async function createAgent(
 
       const toolCtx = { stack, currentTask: task, todoList, contextManager };
 
+      let zimoosFrameUpdatedInBatch = false;
       for (const tc of repairedCalls) {
         const fullName = tc.function.name;
         const args = normalizeArguments(tc.function.arguments);
+
+        if (zimoosFrameUpdatedInBatch && isZimoosFrameTool(fullName)) {
+          const skipped = [
+            'Skipped: a prior ZimoOS tool in this model response already changed the live frame.',
+            'Read the refreshed frame on the next model step before issuing another ZimoOS action.',
+          ].join(' ');
+          yield { type: 'tool:call', name: fullName, args };
+          yield { type: 'tool:result', ok: false, content: skipped };
+          store.appendToolResult(tc.id, skipped);
+          completionAudit.recordToolEvidence({
+            toolName: fullName,
+            args,
+            succeeded: false,
+            verifiedAction: false,
+          });
+          const progress = recordToolProgress(fullName, args, false, skipped);
+          if (progress) yield progress;
+          continue;
+        }
 
         const blockCheck = errorTracker.isBlocked(fullName, args);
         if (blockCheck.blocked) {
@@ -1531,6 +1555,7 @@ export async function createAgent(
         }
         if (runtimeSlotUpdate) {
           runtimeSlots.set(runtimeSlotUpdate);
+          if (isZimoosFrameTool(fullName)) zimoosFrameUpdatedInBatch = true;
           await appendDebugLog(
             `runtime slot updated: ${runtimeSlotUpdate.slotId} sourceTool=${fullName} toolCallId=${tc.id} frameId=${runtimeSlotUpdate.value.frame.frameId ?? '(unknown)'} frameCursor=${runtimeSlotUpdate.value.frame.frameCursor}`,
             options.debugLogging !== false,

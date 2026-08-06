@@ -15,7 +15,7 @@ interface MaAcpSession {
   boot: BootstrapResult;
   pendingPrompt: AbortController | null;
   pendingTool: acp.ToolCall | null;
-  failureReason: string | null;
+  hasVisibleText: boolean;
 }
 
 export interface MaAcpServerOptions {
@@ -189,7 +189,7 @@ export class MaAcpAgent implements acp.Agent {
       boot,
       pendingPrompt: null,
       pendingTool: null,
-      failureReason: null,
+      hasVisibleText: false,
     });
     return { sessionId: boot.sessionId };
   }
@@ -200,13 +200,10 @@ export class MaAcpAgent implements acp.Agent {
     const pending = new AbortController();
     session.pendingPrompt = pending;
     session.pendingTool = null;
-    session.failureReason = null;
+    session.hasVisibleText = false;
     try {
       for await (const event of session.boot.agent.chat(promptContent(params.prompt), pending.signal)) {
         await this.forwardEvent(params.sessionId, session, event);
-        if (session.failureReason) {
-          throw new Error(`MA agent task failed: ${session.failureReason}`);
-        }
       }
       if (pending.signal.aborted) return { stopReason: 'cancelled', userMessageId: params.messageId };
       return {
@@ -266,18 +263,21 @@ export class MaAcpAgent implements acp.Agent {
   ): Promise<void> {
     switch (event.type) {
       case 'token':
+        session.hasVisibleText = true;
         await this.send(sessionId, {
           sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: event.text },
         });
         return;
       case 'text':
+        session.hasVisibleText = true;
         await this.send(sessionId, {
           sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: event.content },
         });
         return;
       case 'ask_user':
+        session.hasVisibleText = true;
         await this.send(sessionId, {
           sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: event.question },
@@ -385,11 +385,12 @@ export class MaAcpAgent implements acp.Agent {
         });
         return;
       case 'task:failed':
-        session.failureReason = sanitizeFailureReason(event.error);
+        const failureReason = sanitizeFailureReason(event.error);
         await this.send(sessionId, {
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: session.failureReason },
+          sessionUpdate: session.hasVisibleText ? 'agent_thought_chunk' : 'agent_message_chunk',
+          content: { type: 'text', text: failureReason },
         });
+        session.hasVisibleText = true;
         return;
       case 'task:aborted':
       case 'aborted':

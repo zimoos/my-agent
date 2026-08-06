@@ -539,6 +539,55 @@ test('agent: a verified terminal MCP result ends the turn without another model 
   }
 });
 
+test('agent: only one ZimoOS frame tool advances state per model response', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  let calls = 0;
+  const connection = makeZimoosConnection([{ content: JSON.stringify(makeZimoosFrame()) }]);
+  const originalCall = connection[0].call;
+  connection[0].call = async (...args) => {
+    calls += 1;
+    return await originalCall(...args);
+  };
+  try {
+    const agent = await createAgent(makeConfig(), connection);
+    state.responses.push(
+      {
+        kind: 'stream',
+        chunks: streamChunks({
+          toolCalls: [
+            {
+              id: 'call_current_batch',
+              name: 'renamed-mteam__zimoos_x2e_current',
+              arguments: '{}',
+            },
+            {
+              index: 1,
+              id: 'call_stale_act_batch',
+              name: 'renamed-mteam__zimoos_x2e_act',
+              arguments: JSON.stringify({ frameCursor: 'cursor-before-current', cmd: 'sys.home' }),
+            },
+          ],
+        }),
+      },
+      { kind: 'stream', chunks: streamChunks({ content: 'Used the refreshed frame.' }) },
+    );
+
+    const events = await drain(agent.chat('inspect the current frame'));
+
+    assert.equal(calls, 1, 'the stale second ZimoOS call must not reach the host');
+    assert.equal(state.calls.length, 2);
+    assert.ok(events.some((event) => (
+      event.type === 'tool:result'
+      && event.ok === false
+      && /prior ZimoOS tool/.test(event.content)
+    )));
+    assertToolCallPaired(state.calls[1].messages);
+  } finally {
+    restore();
+  }
+});
+
 test('messages: append-only transcript sends paired tool protocol to provider', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);

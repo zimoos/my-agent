@@ -189,7 +189,7 @@ test('MA ACP rejects non-stdio MCP transports', async () => {
   );
 });
 
-test('MA ACP task failure rejects the prompt with a redacted driver error', async () => {
+test('MA ACP task failure completes the visible turn without triggering a host retry', async () => {
   const rawSecret = 'sk-live-super-secret';
   const updates: acp.SessionNotification[] = [];
   const agent = eventAgent([{
@@ -203,25 +203,43 @@ test('MA ACP task failure rejects the prompt with a redacted driver error', asyn
 
   try {
     const created = await server.newSession({ cwd: process.cwd(), mcpServers: [] });
-    await assert.rejects(
-      server.prompt({
-        sessionId: created.sessionId,
-        prompt: [{ type: 'text', text: 'run task' }],
-      }),
-      (error: unknown) => {
-        assert.ok(error instanceof Error);
-        assert.match(error.message, /MA agent task failed: Cloud request failed: 402 Provider quota exhausted/);
-        assert.match(error.message, /\[REDACTED\]/);
-        assert.doesNotMatch(error.message, new RegExp(rawSecret));
-        assert.doesNotMatch(error.message, /second-secret/);
-        return true;
-      },
-    );
+    const response = await server.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: 'text', text: 'run task' }],
+    });
+    assert.equal(response.stopReason, 'end_turn');
 
     const serializedUpdates = JSON.stringify(updates);
+    assert.match(serializedUpdates, /Cloud request failed: 402 Provider quota exhausted/);
     assert.match(serializedUpdates, /\[REDACTED\]/);
     assert.doesNotMatch(serializedUpdates, new RegExp(rawSecret));
     assert.doesNotMatch(serializedUpdates, /second-secret/);
+  } finally {
+    await server.shutdown();
+  }
+});
+
+test('MA ACP does not duplicate a task failure after a visible failure summary', async () => {
+  const updates: acp.SessionNotification[] = [];
+  const agent = eventAgent([
+    { type: 'text', content: '失败总结：已安全停止。' },
+    { type: 'task:failed', taskId: 'task-2', error: 'max loops' },
+  ]);
+  const server = new MaAcpAgent(recordingConnection(updates), {
+    bootstrapSession: async () => bootstrapResult(agent, 'ma-visible-failure-session'),
+  });
+
+  try {
+    const created = await server.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const response = await server.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: 'text', text: 'run bounded task' }],
+    });
+    assert.equal(response.stopReason, 'end_turn');
+    assert.deepEqual(
+      updates.map((item) => item.update.sessionUpdate),
+      ['agent_message_chunk', 'agent_thought_chunk'],
+    );
   } finally {
     await server.shutdown();
   }
