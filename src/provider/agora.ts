@@ -145,6 +145,14 @@ export interface AgoraMemoryIntakeBatchResult {
   targets: AgoraMemoryIntakeTargetResult[];
 }
 
+export interface AgoraVisibleMemorySourceMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  origin: 'mteam-user' | 'my-agent-user' | 'ma-assistant';
+  visibility: 'user-visible';
+  turnComplete: true;
+}
+
 export class AgoraMcpError extends Error {
   readonly code?: string;
   readonly field?: string;
@@ -184,11 +192,10 @@ export interface AgoraMemoryController {
   finalizeIntake(jobId: string, profileId: string): Promise<Record<string, any>>;
   startBatchIntake(args: {
     targets: AgoraMemoryIntakeTarget[];
-    source_message_start?: number;
-    source_message_end?: number;
-    sourceMessages?: Array<{ role: 'user' | 'assistant'; content: string }>;
+    sourceMessages: AgoraVisibleMemorySourceMessage[];
+    signal?: AbortSignal;
   }): Promise<AgoraMemoryIntakeBatchResult>;
-  getBatchIntake(batchId: string): Promise<AgoraMemoryIntakeBatchResult>;
+  getBatchIntake(batchId: string, signal?: AbortSignal): Promise<AgoraMemoryIntakeBatchResult>;
   applyCompletedBatch(batch: AgoraMemoryIntakeBatchResult, profileId: string): Promise<Record<string, any>>;
   setAutoPolicy(profileId: string, enabled: boolean, targetMemoryIds?: string[]): Promise<Record<string, any>>;
   rollbackMemory(memoryId: string, expectedHeadPatchId: string, targetPatchId: string): Promise<AgoraMemory>;
@@ -220,6 +227,62 @@ const TERMINAL_INTAKE_STATUSES = new Set(['completed', 'failed', 'noop', 'review
 const DEFAULT_AGORA_MAX_TOKENS = 4096;
 const AGORA_TIMEOUT_CAP_SECONDS = 300;
 const AGORA_TIMEOUT_HEADROOM_MS = 5000;
+
+export function buildAgoraVisibleMemorySource(
+  messages: unknown[],
+  userOrigin: 'mteam-user' | 'my-agent-user' = 'my-agent-user',
+): AgoraVisibleMemorySourceMessage[] {
+  const pairs: Array<[AgoraVisibleMemorySourceMessage, AgoraVisibleMemorySourceMessage]> = [];
+  let pendingUser: AgoraVisibleMemorySourceMessage | null = null;
+  for (const value of messages) {
+    const message = asRecord(value);
+    if (!message || (message.role !== 'user' && message.role !== 'assistant')) continue;
+    if (message.role === 'user') {
+      const content = visibleMessageText(message.content);
+      if (content) {
+        pendingUser = {
+          role: 'user', content, origin: userOrigin,
+          visibility: 'user-visible', turnComplete: true,
+        };
+      }
+      continue;
+    }
+    if (!pendingUser || (Array.isArray(message.tool_calls) && message.tool_calls.length > 0)) continue;
+    const content = visibleMessageText(message.content);
+    if (!content) continue;
+    pairs.push([pendingUser, {
+      role: 'assistant', content, origin: 'ma-assistant',
+      visibility: 'user-visible', turnComplete: true,
+    }]);
+    pendingUser = null;
+  }
+  return pairs.slice(-64).flat();
+}
+
+function visibleMessageText(value: unknown): string {
+  if (typeof value === 'string') return value.trim().slice(0, 131_072);
+  if (!Array.isArray(value)) return '';
+  return value.flatMap((part) => {
+    const record = asRecord(part);
+    return record?.type === 'text' && typeof record.text === 'string' ? [record.text] : [];
+  }).join('\n').trim().slice(0, 131_072);
+}
+
+function isCompleteVisibleMemorySource(messages: AgoraVisibleMemorySourceMessage[]): boolean {
+  return Array.isArray(messages)
+    && messages.length >= 2
+    && messages.length <= 128
+    && messages.length % 2 === 0
+    && messages.every((message, index) => (
+      typeof message.content === 'string'
+      && Boolean(message.content.trim())
+      && message.visibility === 'user-visible'
+      && message.turnComplete === true
+      && (index % 2 === 0
+        ? message.role === 'user' && (message.origin === 'mteam-user' || message.origin === 'my-agent-user')
+        : message.role === 'assistant' && message.origin === 'ma-assistant')
+    ));
+}
 
 function stringifyArgs(value: unknown): string {
   if (typeof value === 'string') return value;
@@ -931,27 +994,27 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
 
   async startBatchIntake(args: {
     targets: AgoraMemoryIntakeTarget[];
-    source_message_start?: number;
-    source_message_end?: number;
-    sourceMessages?: Array<{ role: 'user' | 'assistant'; content: string }>;
+    sourceMessages: AgoraVisibleMemorySourceMessage[];
+    signal?: AbortSignal;
   }): Promise<AgoraMemoryIntakeBatchResult> {
     this.requireV2();
     if (!Array.isArray(args.targets) || args.targets.length === 0) {
       throw new Error('Memory intake requires at least one explicit target');
     }
+    if (!isCompleteVisibleMemorySource(args.sourceMessages)) {
+      throw new Error('Memory intake requires complete user-visible conversation turns from the host');
+    }
     const payload = await this.callJsonTool('memory_intake_batch_run', {
       session_id: this.requireSessionId(),
       targets: args.targets,
-      ...(Number.isInteger(args.source_message_start) ? { source_message_start: args.source_message_start } : {}),
-      ...(Number.isInteger(args.source_message_end) ? { source_message_end: args.source_message_end } : {}),
-      ...(args.sourceMessages ? { source_messages: args.sourceMessages } : {}),
-    });
+      source_messages: args.sourceMessages,
+    }, args.signal);
     return this.normalizeBatch(payload);
   }
 
-  async getBatchIntake(batchId: string): Promise<AgoraMemoryIntakeBatchResult> {
+  async getBatchIntake(batchId: string, signal?: AbortSignal): Promise<AgoraMemoryIntakeBatchResult> {
     this.requireV2();
-    return this.normalizeBatch(await this.callJsonTool('memory_intake_batch_get', { batch_id: batchId }));
+    return this.normalizeBatch(await this.callJsonTool('memory_intake_batch_get', { batch_id: batchId }, signal));
   }
 
   async applyCompletedBatch(

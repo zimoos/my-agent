@@ -362,8 +362,7 @@ commands.set('/memory', {
           await ctx.startMemoryIntake(targets);
           return `Memory intake queued · ${targets.length} targets`;
         }
-        const result = await controller.startBatchIntake({ targets });
-        return `Memory intake queued: ${result.batch_id} · ${targets.length} targets`;
+        return 'Memory intake requires the host-provided visible conversation source. Open the Memory console and retry.';
       }
       const autoMatch = trimmed.match(/^auto\s+(on|off)(?:\s+--targets\s+(.+))?$/);
       if (autoMatch) {

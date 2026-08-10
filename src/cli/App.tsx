@@ -31,7 +31,7 @@ import type {
   AgoraMemoryPatch,
   AgoraMemoryProfile,
 } from '../provider/agora.js';
-import { agoraProjectProfileId } from '../provider/agora.js';
+import { agoraProjectProfileId, buildAgoraVisibleMemorySource } from '../provider/agora.js';
 import { classifyAgoraBatchTargets, planAgoraAutoIntake } from '../provider/agora-auto-intake.js';
 import type { PendingConfirm } from './hooks/useAgent.js';
 import { isCommand, executeCommand } from './utils/commands.js';
@@ -200,6 +200,12 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
     const profile = profiles.find((item) => item.id === profileId);
     if (!profile) throw new Error('当前项目尚未建立 Memory 组合。');
     const localEnd = localSourceEnd ?? sessionStore.load(currentSessionId).length;
+    const sourceMessages = buildAgoraVisibleMemorySource(
+      sessionStore.load(currentSessionId).slice(0, localEnd),
+    );
+    if (sourceMessages.length === 0) {
+      throw new Error('请先完成一次可见的用户提问和 MA 回复，再内化记忆。');
+    }
     const persisted = sessionStore.list(100).find((session) => session.id === currentSessionId)?.providerState;
     const end = sourceEnd ?? Number(
       agent.getProviderState?.()?.memory?.runtime_message_count ??
@@ -209,8 +215,7 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
     if (!Number.isInteger(end) || end <= 0) throw new Error('Agora runtime 尚未确认可内化的 source range；请先完成一次对话。');
     const batch = await memoryController.startBatchIntake({
       targets,
-      ...(Number.isInteger(sourceStart) ? { source_message_start: sourceStart } : {}),
-      ...(Number.isInteger(end) && end > 0 ? { source_message_end: end } : {}),
+      sourceMessages,
     });
     setMemoryActivity(`内化已提交 0/${batch.targets.length}`);
     persistMemoryRuntimeState({

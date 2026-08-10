@@ -7,9 +7,9 @@ import * as path from 'node:path';
 import { AgoraProviderRuntime } from '../src/provider/agora.js';
 import type { ModelConfig } from '../src/mcp/types.js';
 
-const AGORA_DEV_ROOT = '/Users/zhuqingyu/dev/agora';
-const AGORA_DEV_COMMAND = path.join(AGORA_DEV_ROOT, '.venv/bin/agora');
-const AGORA_DEV_PYTHON = path.join(AGORA_DEV_ROOT, '.venv/bin/python');
+const AGORA_DEV_ROOT = process.env.AGORA_DEV_ROOT ?? '/Users/zhuqingyu/dev/agora';
+const AGORA_DEV_COMMAND = process.env.AGORA_DEV_COMMAND ?? path.join(AGORA_DEV_ROOT, '.venv/bin/agora');
+const AGORA_DEV_PYTHON = process.env.AGORA_DEV_PYTHON ?? path.join(AGORA_DEV_ROOT, '.venv/bin/python');
 
 const MEMORY_TOOLS = [
   'doctor',
@@ -549,8 +549,14 @@ test('agora memory intake forwards only the host-visible source messages supplie
     };
   };
   const sourceMessages = [
-    { role: 'user' as const, content: '发布前必须通过真实首答。' },
-    { role: 'assistant' as const, content: '我会按验收门槛执行。' },
+    {
+      role: 'user' as const, content: '发布前必须通过真实首答。', origin: 'mteam-user' as const,
+      visibility: 'user-visible' as const, turnComplete: true as const,
+    },
+    {
+      role: 'assistant' as const, content: '我会按验收门槛执行。', origin: 'ma-assistant' as const,
+      visibility: 'user-visible' as const, turnComplete: true as const,
+    },
   ];
 
   await runtime.startBatchIntake({
@@ -599,7 +605,9 @@ test('agora memory internalize waits for the next real chat response metadata be
   assert.deepEqual(runtime.getProviderState()?.memory?.active_memory_patch_ids, ['patch-a']);
 });
 
-const agoraDevE2eTest = fs.existsSync(AGORA_DEV_COMMAND) && fs.existsSync(AGORA_DEV_PYTHON)
+const agoraDevE2eTest = process.env.MA_RUN_AGORA_DEV_E2E === '1'
+  && fs.existsSync(AGORA_DEV_COMMAND)
+  && fs.existsSync(AGORA_DEV_PYTHON)
   ? test
   : test.skip;
 
@@ -650,6 +658,16 @@ agoraDevE2eTest('agora provider runtime uses real MCP stdio for mount, internali
       } as any);
       const submitted = await controller.startBatchIntake({
         targets: [{ mode: 'create', name: 'MA E2E Memory', output_name: 'MA E2E Memory@v1' }],
+        sourceMessages: [
+          {
+            role: 'user', content: '利博是我的同事。', origin: 'my-agent-user',
+            visibility: 'user-visible', turnComplete: true,
+          },
+          {
+            role: 'assistant', content: '已确认。', origin: 'ma-assistant',
+            visibility: 'user-visible', turnComplete: true,
+          },
+        ],
       });
       let finalized = submitted;
       for (let i = 0; i < 120; i++) {
