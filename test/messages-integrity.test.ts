@@ -431,6 +431,60 @@ async function drain(gen: AsyncGenerator<AgentEvent, void, unknown>): Promise<Ag
 
 // ---------- cases ----------
 
+test('messages: exact reply contract hides tools and replaces model boilerplate', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  let toolCalls = 0;
+  const connection: McpConnection = {
+    name: 'mteam-primary',
+    process: {} as any,
+    tools: [{
+      name: 'zimoos.current',
+      description: 'Read current frame',
+      inputSchema: { type: 'object', properties: {} },
+    }],
+    call: async () => {
+      toolCalls += 1;
+      return { content: 'must not run', isError: false };
+    },
+    close: async () => {},
+  };
+  const agent = await createAgent(makeConfig(), [connection]);
+  try {
+    state.responses.push({
+      kind: 'stream',
+      chunks: streamChunks({
+        content: 'API server is busy. Please try again later or contact your administrator.',
+        toolCalls: [{
+          id: 'call_unwanted',
+          name: 'mteam-primary__zimoos_x2e_current',
+          arguments: '{}',
+        }],
+      }),
+    });
+    const prompt = [
+      'MTEAM wake instructions',
+      '<current_user_message id="message-1">',
+      'Reply exactly: PROJECT-UNMOUNT-UAT',
+      '</current_user_message>',
+    ].join('\n');
+    const events = await drain(agent.chat(prompt));
+    assert.equal(state.calls.length, 1);
+    assert.equal(state.calls[0].body.tools, undefined);
+    assert.equal(state.calls[0].body.tool_choice, undefined);
+    assert.equal(toolCalls, 0);
+    const visible = events
+      .filter((event) => event.type === 'token')
+      .map((event) => event.type === 'token' ? event.text : '')
+      .join('');
+    assert.equal(visible, 'PROJECT-UNMOUNT-UAT');
+    assert.doesNotMatch(visible, /API server is busy/);
+  } finally {
+    restore();
+    await agent.close();
+  }
+});
+
 test('messages: initial system prompt is first message with expected content', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);

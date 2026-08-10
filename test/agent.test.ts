@@ -9,7 +9,24 @@ const {
   normalizeArguments,
   ensureToolCallId,
   normalizeToolCalls,
+  currentUserText,
+  exactReplyContract,
 } = __internal__;
+
+test('exactReplyContract: extracts the protected MTEAM user request', () => {
+  const prompt = [
+    'system wake instructions',
+    '<current_user_message id="message-1">',
+    'Reply exactly: CROSS-MISSION-MEMORY-UAT',
+    '</current_user_message>',
+  ].join('\n');
+  assert.equal(currentUserText(prompt), 'Reply exactly: CROSS-MISSION-MEMORY-UAT');
+  assert.equal(exactReplyContract(prompt), 'CROSS-MISSION-MEMORY-UAT');
+});
+
+test('exactReplyContract: does not disable tools for ordinary requests', () => {
+  assert.equal(exactReplyContract('检查当前项目并运行测试'), null);
+});
 
 function fakeConn(name: string, toolNames: string[]): McpConnection {
   return {

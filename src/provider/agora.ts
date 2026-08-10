@@ -623,6 +623,129 @@ function errorText(payload: Record<string, any>): string {
   return 'Agora MCP tool returned a failed payload';
 }
 
+interface SharedAgoraHostSnapshot {
+  toolNames: Set<string>;
+  resources: string[];
+  doctorPayload: Record<string, any>;
+  modelsPayload: Record<string, any>;
+  runtimeContract: AgoraRuntimeContract | null;
+}
+
+interface SharedAgoraHost {
+  client: McpClient;
+  refs: number;
+  ready: Promise<SharedAgoraHostSnapshot>;
+}
+
+const sharedAgoraHosts = new Map<string, SharedAgoraHost>();
+
+function sharedAgoraHostKey(
+  command: ResolvedAgoraCommand,
+  runtime: AgoraRuntimeConfig | undefined,
+  dataRoot: string,
+  requestTimeoutMs: number,
+): string {
+  const env = Object.entries(runtime?.env ?? {}).sort(([left], [right]) => left.localeCompare(right));
+  return JSON.stringify({
+    command: path.resolve(command.command),
+    args: command.args,
+    cwd: runtime?.cwd ? path.resolve(runtime.cwd) : null,
+    dataRoot,
+    env,
+    requestTimeoutMs,
+  });
+}
+
+async function callSharedAgoraJson(
+  client: McpClient,
+  toolName: string,
+  args: Record<string, any> = {},
+): Promise<Record<string, any>> {
+  const result = await client.call(toolName, args);
+  if (result.isError) throw new Error(result.content || `Agora MCP tool ${toolName} failed`);
+  let payload: unknown;
+  try {
+    payload = JSON.parse(result.content || '{}');
+  } catch (error) {
+    throw new Error(`Agora MCP tool ${toolName} returned non-JSON content: ${(error as Error).message}`);
+  }
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error(`Agora MCP tool ${toolName} returned invalid JSON payload`);
+  }
+  const record = payload as Record<string, any>;
+  if (isErrorPayload(record)) throw new AgoraMcpError(errorText(record), record);
+  return record;
+}
+
+async function initializeSharedAgoraHost(client: McpClient): Promise<SharedAgoraHostSnapshot> {
+  await client.initialize();
+  const tools = await client.listTools();
+  const toolNames = new Set(tools.map((tool) => tool.name));
+  for (const name of REQUIRED_TOOLS) {
+    if (!toolNames.has(name)) throw new Error(`Agora MCP missing required tool: ${name}`);
+  }
+  let resources: string[] = [];
+  try {
+    const listed = await client.request('resources/list', {});
+    const raw = Array.isArray(listed?.resources) ? listed.resources : [];
+    resources = raw.map((item: any) => String(item?.uri ?? '')).filter(Boolean);
+  } catch {
+    resources = [];
+  }
+  const doctorPayload = await callSharedAgoraJson(client, 'doctor');
+  const capabilityPayload = toolNames.has('runtime_capabilities')
+    ? await callSharedAgoraJson(client, 'runtime_capabilities')
+    : null;
+  const runtimeContract = capabilityPayload
+    ? (asRecord(capabilityPayload.contract) ?? capabilityPayload) as AgoraRuntimeContract
+    : asRecord(doctorPayload.contract) as AgoraRuntimeContract | null;
+  const modelsPayload = await callSharedAgoraJson(client, 'models_list');
+  return { toolNames, resources, doctorPayload, modelsPayload, runtimeContract };
+}
+
+function acquireSharedAgoraHost(
+  command: ResolvedAgoraCommand,
+  runtime: AgoraRuntimeConfig | undefined,
+  dataRoot: string,
+  requestTimeoutMs: number,
+): { key: string; host: SharedAgoraHost } {
+  const key = sharedAgoraHostKey(command, runtime, dataRoot, requestTimeoutMs);
+  let host = sharedAgoraHosts.get(key);
+  if (!host) {
+    const child = spawn(command.command, command.args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: runtime?.cwd,
+      env: buildMcpEnv({
+        ...(runtime?.env ?? {}),
+        AGORA_DATA_ROOT: dataRoot,
+      }),
+    });
+    const client = new McpClient('agora-provider', child, requestTimeoutMs);
+    host = {
+      client,
+      refs: 0,
+      ready: initializeSharedAgoraHost(client),
+    };
+    sharedAgoraHosts.set(key, host);
+    child.once('exit', () => {
+      if (sharedAgoraHosts.get(key) === host) sharedAgoraHosts.delete(key);
+    });
+    void host.ready.catch(async () => {
+      if (sharedAgoraHosts.get(key) === host) sharedAgoraHosts.delete(key);
+      await client.close();
+    });
+  }
+  host.refs += 1;
+  return { key, host };
+}
+
+async function releaseSharedAgoraHost(key: string, host: SharedAgoraHost): Promise<void> {
+  host.refs = Math.max(0, host.refs - 1);
+  if (host.refs > 0 || sharedAgoraHosts.get(key) !== host) return;
+  sharedAgoraHosts.delete(key);
+  await host.client.close();
+}
+
 function asRecord(value: unknown): Record<string, any> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, any>
@@ -722,6 +845,7 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
   private requestedAfterRevision: number | null = null;
   private runtimeTrust: 'verified' | 'unverified' = 'unverified';
   private runtimeSource = 'unknown';
+  private sharedHost: { key: string; host: SharedAgoraHost } | null = null;
 
   constructor(
     private readonly model: ModelConfig,
@@ -1092,9 +1216,10 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
   }
 
   async close(): Promise<void> {
-    const client = this.mcp;
     this.mcp = null;
-    if (client) await client.close();
+    const shared = this.sharedHost;
+    this.sharedHost = null;
+    if (shared) await releaseSharedAgoraHost(shared.key, shared.host);
   }
 
   async createChatCompletion(
@@ -1318,36 +1443,15 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
     this.runtimeSource = command.source;
     const dataRoot = resolveAgoraDataRoot(runtime);
     fs.mkdirSync(dataRoot, { recursive: true });
-    const child = spawn(command.command, command.args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: runtime?.cwd,
-      env: buildMcpEnv({
-        ...(runtime?.env ?? {}),
-        AGORA_DATA_ROOT: dataRoot,
-      }),
-    });
-    this.mcp = new McpClient('agora-provider', child, this.policy.requestTimeoutMs);
+    const shared = acquireSharedAgoraHost(command, runtime, dataRoot, this.policy.requestTimeoutMs);
+    this.sharedHost = shared;
+    this.mcp = shared.host.client;
     try {
-      await this.mcp.initialize();
-      const tools = await this.mcp.listTools();
-      this.toolNames = new Set(tools.map((tool) => tool.name));
-      for (const name of REQUIRED_TOOLS) {
-        if (!this.toolNames.has(name)) throw new Error(`Agora MCP missing required tool: ${name}`);
-      }
-      try {
-        const resources = await this.mcp.request('resources/list', {});
-        const raw = Array.isArray(resources?.resources) ? resources.resources : [];
-        this.resources = raw.map((item: any) => String(item?.uri ?? '')).filter(Boolean);
-      } catch {
-        this.resources = [];
-      }
-      this.doctorPayload = await this.callJsonTool('doctor', {}, undefined, false);
-      if (this.toolNames.has('runtime_capabilities')) {
-        const capabilityPayload = await this.callJsonTool('runtime_capabilities', {}, undefined, false);
-        this.runtimeContract = (asRecord(capabilityPayload.contract) ?? capabilityPayload) as AgoraRuntimeContract;
-      } else {
-        this.runtimeContract = asRecord(this.doctorPayload.contract) as AgoraRuntimeContract | null;
-      }
+      const snapshot = await shared.host.ready;
+      this.toolNames = new Set(snapshot.toolNames);
+      this.resources = [...snapshot.resources];
+      this.doctorPayload = snapshot.doctorPayload;
+      this.runtimeContract = snapshot.runtimeContract;
       if (command.trust === 'verified') {
         const expectedVersion = command.lock?.version;
         const actualVersion = this.runtimeContract?.runtime_version ?? this.doctorPayload.version;
@@ -1359,7 +1463,7 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
           );
         }
       }
-      this.modelsPayload = await this.callJsonTool('models_list', {}, undefined, false);
+      this.modelsPayload = snapshot.modelsPayload;
     } catch (err) {
       await this.close();
       throw err;

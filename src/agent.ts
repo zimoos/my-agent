@@ -346,6 +346,16 @@ async function* drainProviderEvents<T>(
   }
 }
 
+async function* suppressModelTokens<T>(
+  source: AsyncGenerator<AgentEvent, T, unknown>
+): AsyncGenerator<AgentEvent, T, unknown> {
+  while (true) {
+    const next = await source.next();
+    if (next.done) return next.value;
+    if (next.value.type !== 'token') yield next.value;
+  }
+}
+
 async function appendDebugLog(content: string, enabled = true): Promise<void> {
   if (!enabled) return;
   try {
@@ -411,6 +421,29 @@ function clarificationForAmbiguousPrompt(
 
 function userAskedForConcreteToolWork(prompt: string): boolean {
   return /(?:读|读取|查看|列出|搜索|搜|grep|执行|运行|统计|创建|写|写入|修改|编辑|替换|修复|实现|测试|read|list|search|grep|run|execute|count|create|write|edit|replace|fix|implement|test)/i.test(prompt);
+}
+
+function decodeXmlText(value: string): string {
+  return value
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+function currentUserText(prompt: string): string {
+  const wrapped = /<current_user_message\s+id="[^"]+">\s*([\s\S]*?)\s*<\/current_user_message>/i.exec(prompt);
+  return decodeXmlText((wrapped?.[1] ?? prompt).trim());
+}
+
+function exactReplyContract(prompt: string): string | null {
+  const current = currentUserText(prompt);
+  const match = /^(?:reply\s+exactly|(?:请)?(?:只|仅)(?:需|需要)?回复)\s*[:：]\s*([\s\S]+)$/i.exec(current);
+  if (!match) return null;
+  const expected = match[1].trim();
+  if (!expected || expected.length > 4_000) return null;
+  return expected;
 }
 
 function looksLikeVerbalToolIntent(text: string): boolean {
@@ -994,6 +1027,10 @@ export async function createAgent(
     signal?: AbortSignal
   ): AsyncGenerator<AgentEvent, TaskRunResult, unknown> {
     const errorTracker = new ErrorTracker();
+    const expectedExactReply = task.parentId
+      ? null
+      : exactReplyContract(textFromChatContent(rootUserMessage));
+    const requestTools = expectedExactReply === null ? tools : [];
     const effectiveMaxTokens = config.model.maxTokens;
     const streamParser = new StreamParser({
       maxContentChars: config.model.maxOutputChars,
@@ -1175,13 +1212,13 @@ export async function createAgent(
         providerCodec.buildRequestExtras?.({
           model: config.model,
           messages: requestMessages,
-          tools,
+          tools: requestTools,
           stream: true,
         }) ?? {},
         config.model.extraParams ?? {}
       );
-      if (tools.length > 0) {
-        request.tools = tools;
+      if (requestTools.length > 0) {
+        request.tools = requestTools;
         request.tool_choice = 'auto';
       }
 
@@ -1227,7 +1264,7 @@ export async function createAgent(
         } catch { /* ignore */ }
       }
 
-      const parsedTurn = yield* drainProviderEvents((onProviderEvent) =>
+      const providerTurn = drainProviderEvents((onProviderEvent) =>
         (async function* () {
           const stream = await providerRuntime.createStreamingChatCompletion(
             request,
@@ -1236,7 +1273,16 @@ export async function createAgent(
           return yield* streamParser.parse(stream);
         })()
       );
-      const { content: contentBuf, toolCalls, finishReason } = parsedTurn;
+      const parsedTurn = expectedExactReply === null
+        ? (yield* providerTurn)
+        : (yield* suppressModelTokens(providerTurn));
+      let { content: contentBuf, toolCalls, finishReason } = parsedTurn;
+      if (expectedExactReply !== null) {
+        contentBuf = expectedExactReply;
+        toolCalls = null;
+        finishReason = 'stop';
+        yield { type: 'token', text: expectedExactReply };
+      }
       persistProviderState();
       const reasoningContent = providerCodec.shouldStoreReasoningContent(parsedTurn)
         ? parsedTurn.reasoningContent
@@ -1872,4 +1918,6 @@ export const __internal__ = {
   compactToolResult,
   CREATE_TASK_TOOL,
   STACK_STATE_PREFIX,
+  currentUserText,
+  exactReplyContract,
 };

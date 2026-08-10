@@ -611,6 +611,67 @@ const agoraDevE2eTest = process.env.MA_RUN_AGORA_DEV_E2E === '1'
   ? test
   : test.skip;
 
+test('agora provider runtimes share one MCP host until the final lease closes', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ma-agora-shared-host-'));
+  const serverPath = path.join(tmp, 'fake-agora.mjs');
+  const counterPath = path.join(tmp, 'starts.log');
+  fs.writeFileSync(serverPath, `
+import fs from 'node:fs';
+import readline from 'node:readline';
+fs.appendFileSync(process.env.SPAWN_COUNTER, String(process.pid) + '\\n');
+const tools = ['doctor', 'models_list', 'chat_complete'];
+const send = (id, result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\\n');
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  const message = JSON.parse(line);
+  if (typeof message.id !== 'number') return;
+  if (message.method === 'initialize') return send(message.id, { protocolVersion: '2024-11-05', capabilities: {}, serverInfo: { name: 'fake-agora', version: '1' } });
+  if (message.method === 'tools/list') return send(message.id, { tools: tools.map((name) => ({ name, description: name, inputSchema: { type: 'object', properties: {} } })) });
+  if (message.method === 'resources/list') return send(message.id, { resources: [] });
+  if (message.method === 'tools/call') {
+    const name = message.params?.name;
+    const payload = name === 'doctor'
+      ? { status: 'ok', service: 'agora' }
+      : name === 'models_list'
+        ? { status: 'ok', models: [{ id: 'base-a' }] }
+        : { status: 'completed', message: { role: 'assistant', content: 'ok' }, session_id: 'chat-a' };
+    return send(message.id, { content: [{ type: 'text', text: JSON.stringify(payload) }], isError: false });
+  }
+  send(message.id, {});
+});
+`);
+  const sharedModel = (conversationId: string): ModelConfig => ({
+    ...model(),
+    agoraRuntime: {
+      command: process.execPath,
+      args: [serverPath],
+      dataRoot: path.join(tmp, 'data'),
+      env: { SPAWN_COUNTER: counterPath },
+    },
+    agoraMemory: { ...model().agoraMemory!, conversationId },
+  });
+  const policy = { requestTimeoutMs: 5000, streamIdleTimeoutMs: 5000, maxRetries: 0 };
+  const first = new AgoraProviderRuntime(sharedModel('one'), policy, { sessionId: 'one', cwd: tmp });
+  const second = new AgoraProviderRuntime(sharedModel('two'), policy, { sessionId: 'two', cwd: tmp });
+  try {
+    await Promise.all([first.ready(), second.ready()]);
+    assert.equal(fs.readFileSync(counterPath, 'utf8').trim().split('\n').length, 1);
+    await first.close();
+    assert.deepEqual(await second.listModels(), [{ id: 'base-a' }]);
+    await second.close();
+
+    const third = new AgoraProviderRuntime(sharedModel('three'), policy, { sessionId: 'three', cwd: tmp });
+    try {
+      await third.ready();
+      assert.equal(fs.readFileSync(counterPath, 'utf8').trim().split('\n').length, 2);
+    } finally {
+      await third.close();
+    }
+  } finally {
+    await Promise.allSettled([first.close(), second.close()]);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 agoraDevE2eTest('agora provider runtime uses real MCP stdio for mount, internalize, rollback, and disable', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ma-agora-provider-e2e-'));
   const dataRoot = path.join(tmp, 'agora-data');
