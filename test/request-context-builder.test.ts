@@ -12,6 +12,10 @@ import type {
   ZimoosFrameSlotValue,
   ZimoosOSFrame,
 } from '../src/agent/runtime-context-slots.js';
+import {
+  completeZimoosToolAuditSummary,
+  createZimoosToolAuditText,
+} from '../src/agent/runtime-context-slots.js';
 
 const ZIMOOS_STATE_RE =
   /<zimoos\b|\[ZimoOS Current Frame\]|["']?protocol["']?\s*:\s*["']zimoos\/os-frame["']|zimoos\/os-frame/;
@@ -71,6 +75,21 @@ function slot(value: ZimoosOSFrame): ZimoosFrameSlotValue {
     receivedAt: '2026-07-04T10:00:01.000Z',
   };
 }
+
+test('zimoos audit history is objective and cannot be rewritten by assistant claims', () => {
+  const audit = createZimoosToolAuditText(
+    frame(),
+    'mteam-primary__zimoos_x2e_current',
+    {},
+  );
+  assert.match(audit, /Read the current frame only; no frame action or external side effect was executed/);
+  assert.doesNotMatch(audit, /pending LLM correction/);
+  assert.equal(
+    completeZimoosToolAuditSummary(audit, 'The requested file was created.'),
+    null,
+  );
+  assert.doesNotMatch(audit, /requested file was created/);
+});
 
 function renderRequestOnlyZimoos(value: ZimoosFrameSlotValue): string {
   return [

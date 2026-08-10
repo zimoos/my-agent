@@ -1,6 +1,6 @@
 import type { FileReadCoverage } from './file-read-ledger.js';
 
-export type CompletionObligationKind = 'test' | 'browser' | 'file_read_coverage';
+export type CompletionObligationKind = 'test' | 'browser' | 'file_read_coverage' | 'file_mutation';
 
 export interface CompletionToolEvidence {
   toolName: string;
@@ -21,6 +21,7 @@ const OBLIGATION_LABELS: Record<CompletionObligationKind, string> = {
   test: '运行测试并取得成功结果',
   browser: '使用真实浏览器自动化完成验证',
   file_read_coverage: '用 read_file receipt 证明目标文件已连续完整读取',
+  file_mutation: '用带结构化验真的文件工具证明目标文件已创建或修改',
 };
 
 function asksToRunTests(prompt: string): boolean {
@@ -58,6 +59,15 @@ function asksForCompleteFileReading(prompt: string): boolean {
   ].some((pattern) => pattern.test(prompt));
 }
 
+function asksForFileMutation(prompt: string, fileHints: string[]): boolean {
+  if (fileHints.length === 0) return false;
+  return [
+    /(?:创建|新建|写入|保存|生成|修改|编辑|更新|追加|删除|移除|重命名|移动).{0,80}(?:文件|目录|[A-Za-z0-9_@./\\:+-]+\.[A-Za-z][A-Za-z0-9]{0,11})/i,
+    /(?:文件|目录|[A-Za-z0-9_@./\\:+-]+\.[A-Za-z][A-Za-z0-9]{0,11}).{0,80}(?:创建|新建|写入|保存|生成|修改|编辑|更新|追加|删除|移除|重命名|移动)/i,
+    /\b(?:create|write|save|generate|modify|edit|update|append|delete|remove|rename|move)\b.{0,100}\b(?:file|directory|folder)\b/i,
+  ].some((pattern) => pattern.test(prompt));
+}
+
 function claimsCompleteFileReading(text: string): boolean {
   return [
     /(?:已经|已|我已).{0,8}(?:完整|全部|全量).{0,16}(?:阅读|读取|查看|审阅|检查)/i,
@@ -87,9 +97,11 @@ export function extractCompletionObligations(
   rootPrompt: string
 ): CompletionObligationKind[] {
   const obligations: CompletionObligationKind[] = [];
+  const fileHints = extractExplicitFileHints(rootPrompt);
   if (asksToRunTests(rootPrompt)) obligations.push('test');
   if (asksForBrowserVerification(rootPrompt)) obligations.push('browser');
   if (asksForCompleteFileReading(rootPrompt)) obligations.push('file_read_coverage');
+  if (asksForFileMutation(rootPrompt, fileHints)) obligations.push('file_mutation');
   return obligations;
 }
 
@@ -104,6 +116,18 @@ function commandFromArgs(args: Record<string, unknown>): string {
 
 function isExecuteCommand(toolName: string): boolean {
   return /(?:^|__)execute_command$/i.test(toolName);
+}
+
+function isFileMutationTool(toolName: string): boolean {
+  return /(?:^|__)(?:write_file|file_edit|delete_file|create_file|remove_file|move_file|rename_file)$/i.test(toolName);
+}
+
+function mutationPath(args: Record<string, unknown>): string | null {
+  for (const key of ['path', 'file_path', 'filename', 'target', 'destination']) {
+    const value = args[key];
+    if (typeof value === 'string' && value.trim()) return value.trim().replace(/\\/g, '/');
+  }
+  return null;
 }
 
 export function isSemanticTestCommand(command: string): boolean {
@@ -143,6 +167,7 @@ export class CompletionObligationAudit {
   private readonly required: Set<CompletionObligationKind>;
   private readonly explicitFileHints: string[];
   private readonly completed = new Set<CompletionObligationKind>();
+  private readonly mutatedFiles = new Set<string>();
   private retryCount = 0;
   private fileReadCoverage: FileReadCoverage = {
     files: [],
@@ -158,6 +183,15 @@ export class CompletionObligationAudit {
 
   recordToolEvidence(evidence: CompletionToolEvidence): void {
     if (!evidence.succeeded) return;
+
+    if (evidence.verifiedAction && isFileMutationTool(evidence.toolName)) {
+      const path = mutationPath(evidence.args);
+      if (path) this.mutatedFiles.add(path);
+      const everyExplicitFileMutated = this.explicitFileHints.every((hint) =>
+        [...this.mutatedFiles].some((mutated) => coverageMatchesHint(mutated, hint)),
+      );
+      if (everyExplicitFileMutated) this.completed.add('file_mutation');
+    }
 
     if (isBrowserAutomationTool(evidence.toolName)) {
       this.completed.add('browser');
@@ -224,7 +258,7 @@ export class CompletionObligationAudit {
       `[MA completion audit] 不能完成任务：仍缺少 ${details}。`,
       unread,
       '请现在直接调用工具补齐验证。测试必须由成功的测试命令证明；浏览器验证必须由真实浏览器自动化证明；完整读取必须由同一文件 hash 上从 1:0 连续到 EOF 的 read_file receipt 证明。',
-      'exec cat/sed/head/tail、web_fetch/HTTP 200、只写验证脚本、以及文字自述都不算对应完成证据。',
+      '文件创建或修改必须由目标路径匹配且带结构化验真的 write_file/file_edit 等文件工具证明。exec cat/sed/head/tail、web_fetch/HTTP 200、只写验证脚本、以及文字自述都不算对应完成证据。',
     ].filter(Boolean).join('\n');
   }
 

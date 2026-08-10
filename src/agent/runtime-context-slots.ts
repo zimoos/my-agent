@@ -78,8 +78,6 @@ export type RuntimeContextSlotUpdate = {
   auditText: string;
 };
 
-const PENDING_SUMMARY = 'pending LLM correction';
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -162,14 +160,18 @@ function escapeXmlAttr(text: string): string {
   return escapeXmlText(text).replace(/"/g, '&quot;');
 }
 
-function sanitizeOperationSummary(summary: string): string {
-  const withoutRequestOnlyState = summary
-    .replace(/<zimoos\b[\s\S]*?<\/zimoos>/gi, '[request-only ZimoOS state omitted]')
-    .replace(/\[ZimoOS Current Frame\]/g, 'ZimoOS current frame');
-  const normalized = withoutRequestOnlyState.replace(/\s+/g, ' ').trim();
-  return normalized
-    ? oneLine(normalized, 700)
-    : 'No assistant summary was produced for this ZimoOS operation.';
+function objectiveOperationSummary(sourceTool: string): string {
+  const normalized = sourceTool.replace(/_x2e_/g, '.').toLowerCase();
+  if (/zimoos.*current/.test(normalized)) {
+    return 'Read the current frame only; no frame action or external side effect was executed';
+  }
+  if (/zimoos.*search/.test(normalized)) {
+    return 'Searched ZimoOS frames only; no frame action or external side effect was executed';
+  }
+  if (/zimoos.*act/.test(normalized)) {
+    return 'Requested one frame action; only returned structured evidence can prove its effect';
+  }
+  return 'Updated the request-only ZimoOS frame; no external side effect was proven';
 }
 
 function limitItems<T>(items: T[] | undefined, max: number): { shown: T[]; omitted: number } {
@@ -198,7 +200,7 @@ export function createZimoosToolAuditText(
   return [
     '[ZimoOS Operation]',
     `Action: ${action}`,
-    `Summary: ${PENDING_SUMMARY}.`,
+    `Summary: ${objectiveOperationSummary(sourceTool)}.`,
     `Frame audit: Updated live slot ${ZIMOOS_CURRENT_FRAME_SLOT_ID}; audit only: frameCursor=${frame.frameCursor}, title=${title}, status=${status}, ${countLabel(visible, 'visible item')}, ${countLabel(shortcuts, 'action')}, ${countLabel(handles, 'handle')}.`,
     'Current UI state is request-only and is not duplicated in tool history.',
   ].join(' ');
@@ -212,7 +214,7 @@ export function createInvalidZimoosFrameAuditText(
   return [
     '[ZimoOS Operation]',
     `Action: ${action}`,
-    `Summary: ${PENDING_SUMMARY}.`,
+    'Summary: Rejected malformed ZimoOS frame payload; no effect was accepted.',
     'Frame audit: rejected malformed ZimoOS frame payload; raw payload omitted; live slot was not updated.',
   ].join(' ');
 }
@@ -236,16 +238,13 @@ export function sanitizeZimoosToolResultForHistory(params: {
 }
 
 export function completeZimoosToolAuditSummary(
-  auditText: string,
-  summary: string
+  _auditText: string,
+  _summary: string
 ): string | null {
-  if (!auditText.includes(`[ZimoOS Operation]`) || !auditText.includes(`Summary: ${PENDING_SUMMARY}.`)) {
-    return null;
-  }
-  return auditText.replace(
-    `Summary: ${PENDING_SUMMARY}.`,
-    `Summary: ${sanitizeOperationSummary(summary)}.`
-  );
+  // ZimoOS history is system-owned evidence. Assistant prose must never be
+  // copied back into a tool result, otherwise the model can self-certify an
+  // action that no tool performed.
+  return null;
 }
 
 export function createZimoosRuntimeSlotUpdate(params: {

@@ -123,6 +123,33 @@ function verifiedExecConnection(): McpConnection {
   });
 }
 
+function verifiedWriteConnection(): McpConnection {
+  return connection('fs', 'write_file', {
+    content: 'file written',
+    structuredContent: {
+      'my-agent/evidence': {
+        operation: 'write_file',
+        status: 'verified',
+      },
+    },
+  });
+}
+
+function zimoosCurrentConnection(): McpConnection {
+  return connection('mteam', 'zimoos.current', {
+    content: JSON.stringify({
+      protocol: 'zimoos/os-frame',
+      version: '0.1',
+      frameCursor: 'cursor-current',
+      status: 'active',
+      title: 'MIT Direct: You',
+      visibleContent: [],
+      shortcuts: [],
+      handles: [],
+    }),
+  });
+}
+
 function readPage(
   cursor: string,
   nextCursor: string | null,
@@ -296,6 +323,46 @@ test('completion obligations: repeated unsupported final exhausts bounded retrie
     assert.equal(events.filter((event) => event.type === 'warning').length, 2);
     assert.equal(events.some((event) => event.type === 'task:done'), false);
     assert.ok(events.some((event) => event.type === 'task:failed'));
+  } finally {
+    provider.restore();
+    await agent.close();
+  }
+});
+
+test('completion obligations: zimoos.current cannot self-certify a requested file write', async () => {
+  const provider = installProviderResponses([
+    toolResponse('call_current', 'mteam__zimoos_x2e_current', {}),
+    textResponse('Created uat-ma-local.txt successfully.'),
+    textResponse('The file definitely exists.'),
+    textResponse('Final: file creation completed.'),
+  ]);
+  const agent = await createAgent(config, [zimoosCurrentConnection()]);
+  try {
+    const events = await drain(agent.chat('创建 uat-ma-local.txt 并写入验收编号。'));
+    assert.equal(provider.calls(), 4);
+    assert.equal(events.some((event) => event.type === 'task:done'), false);
+    assert.ok(events.some((event) => event.type === 'warning' && /文件|file/i.test(event.message)));
+    assert.ok(events.some((event) => event.type === 'task:failed'));
+  } finally {
+    provider.restore();
+    await agent.close();
+  }
+});
+
+test('completion obligations: verified write evidence for the requested path satisfies file mutation', async () => {
+  const provider = installProviderResponses([
+    toolResponse('call_write', 'fs__write_file', {
+      path: '/tmp/uat-ma-local.txt',
+      content: 'UAT-0810-A',
+    }),
+    textResponse('The requested file was created.'),
+  ]);
+  const agent = await createAgent(config, [verifiedWriteConnection()]);
+  try {
+    const events = await drain(agent.chat('创建 /tmp/uat-ma-local.txt 并写入验收编号。'));
+    assert.equal(provider.calls(), 2);
+    assert.ok(events.some((event) => event.type === 'task:done'));
+    assert.equal(events.some((event) => event.type === 'task:failed'), false);
   } finally {
     provider.restore();
     await agent.close();
