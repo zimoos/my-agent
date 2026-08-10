@@ -186,6 +186,7 @@ export interface AgoraMemoryController {
     targets: AgoraMemoryIntakeTarget[];
     source_message_start?: number;
     source_message_end?: number;
+    sourceMessages?: Array<{ role: 'user' | 'assistant'; content: string }>;
   }): Promise<AgoraMemoryIntakeBatchResult>;
   getBatchIntake(batchId: string): Promise<AgoraMemoryIntakeBatchResult>;
   applyCompletedBatch(batch: AgoraMemoryIntakeBatchResult, profileId: string): Promise<Record<string, any>>;
@@ -932,6 +933,7 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
     targets: AgoraMemoryIntakeTarget[];
     source_message_start?: number;
     source_message_end?: number;
+    sourceMessages?: Array<{ role: 'user' | 'assistant'; content: string }>;
   }): Promise<AgoraMemoryIntakeBatchResult> {
     this.requireV2();
     if (!Array.isArray(args.targets) || args.targets.length === 0) {
@@ -942,6 +944,7 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
       targets: args.targets,
       ...(Number.isInteger(args.source_message_start) ? { source_message_start: args.source_message_start } : {}),
       ...(Number.isInteger(args.source_message_end) ? { source_message_end: args.source_message_end } : {}),
+      ...(args.sourceMessages ? { source_messages: args.sourceMessages } : {}),
     });
     return this.normalizeBatch(payload);
   }

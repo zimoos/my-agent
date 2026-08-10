@@ -517,6 +517,52 @@ test('agora provider runtime keeps a capability-reporting host controller when m
   assert.equal(controller.getCapabilities().runtimeMode, 'unavailable');
 });
 
+test('agora memory intake forwards only the host-visible source messages supplied by the host', async () => {
+  const calls: Array<{ name: string; args: Record<string, any> }> = [];
+  const runtime = runtimeWithFakeCalls(calls);
+  (runtime as any).toolNames = new Set([
+    ...MEMORY_TOOLS,
+    'memories_create',
+    'memories_list',
+    'memories_rename',
+    'memories_rollback',
+    'memory_intake_batch_run',
+    'memory_intake_batch_get',
+  ]);
+  (runtime as any).runtimeContract = {
+    capabilities: {
+      named_memories: 1,
+      multi_target_intake: 1,
+      incremental_segments: 1,
+      multi_model_delta_mount: 1,
+      request_boundary_hot_swap: 1,
+    },
+  };
+  (runtime as any).lastState = { provider_id: 'agora', agora_session_id: 'agora-session-a' };
+  (runtime as any).callJsonTool = async (name: string, args: Record<string, any>) => {
+    calls.push({ name, args });
+    return {
+      status: 'queued',
+      batch_id: 'batch-a',
+      batch: { id: 'batch-a', status: 'queued' },
+      targets: [],
+    };
+  };
+  const sourceMessages = [
+    { role: 'user' as const, content: '发布前必须通过真实首答。' },
+    { role: 'assistant' as const, content: '我会按验收门槛执行。' },
+  ];
+
+  await runtime.startBatchIntake({
+    targets: [{ mode: 'create', name: 'Project', output_name: 'Project@v1' }],
+    sourceMessages,
+  });
+
+  assert.equal(calls[0]?.name, 'memory_intake_batch_run');
+  assert.deepEqual(calls[0]?.args.source_messages, sourceMessages);
+  assert.equal(calls[0]?.args.session_id, 'agora-session-a');
+});
+
 test('agora memory internalize waits for the next real chat response metadata before marking the mount verified', async () => {
   const calls: Array<{ name: string; args: Record<string, any> }> = [];
   const runtime = runtimeWithFakeCalls(calls);
