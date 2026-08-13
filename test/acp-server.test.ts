@@ -270,6 +270,116 @@ test('MA ACP model refusal text remains a normal completed turn', async () => {
   }
 });
 
+test('MA ACP buffered-final mode exposes only the host-approved answer block', async () => {
+  const updates: acp.SessionNotification[] = [];
+  const agent = eventAgent([
+    { type: 'token', text: 'internal plan that must not be visible' },
+    { type: 'token', text: '[[MTEAM_FINAL]]User-visible result.' },
+  ]);
+  const server = new MaAcpAgent(recordingConnection(updates), {
+    bootstrapSession: async () => bootstrapResult(agent, 'ma-buffered-session'),
+    visibleOutput: {
+      mode: 'buffered-final',
+      transform: (raw) => raw.includes('[[MTEAM_FINAL]]')
+        ? raw.split('[[MTEAM_FINAL]]').at(-1)!.trim()
+        : null,
+      invalidOutputMessage: 'The model did not produce a safe final answer.',
+    },
+  });
+
+  try {
+    const created = await server.newSession({ cwd: process.cwd(), mcpServers: [] });
+    await server.prompt({ sessionId: created.sessionId, prompt: [{ type: 'text', text: 'work' }] });
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0]?.update.sessionUpdate, 'agent_message_chunk');
+    assert.equal((updates[0]?.update as any).content.text, 'User-visible result.');
+    assert.doesNotMatch(JSON.stringify(updates), /internal plan/);
+  } finally {
+    await server.shutdown();
+  }
+});
+
+test('MA ACP buffered-final mode discards pre-tool draft text', async () => {
+  const updates: acp.SessionNotification[] = [];
+  const agent = eventAgent([
+    { type: 'token', text: 'I will call the tool now.' },
+    { type: 'tool:call', name: 'zimoos.current', args: {} },
+    { type: 'tool:result', ok: true, content: 'frame' },
+    { type: 'token', text: '[[MTEAM_FINAL]]Verified result.' },
+  ]);
+  const server = new MaAcpAgent(recordingConnection(updates), {
+    bootstrapSession: async () => bootstrapResult(agent, 'ma-buffered-tool-session'),
+    visibleOutput: {
+      mode: 'buffered-final',
+      transform: (raw) => raw.includes('[[MTEAM_FINAL]]')
+        ? raw.split('[[MTEAM_FINAL]]').at(-1)!.trim()
+        : null,
+      invalidOutputMessage: 'The model did not produce a safe final answer.',
+    },
+  });
+
+  try {
+    const created = await server.newSession({ cwd: process.cwd(), mcpServers: [] });
+    await server.prompt({ sessionId: created.sessionId, prompt: [{ type: 'text', text: 'inspect' }] });
+    assert.deepEqual(
+      updates.map((item) => item.update.sessionUpdate),
+      ['tool_call', 'tool_call_update', 'agent_message_chunk'],
+    );
+    assert.doesNotMatch(JSON.stringify(updates), /I will call/);
+    assert.match(JSON.stringify(updates), /Verified result/);
+  } finally {
+    await server.shutdown();
+  }
+});
+
+test('MA ACP buffered-final mode renders a safe retry message for malformed model output', async () => {
+  const updates: acp.SessionNotification[] = [];
+  const server = new MaAcpAgent(recordingConnection(updates), {
+    bootstrapSession: async () => bootstrapResult(
+      eventAgent([{ type: 'token', text: 'private scratchpad only' }]),
+      'ma-buffered-invalid-session',
+    ),
+    visibleOutput: {
+      mode: 'buffered-final',
+      transform: () => null,
+      invalidOutputMessage: 'Safe retry required.',
+    },
+  });
+
+  try {
+    const created = await server.newSession({ cwd: process.cwd(), mcpServers: [] });
+    await server.prompt({ sessionId: created.sessionId, prompt: [{ type: 'text', text: 'hello' }] });
+    assert.match(JSON.stringify(updates), /Safe retry required/);
+    assert.doesNotMatch(JSON.stringify(updates), /private scratchpad/);
+  } finally {
+    await server.shutdown();
+  }
+});
+
+test('MA ACP buffered-final mode keeps trusted host clarification visible', async () => {
+  const updates: acp.SessionNotification[] = [];
+  const server = new MaAcpAgent(recordingConnection(updates), {
+    bootstrapSession: async () => bootstrapResult(
+      eventAgent([{ type: 'text', content: '请提供具体文件路径。' }]),
+      'ma-buffered-clarification-session',
+    ),
+    visibleOutput: {
+      mode: 'buffered-final',
+      transform: () => null,
+      invalidOutputMessage: 'Safe retry required.',
+    },
+  });
+
+  try {
+    const created = await server.newSession({ cwd: process.cwd(), mcpServers: [] });
+    await server.prompt({ sessionId: created.sessionId, prompt: [{ type: 'text', text: 'read it' }] });
+    assert.equal((updates[0]?.update as any).content.text, '请提供具体文件路径。');
+    assert.doesNotMatch(JSON.stringify(updates), /Safe retry required/);
+  } finally {
+    await server.shutdown();
+  }
+});
+
 test('MA ACP release entry completes a real stdio handshake and exits when the host disconnects', async () => {
   const child = spawn(
     process.execPath,
@@ -287,6 +397,7 @@ test('MA ACP release entry completes a real stdio handshake and exits when the h
     requestPermission: async () => ({ outcome: { outcome: 'cancelled' } }),
   };
   const connection = new acpRuntime.ClientSideConnection(() => client, stream);
+  const exited = once(child, 'exit');
   try {
     const initialized = await connection.initialize({
       protocolVersion: acpRuntime.PROTOCOL_VERSION,
@@ -297,7 +408,8 @@ test('MA ACP release entry completes a real stdio handshake and exits when the h
   } finally {
     child.stdin.end();
   }
-  const [code, signal] = await once(child, 'exit');
+  await connection.closed;
+  const [code, signal] = await exited;
   assert.equal(signal, null);
   assert.equal(code, 0, Buffer.concat(stderr).toString('utf8'));
 });

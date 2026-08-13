@@ -1395,7 +1395,9 @@ export async function createAgent(
         { userText: textFromChatContent(rootUserMessage) }
       );
       for (const note of repairResult.report.notes) {
-        yield { type: 'text', content: `[repair] ${note}` };
+        // Repair notes describe internal recovery and loop protection. Exposing
+        // them as assistant text mixes diagnostics into the user's final reply.
+        yield { type: 'warning', message: `[repair] ${note}` };
       }
 
       const repairedCalls = repairResult.calls.length > 0 ? repairResult.calls : null;

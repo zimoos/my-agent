@@ -431,6 +431,49 @@ async function drain(gen: AsyncGenerator<AgentEvent, void, unknown>): Promise<Ag
 
 // ---------- cases ----------
 
+test('messages: repair diagnostics remain internal instead of becoming assistant text', async () => {
+  const state: MockState = { responses: [], calls: [] };
+  const restore = installOpenAiMock(state);
+  try {
+    const connection: McpConnection = {
+      name: 'mteam-primary',
+      process: {} as any,
+      tools: [{
+        name: 'zimoos.current',
+        description: 'Read current frame',
+        inputSchema: { type: 'object', properties: {} },
+      }],
+      call: async () => ({ content: JSON.stringify(makeZimoosFrame()), isError: false }),
+      close: async () => {},
+    };
+    const agent = await createAgent(makeConfig({ maxLoops: 6 }), [connection]);
+    for (let round = 0; round < 4; round += 1) {
+      state.responses.push({
+        kind: 'stream',
+        chunks: streamChunks({
+          toolCalls: [{
+            id: `call_current_${round}`,
+            name: 'mteam-primary__zimoos_x2e_current',
+            arguments: '{}',
+          }],
+        }),
+      });
+    }
+    state.responses.push({ kind: 'stream', chunks: streamChunks({ content: '最终答复。' }) });
+
+    const events = await drain(agent.chat('检查当前状态并回复。'));
+
+    assert.ok(events.some(
+      (event) => event.type === 'warning' && event.message.includes('[repair]'),
+    ));
+    assert.equal(events.some(
+      (event) => event.type === 'text' && event.content.includes('[repair]'),
+    ), false);
+  } finally {
+    restore();
+  }
+});
+
 test('messages: exact reply contract hides tools and replaces model boilerplate', async () => {
   const state: MockState = { responses: [], calls: [] };
   const restore = installOpenAiMock(state);

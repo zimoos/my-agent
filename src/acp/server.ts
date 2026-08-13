@@ -16,12 +16,21 @@ interface MaAcpSession {
   pendingPrompt: AbortController | null;
   pendingTool: acp.ToolCall | null;
   hasVisibleText: boolean;
+  pendingVisibleText: string;
+  currentPrompt: ChatContent | null;
+}
+
+export interface MaAcpBufferedOutputOptions {
+  mode: 'buffered-final';
+  transform: (rawText: string, context: { prompt: ChatContent | null }) => string | null;
+  invalidOutputMessage: string;
 }
 
 export interface MaAcpServerOptions {
   configPath?: string;
   sessionDir?: string;
   bootstrapSession?: typeof bootstrap;
+  visibleOutput?: MaAcpBufferedOutputOptions;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -190,6 +199,8 @@ export class MaAcpAgent implements acp.Agent {
       pendingPrompt: null,
       pendingTool: null,
       hasVisibleText: false,
+      pendingVisibleText: '',
+      currentPrompt: null,
     });
     return { sessionId: boot.sessionId };
   }
@@ -198,14 +209,18 @@ export class MaAcpAgent implements acp.Agent {
     const session = this.requireSession(params.sessionId);
     if (session.pendingPrompt) throw new Error(`Session ${params.sessionId} is already processing a prompt`);
     const pending = new AbortController();
+    const currentPrompt = promptContent(params.prompt);
     session.pendingPrompt = pending;
     session.pendingTool = null;
     session.hasVisibleText = false;
+    session.pendingVisibleText = '';
+    session.currentPrompt = currentPrompt;
     try {
-      for await (const event of session.boot.agent.chat(promptContent(params.prompt), pending.signal)) {
+      for await (const event of session.boot.agent.chat(currentPrompt, pending.signal)) {
         await this.forwardEvent(params.sessionId, session, event);
       }
       if (pending.signal.aborted) return { stopReason: 'cancelled', userMessageId: params.messageId };
+      await this.flushVisibleText(params.sessionId, session, true);
       return {
         stopReason: 'end_turn',
         userMessageId: params.messageId,
@@ -216,6 +231,8 @@ export class MaAcpAgent implements acp.Agent {
     } finally {
       session.pendingPrompt = null;
       session.pendingTool = null;
+      session.pendingVisibleText = '';
+      session.currentPrompt = null;
     }
   }
 
@@ -256,6 +273,47 @@ export class MaAcpAgent implements acp.Agent {
     await this.connection.sessionUpdate({ sessionId, update });
   }
 
+  private buffersVisibleOutput(): boolean {
+    return this.options.visibleOutput?.mode === 'buffered-final';
+  }
+
+  private async forwardVisibleText(
+    sessionId: string,
+    session: MaAcpSession,
+    text: string,
+  ): Promise<void> {
+    if (this.buffersVisibleOutput()) {
+      session.pendingVisibleText += text;
+      return;
+    }
+    session.hasVisibleText = true;
+    await this.send(sessionId, {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text },
+    });
+  }
+
+  private async flushVisibleText(
+    sessionId: string,
+    session: MaAcpSession,
+    includeInvalidOutputMessage: boolean,
+  ): Promise<boolean> {
+    if (!this.buffersVisibleOutput()) return session.hasVisibleText;
+    const rawText = session.pendingVisibleText;
+    session.pendingVisibleText = '';
+    if (!rawText.trim()) return false;
+    const policy = this.options.visibleOutput!;
+    const transformed = policy.transform(rawText, { prompt: session.currentPrompt })?.trim()
+      || (includeInvalidOutputMessage ? policy.invalidOutputMessage.trim() : '');
+    if (!transformed) return false;
+    session.hasVisibleText = true;
+    await this.send(sessionId, {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: transformed },
+    });
+    return true;
+  }
+
   private async forwardEvent(
     sessionId: string,
     session: MaAcpSession,
@@ -263,20 +321,25 @@ export class MaAcpAgent implements acp.Agent {
   ): Promise<void> {
     switch (event.type) {
       case 'token':
-        session.hasVisibleText = true;
-        await this.send(sessionId, {
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: event.text },
-        });
+        await this.forwardVisibleText(sessionId, session, event.text);
         return;
       case 'text':
-        session.hasVisibleText = true;
-        await this.send(sessionId, {
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: event.content },
-        });
+        if (this.buffersVisibleOutput()) {
+          // `text` is emitted by MA's host-owned clarification/failure paths;
+          // model output arrives as `token`. Keep trusted host messages usable
+          // while requiring model text to satisfy the final-output contract.
+          session.pendingVisibleText = '';
+          session.hasVisibleText = true;
+          await this.send(sessionId, {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: event.content },
+          });
+        } else {
+          await this.forwardVisibleText(sessionId, session, event.content);
+        }
         return;
       case 'ask_user':
+        session.pendingVisibleText = '';
         session.hasVisibleText = true;
         await this.send(sessionId, {
           sessionUpdate: 'agent_message_chunk',
@@ -328,6 +391,9 @@ export class MaAcpAgent implements acp.Agent {
         });
         return;
       case 'tool:call': {
+        // Text emitted before a tool call is planning/progress, not the final
+        // user-facing answer. A buffered host must never persist it as reply text.
+        if (this.buffersVisibleOutput()) session.pendingVisibleText = '';
         const toolCall: acp.ToolCall = {
           toolCallId: `ma_tool_${randomUUID()}`,
           title: event.name,
@@ -386,6 +452,7 @@ export class MaAcpAgent implements acp.Agent {
         return;
       case 'task:failed':
         const failureReason = sanitizeFailureReason(event.error);
+        await this.flushVisibleText(sessionId, session, false);
         await this.send(sessionId, {
           sessionUpdate: session.hasVisibleText ? 'agent_thought_chunk' : 'agent_message_chunk',
           content: { type: 'text', text: failureReason },
