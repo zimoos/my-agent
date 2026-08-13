@@ -24,6 +24,7 @@ export interface MaAcpBufferedOutputOptions {
   mode: 'buffered-final';
   transform: (rawText: string, context: { prompt: ChatContent | null }) => string | null;
   invalidOutputMessage: string;
+  finalMarker?: string;
 }
 
 export interface MaAcpServerOptions {
@@ -193,6 +194,7 @@ export class MaAcpAgent implements acp.Agent {
       configMode: 'host-only',
       loadAgentInstructions: false,
       debugLogging: false,
+      visibleFinalMarker: this.options.visibleOutput?.finalMarker,
     });
     this.sessions.set(boot.sessionId, {
       boot,

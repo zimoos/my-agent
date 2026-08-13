@@ -31,12 +31,15 @@ function findCompletionsPrototype(): any {
 function installProviderResponses(responses: StreamChunk[][]): {
   restore: () => void;
   calls: () => number;
+  requests: () => any[];
 } {
   const proto = findCompletionsPrototype();
   const original = proto.create;
   let callCount = 0;
-  proto.create = function patched() {
+  const requests: any[] = [];
+  proto.create = function patched(request: any) {
     callCount++;
+    requests.push(request);
     const chunks = responses.shift();
     if (!chunks) throw new Error('test provider: no response queued');
     return Promise.resolve((async function* () {
@@ -46,6 +49,7 @@ function installProviderResponses(responses: StreamChunk[][]): {
   return {
     restore: () => { proto.create = original; },
     calls: () => callCount,
+    requests: () => requests,
   };
 }
 
@@ -363,6 +367,48 @@ test('completion obligations: verified write evidence for the requested path sat
     assert.equal(provider.calls(), 2);
     assert.ok(events.some((event) => event.type === 'task:done'));
     assert.equal(events.some((event) => event.type === 'task:failed'), false);
+  } finally {
+    provider.restore();
+    await agent.close();
+  }
+});
+
+test('host final marker repair never repeats tools or grants tool access', async () => {
+  let toolCalls = 0;
+  const provider = installProviderResponses([
+    toolResponse('call_current', 'mteam__zimoos_x2e_current', {}),
+    textResponse('Current Mission has one completion criterion.'),
+    textResponse('[[MTEAM_FINAL]]Current Mission has one completion criterion.'),
+  ]);
+  const runtimeConnection = zimoosCurrentConnection();
+  runtimeConnection.call = async () => {
+    toolCalls += 1;
+    return {
+      content: JSON.stringify({
+        protocol: 'zimoos/os-frame',
+        version: '0.1',
+        frameCursor: 'cursor-current',
+        status: 'active',
+        title: 'Mission',
+        visibleContent: [{ kind: 'summary', content: 'doneCriteria: 1' }],
+        shortcuts: [],
+        handles: [],
+      }),
+      isError: false,
+    };
+  };
+  const agent = await createAgent(config, [runtimeConnection], {
+    visibleFinalMarker: '[[MTEAM_FINAL]]',
+  });
+  try {
+    const events = await drain(agent.chat('Read the current Mission through ZimoOS and report its criteria count.'));
+    const tokens = events.filter((event): event is Extract<AgentEvent, { type: 'token' }> => event.type === 'token');
+    assert.equal(provider.calls(), 3);
+    assert.equal(toolCalls, 1);
+    assert.equal(provider.requests()[2]?.tools, undefined);
+    assert.equal(provider.requests()[2]?.tool_choice, undefined);
+    assert.equal(tokens.at(-1)?.text, '[[MTEAM_FINAL]]Current Mission has one completion criterion.');
+    assert.ok(events.some((event) => event.type === 'task:done'));
   } finally {
     provider.restore();
     await agent.close();

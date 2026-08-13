@@ -14,6 +14,7 @@ export interface BootstrapOptions {
   configMode?: 'layered' | 'host-only';
   loadAgentInstructions?: boolean;
   debugLogging?: boolean;
+  visibleFinalMarker?: string;
 }
 
 export interface BootstrapResult {
@@ -42,6 +43,7 @@ export interface BootstrapPreparation {
   confirmationChannel?: 'tty' | 'host';
   loadAgentInstructions?: boolean;
   debugLogging?: boolean;
+  visibleFinalMarker?: string;
 }
 
 export function prepareBootstrap(
@@ -113,6 +115,7 @@ export function prepareBootstrap(
     confirmationChannel: opts.confirmationChannel,
     loadAgentInstructions: opts.loadAgentInstructions,
     debugLogging: opts.debugLogging,
+    visibleFinalMarker: opts.visibleFinalMarker,
   };
 }
 
@@ -170,6 +173,7 @@ export async function hydrateBootstrap(prepared: BootstrapPreparation): Promise<
       confirmationChannel: prepared.confirmationChannel,
       loadAgentInstructions: prepared.loadAgentInstructions,
       debugLogging: prepared.debugLogging,
+      visibleFinalMarker: prepared.visibleFinalMarker,
     });
     return {
       config: prepared.config,

@@ -176,6 +176,29 @@ test('MA ACP exposes a host-owned session, forwards events, permissions, cancell
   }
 });
 
+test('MA ACP passes the host final marker into the model runtime', async () => {
+  const calls: Array<{ options?: BootstrapOptions }> = [];
+  const server = new MaAcpAgent(recordingConnection([]), {
+    bootstrapSession: async (_configPath, options) => {
+      calls.push({ options });
+      return bootstrapResult(eventAgent([]), 'ma-final-marker-session');
+    },
+    visibleOutput: {
+      mode: 'buffered-final',
+      finalMarker: '[[MTEAM_FINAL]]',
+      transform: () => null,
+      invalidOutputMessage: 'Safe retry required.',
+    },
+  });
+
+  try {
+    await server.newSession({ cwd: process.cwd(), mcpServers: [] });
+    assert.equal(calls[0]?.options?.visibleFinalMarker, '[[MTEAM_FINAL]]');
+  } finally {
+    await server.shutdown();
+  }
+});
+
 test('MA ACP rejects non-stdio MCP transports', async () => {
   const server = new MaAcpAgent({} as acp.AgentSideConnection, {
     bootstrapSession: async () => { throw new Error('bootstrap must not run'); },

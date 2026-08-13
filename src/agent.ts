@@ -69,6 +69,8 @@ export interface CreateAgentOptions {
   confirmationChannel?: 'tty' | 'host';
   loadAgentInstructions?: boolean;
   debugLogging?: boolean;
+  /** Host-owned marker required before model text can become user-visible. */
+  visibleFinalMarker?: string;
 }
 
 const DEFAULT_MAX_LOOPS = 500;
@@ -963,6 +965,9 @@ export async function createAgent(
     return [
       stateStr || '',
       loopWarning,
+      options.visibleFinalMarker
+        ? `HOST OUTPUT CONTRACT: When this turn is complete, output ${options.visibleFinalMarker} exactly once, immediately followed by the complete user-facing answer. Do not put planning, reasoning, or diagnostics after the marker.`
+        : '',
     ].filter(Boolean).join('\n\n');
   }
 
@@ -1086,6 +1091,7 @@ export async function createAgent(
     let lengthContinuationCount = 0;
     let lastLengthContinuationContent = '';
     let emptyResponseRecoveries = 0;
+    let visibleFinalRepairAttempted = false;
     const incompleteActionEvidence = new Map<string, MissingActionEvidence>();
     lastTaskDiagnostics = { recentTools: [], totalTools: 0 };
 
@@ -1403,6 +1409,70 @@ export async function createAgent(
       const repairedCalls = repairResult.calls.length > 0 ? repairResult.calls : null;
 
       if (!repairedCalls) {
+        if (
+          !task.parentId &&
+          expectedExactReply === null &&
+          options.visibleFinalMarker &&
+          contentBuf.trim().length > 0 &&
+          !contentBuf.includes(options.visibleFinalMarker) &&
+          !visibleFinalRepairAttempted
+        ) {
+          visibleFinalRepairAttempted = true;
+          const draft = contentBuf.slice(-24_000);
+          const repairMessages = [
+            ...requestMessages,
+            { role: 'assistant' as const, content: draft },
+            {
+              role: 'user' as const,
+              content: [
+                'The preceding assistant draft completed the task but missed the host output contract.',
+                'Do not call tools, repeat work, add facts, or expose planning.',
+                `Return exactly one ${options.visibleFinalMarker} block followed by the complete user-facing answer supported by the draft and tool evidence.`,
+                `Nothing may appear before ${options.visibleFinalMarker}.`,
+              ].join('\n'),
+            },
+          ];
+          const repairRequest: ChatCompletionCreateParamsStreaming = {
+            model: config.model.model,
+            messages: repairMessages,
+            stream: true,
+            temperature: 0.1,
+            frequency_penalty: 0,
+            ...(effectiveMaxTokens != null && effectiveMaxTokens > 0
+              ? { max_tokens: effectiveMaxTokens }
+              : {}),
+          };
+          Object.assign(
+            repairRequest as unknown as Record<string, unknown>,
+            localModelParams,
+            providerCodec.buildRequestExtras?.({
+              model: config.model,
+              messages: repairMessages,
+              tools: [],
+              stream: true,
+            }) ?? {},
+            config.model.extraParams ?? {},
+          );
+          delete (repairRequest as unknown as Record<string, unknown>).tools;
+          delete (repairRequest as unknown as Record<string, unknown>).tool_choice;
+          const repairTurn = drainProviderEvents((onProviderEvent) =>
+            (async function* () {
+              const stream = await providerRuntime.createStreamingChatCompletion(
+                repairRequest,
+                { signal, onEvent: onProviderEvent },
+              );
+              return yield* streamParser.parse(stream);
+            })()
+          );
+          const repairedFinal = yield* suppressModelTokens(repairTurn);
+          if (
+            !repairedFinal.toolCalls?.length &&
+            repairedFinal.content.includes(options.visibleFinalMarker)
+          ) {
+            contentBuf = repairedFinal.content;
+            yield { type: 'token', text: repairedFinal.content };
+          }
+        }
         // If content is empty/whitespace after tool use, nudge model to answer
         if (contentBuf.trim().length === 0 && loop > 0) {
           if (emptyResponseRecoveries >= MAX_EMPTY_RESPONSE_RECOVERIES) {
