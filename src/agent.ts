@@ -1425,9 +1425,11 @@ export async function createAgent(
             {
               role: 'user' as const,
               content: [
-                'The preceding assistant draft completed the task but missed the host output contract.',
-                'Do not call tools, repeat work, add facts, or expose planning.',
-                `Return exactly one ${options.visibleFinalMarker} block followed by the complete user-facing answer supported by the draft and tool evidence.`,
+                'The preceding assistant draft is internal reasoning, not a user-visible answer.',
+                'This is an isolated evidence-only finalization pass: do not call tools, repeat work, add facts, or propose another investigation.',
+                'Answer the active user request directly from facts already present in the draft and tool evidence.',
+                'If evidence is incomplete, state what is verified and what remains unverified instead of guessing.',
+                `Return exactly one ${options.visibleFinalMarker} block followed by the complete user-facing answer.`,
                 `Nothing may appear before ${options.visibleFinalMarker}.`,
               ].join('\n'),
             },
@@ -1459,7 +1461,7 @@ export async function createAgent(
             (async function* () {
               const stream = await providerRuntime.createStreamingChatCompletion(
                 repairRequest,
-                { signal, onEvent: onProviderEvent },
+                { signal, onEvent: onProviderEvent, purpose: 'finalization' },
               );
               return yield* streamParser.parse(stream);
             })()

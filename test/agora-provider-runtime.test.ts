@@ -142,6 +142,30 @@ async function collect(iterable: AsyncIterable<any>): Promise<any[]> {
   return out;
 }
 
+test('agora finalization pass disables memory, uses an isolated conversation, and preserves provider state', async () => {
+  const calls: Array<{ name: string; args: Record<string, any> }> = [];
+  const runtime = runtimeWithFakeCalls(calls);
+  await runtime.createChatCompletion({
+    model: 'base-a',
+    messages: [{ role: 'user', content: 'normal turn' }],
+    stream: false,
+  } as any);
+  const stateBefore = structuredClone(runtime.getProviderState());
+
+  await runtime.createChatCompletion({
+    model: 'base-a',
+    messages: [{ role: 'user', content: 'finalize existing evidence only' }],
+    stream: false,
+  } as any, { purpose: 'finalization' });
+
+  const requests = calls.filter((call) => call.name === 'chat_complete');
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1]?.args.metadata?.memory_enabled, false);
+  assert.equal('memory_profile' in (requests[1]?.args.metadata ?? {}), false);
+  assert.equal(requests[1]?.args.metadata?.conversation_id, 'conv-a--host-finalizer');
+  assert.deepEqual(runtime.getProviderState(), stateBefore);
+});
+
 function writeFakeAgoraModelRuntime(fakeModulesDir: string): void {
   const mlxLmDir = path.join(fakeModulesDir, 'mlx_lm');
   const mlxLmModelsDir = path.join(mlxLmDir, 'models');

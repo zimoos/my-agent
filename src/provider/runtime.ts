@@ -54,6 +54,8 @@ export type ProviderRuntimeEvent = ProviderAttemptEvent | ProviderProgressEvent;
 export interface ProviderRunOptions {
   signal?: AbortSignal;
   onEvent?: (event: ProviderRuntimeEvent) => void;
+  /** Isolate a host-owned evidence-only finalization pass from provider memory. */
+  purpose?: 'conversation' | 'finalization';
 }
 
 export class ProviderStreamIdleTimeoutError extends Error {

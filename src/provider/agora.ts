@@ -1530,18 +1530,30 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
 
   private async chatCompletePayload(
     request: ChatCompletionCreateParamsNonStreaming | ChatCompletionCreateParamsStreaming,
-    options?: ProviderRunOptions,
-    metadataOverride?: Record<string, any>
+    options?: ProviderRunOptions
   ): Promise<Record<string, any>> {
     await this.ready();
     const rawRequest = request as any;
+    const finalization = options?.purpose === 'finalization';
+    const baseConversationId = this.model.agoraMemory?.conversationId
+      || this.context.sessionId
+      || 'default';
     const payload = await this.callJsonTool(
       'chat_complete',
       {
         model: this.model.model,
         messages: rawRequest.messages ?? [],
         session_history_mode: 'replace',
-        metadata: this.buildMetadata(rawRequest.metadata, metadataOverride),
+        metadata: this.buildMetadata(
+          rawRequest.metadata,
+          finalization
+            ? {
+                conversation_id: `${baseConversationId}--host-finalizer`,
+                memory_profile: null,
+                memory_enabled: false,
+              }
+            : undefined,
+        ),
         max_tokens: rawRequest.max_tokens ?? this.model.maxTokens ?? DEFAULT_AGORA_MAX_TOKENS,
         temperature: rawRequest.temperature ?? this.model.temperature ?? 0.6,
         timeout_seconds: resolveAgoraTimeoutSeconds(rawRequest.timeout_seconds, this.policy.requestTimeoutMs),
@@ -1555,6 +1567,7 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
         ? (event) => options.onEvent?.(providerProgressFromMcp(event))
         : undefined
     );
+    if (finalization) return payload;
     const requestedPatchIds = this.requestedPatchIds;
     const localMemoryState = this.lastState?.memory;
     this.lastState = stateFromChatPayload(payload, requestedPatchIds);
@@ -1608,6 +1621,10 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
     if (profileId) base.memory_profile = profileId;
     if (memory.memoryEnabled !== undefined) base.memory_enabled = memory.memoryEnabled;
     if (override) Object.assign(base, override);
+    if (override && Object.prototype.hasOwnProperty.call(override, 'memory_profile')
+      && override.memory_profile == null) {
+      delete base.memory_profile;
+    }
     return base;
   }
 

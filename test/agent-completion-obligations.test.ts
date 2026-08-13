@@ -407,6 +407,10 @@ test('host final marker repair never repeats tools or grants tool access', async
     assert.equal(toolCalls, 1);
     assert.equal(provider.requests()[2]?.tools, undefined);
     assert.equal(provider.requests()[2]?.tool_choice, undefined);
+    assert.match(
+      String(provider.requests()[2]?.messages?.at(-1)?.content),
+      /isolated evidence-only finalization pass/
+    );
     assert.equal(tokens.at(-1)?.text, '[[MTEAM_FINAL]]Current Mission has one completion criterion.');
     assert.ok(events.some((event) => event.type === 'task:done'));
   } finally {
