@@ -106,12 +106,21 @@ export interface AgoraMemoryConfig {
   memoryEnabled?: boolean;
 }
 
+export interface AgoraHostRuntimeContract {
+  version: string;
+  hostProtocolMajor: number;
+  nativeCoreAbi: number;
+  manifestSha256: string;
+}
+
 export interface AgoraRuntimeConfig {
   command?: string;
   args?: string[];
   dataRoot?: string;
   env?: Record<string, string>;
   cwd?: string;
+  /** Host metadata only. This field is not trusted without the private runtime brand. */
+  hostContract?: AgoraHostRuntimeContract;
 }
 
 export interface ProviderSessionState {

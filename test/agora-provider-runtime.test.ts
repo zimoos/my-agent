@@ -4,8 +4,15 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { AgoraProviderRuntime } from '../src/provider/agora.js';
-import type { ModelConfig } from '../src/mcp/types.js';
+import {
+  AgoraProviderRuntime,
+  markAgoraRuntimeHostTrusted,
+} from '../src/provider/agora.js';
+import type {
+  AgoraHostRuntimeContract,
+  AgoraRuntimeConfig,
+  ModelConfig,
+} from '../src/mcp/types.js';
 
 const AGORA_DEV_ROOT = process.env.AGORA_DEV_ROOT ?? '/Users/zhuqingyu/dev/agora';
 const AGORA_DEV_COMMAND = process.env.AGORA_DEV_COMMAND ?? path.join(AGORA_DEV_ROOT, '.venv/bin/agora');
@@ -634,6 +641,151 @@ const agoraDevE2eTest = process.env.MA_RUN_AGORA_DEV_E2E === '1'
   && fs.existsSync(AGORA_DEV_PYTHON)
   ? test
   : test.skip;
+
+const HOST_RUNTIME_CONTRACT: AgoraHostRuntimeContract = {
+  version: '0.2.9',
+  hostProtocolMajor: 1,
+  nativeCoreAbi: 1,
+  manifestSha256: 'a'.repeat(64),
+};
+
+function writeContractAgoraServer(tmp: string): string {
+  const serverPath = path.join(tmp, 'fake-contract-agora.mjs');
+  fs.writeFileSync(serverPath, `
+import readline from 'node:readline';
+const tools = ['doctor', 'runtime_capabilities', 'models_list', 'chat_complete'];
+const contract = {
+  runtime_version: process.env.FAKE_RUNTIME_VERSION,
+  host_protocol_major: Number(process.env.FAKE_HOST_PROTOCOL_MAJOR),
+  native_core_abi: Number(process.env.FAKE_NATIVE_CORE_ABI),
+  manifest_sha256: process.env.FAKE_MANIFEST_SHA256,
+  capabilities: {},
+};
+const send = (id, result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\\n');
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  const message = JSON.parse(line);
+  if (typeof message.id !== 'number') return;
+  if (message.method === 'initialize') return send(message.id, { protocolVersion: '2024-11-05', capabilities: {}, serverInfo: { name: 'fake-agora', version: contract.runtime_version } });
+  if (message.method === 'tools/list') return send(message.id, { tools: tools.map((name) => ({ name, description: name, inputSchema: { type: 'object', properties: {} } })) });
+  if (message.method === 'resources/list') return send(message.id, { resources: [] });
+  if (message.method === 'tools/call') {
+    const name = message.params?.name;
+    const payload = name === 'doctor'
+      ? { status: 'ok', service: 'agora', version: contract.runtime_version, contract }
+      : name === 'runtime_capabilities'
+        ? { status: 'ok', service: 'agora', contract }
+        : name === 'models_list'
+          ? { status: 'ok', models: [{ id: 'base-a' }] }
+          : { status: 'completed', message: { role: 'assistant', content: 'ok' }, session_id: 'chat-a' };
+    return send(message.id, { content: [{ type: 'text', text: JSON.stringify(payload) }], isError: false });
+  }
+  send(message.id, {});
+});
+`);
+  return serverPath;
+}
+
+function contractRuntimeConfig(
+  tmp: string,
+  serverPath: string,
+  actualContract: AgoraHostRuntimeContract = HOST_RUNTIME_CONTRACT,
+): AgoraRuntimeConfig {
+  return {
+    command: process.execPath,
+    args: [serverPath],
+    dataRoot: path.join(tmp, 'data'),
+    env: {
+      FAKE_RUNTIME_VERSION: actualContract.version,
+      FAKE_HOST_PROTOCOL_MAJOR: String(actualContract.hostProtocolMajor),
+      FAKE_NATIVE_CORE_ABI: String(actualContract.nativeCoreAbi),
+      FAKE_MANIFEST_SHA256: actualContract.manifestSha256,
+    },
+    hostContract: { ...HOST_RUNTIME_CONTRACT },
+  };
+}
+
+function runtimeTrustModel(runtime: AgoraRuntimeConfig): ModelConfig {
+  return { ...model(), agoraRuntime: runtime };
+}
+
+async function runtimeTrust(runtime: AgoraProviderRuntime): Promise<string> {
+  await runtime.ready();
+  return JSON.parse((await runtime.status()).content).runtime_trust;
+}
+
+test('agora configured runtime cannot forge verified trust through hostContract JSON', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ma-agora-untrusted-contract-'));
+  const serverPath = writeContractAgoraServer(tmp);
+  const configured = JSON.parse(JSON.stringify(
+    contractRuntimeConfig(tmp, serverPath),
+  )) as AgoraRuntimeConfig;
+  const runtime = new AgoraProviderRuntime(
+    runtimeTrustModel(configured),
+    { requestTimeoutMs: 5000, streamIdleTimeoutMs: 5000, maxRetries: 0 },
+    { cwd: tmp },
+  );
+  try {
+    assert.equal(await runtimeTrust(runtime), 'unverified');
+  } finally {
+    await runtime.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('agora configured runtime becomes verified only after its cloned config is host-branded', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ma-agora-trusted-contract-'));
+  const serverPath = writeContractAgoraServer(tmp);
+  const original = contractRuntimeConfig(tmp, serverPath);
+  markAgoraRuntimeHostTrusted(original, HOST_RUNTIME_CONTRACT);
+  const cloned = structuredClone(original);
+  const unbrandedClone = new AgoraProviderRuntime(
+    runtimeTrustModel(cloned),
+    { requestTimeoutMs: 5000, streamIdleTimeoutMs: 5000, maxRetries: 0 },
+    { cwd: tmp },
+  );
+  try {
+    assert.equal(await runtimeTrust(unbrandedClone), 'unverified');
+  } finally {
+    await unbrandedClone.close();
+  }
+
+  markAgoraRuntimeHostTrusted(cloned, HOST_RUNTIME_CONTRACT);
+  const brandedClone = new AgoraProviderRuntime(
+    runtimeTrustModel(cloned),
+    { requestTimeoutMs: 5000, streamIdleTimeoutMs: 5000, maxRetries: 0 },
+    { cwd: tmp },
+  );
+  try {
+    assert.equal(await runtimeTrust(brandedClone), 'verified');
+  } finally {
+    await brandedClone.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('agora host-branded runtime fails startup when the actual native ABI mismatches', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ma-agora-abi-mismatch-'));
+  const serverPath = writeContractAgoraServer(tmp);
+  const configured = contractRuntimeConfig(tmp, serverPath, {
+    ...HOST_RUNTIME_CONTRACT,
+    nativeCoreAbi: HOST_RUNTIME_CONTRACT.nativeCoreAbi + 1,
+  });
+  markAgoraRuntimeHostTrusted(configured, HOST_RUNTIME_CONTRACT);
+  const runtime = new AgoraProviderRuntime(
+    runtimeTrustModel(configured),
+    { requestTimeoutMs: 5000, streamIdleTimeoutMs: 5000, maxRetries: 0 },
+    { cwd: tmp },
+  );
+  try {
+    await assert.rejects(
+      runtime.ready(),
+      /nativeCoreAbi\/native_core_abi expected 1, got 2/,
+    );
+  } finally {
+    await runtime.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
 
 test('agora provider runtimes share one MCP host until the final lease closes', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ma-agora-shared-host-'));

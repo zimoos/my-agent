@@ -16,6 +16,7 @@ import type {
 import { AGORA_MCP_API_KEY } from '../config.js';
 import { buildMcpEnv, McpClient } from '../mcp/client.js';
 import type {
+  AgoraHostRuntimeContract,
   AgoraMemoryConfig,
   AgoraRuntimeConfig,
   McpProgressEvent,
@@ -61,6 +62,7 @@ export interface AgoraRuntimeContract {
   host_protocol_major?: number;
   registry_schema_version?: number;
   native_core_abi?: number;
+  manifest_sha256?: string;
   capabilities?: Record<string, number | boolean | string>;
   memory_runtime_v2?: { enabled?: boolean; rollback?: string };
 }
@@ -343,7 +345,188 @@ interface ResolvedAgoraCommand {
   args: string[];
   trust: 'verified' | 'unverified';
   source: 'configured' | 'override' | 'bundled' | 'npm' | 'path';
-  lock?: Record<string, any>;
+  expectedContract?: Readonly<AgoraHostRuntimeContract>;
+  verifiedManifestSha256?: string;
+}
+
+interface TrustedAgoraRuntimeBrand {
+  contract: Readonly<AgoraHostRuntimeContract>;
+  launchFingerprint: string;
+}
+
+const HOST_CONTRACT_KEYS = [
+  'hostProtocolMajor',
+  'manifestSha256',
+  'nativeCoreAbi',
+  'version',
+] as const;
+const AGORA_RUNTIME_VERSION = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+const SHA256_HEX = /^[a-f0-9]{64}$/;
+const trustedAgoraRuntimes = new WeakMap<AgoraRuntimeConfig, TrustedAgoraRuntimeBrand>();
+
+function parseAgoraHostRuntimeContract(value: unknown): Readonly<AgoraHostRuntimeContract> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return null;
+  const ownKeys = Reflect.ownKeys(value);
+  if (
+    ownKeys.length !== HOST_CONTRACT_KEYS.length ||
+    ownKeys.some((key) => typeof key !== 'string') ||
+    !HOST_CONTRACT_KEYS.every((key) => ownKeys.includes(key))
+  ) return null;
+
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (!HOST_CONTRACT_KEYS.every((key) => descriptors[key]?.enumerable && 'value' in descriptors[key])) {
+    return null;
+  }
+  const version = descriptors.version!.value;
+  const hostProtocolMajor = descriptors.hostProtocolMajor!.value;
+  const nativeCoreAbi = descriptors.nativeCoreAbi!.value;
+  const manifestSha256 = descriptors.manifestSha256!.value;
+  if (
+    typeof version !== 'string' ||
+    version.length > 128 ||
+    !AGORA_RUNTIME_VERSION.test(version) ||
+    !Number.isSafeInteger(hostProtocolMajor) ||
+    hostProtocolMajor < 1 ||
+    !Number.isSafeInteger(nativeCoreAbi) ||
+    nativeCoreAbi < 1 ||
+    typeof manifestSha256 !== 'string' ||
+    !SHA256_HEX.test(manifestSha256)
+  ) return null;
+
+  return Object.freeze({ version, hostProtocolMajor, nativeCoreAbi, manifestSha256 });
+}
+
+function sameAgoraHostRuntimeContract(
+  left: AgoraHostRuntimeContract,
+  right: AgoraHostRuntimeContract,
+): boolean {
+  return left.version === right.version &&
+    left.hostProtocolMajor === right.hostProtocolMajor &&
+    left.nativeCoreAbi === right.nativeCoreAbi &&
+    left.manifestSha256 === right.manifestSha256;
+}
+
+function agoraRuntimeLaunchFingerprint(runtime: AgoraRuntimeConfig): string | null {
+  const command = runtime.command?.trim();
+  if (!command) return null;
+  const args = runtime.args ?? ['mcp', 'serve'];
+  if (!Array.isArray(args) || !args.every((arg) => typeof arg === 'string')) return null;
+  const env = runtime.env ?? {};
+  if (!env || typeof env !== 'object' || Array.isArray(env)) return null;
+  const envEntries = Object.entries(env);
+  if (!envEntries.every(([, value]) => typeof value === 'string')) return null;
+  envEntries.sort(([left], [right]) => left.localeCompare(right));
+  return JSON.stringify({
+    command,
+    args,
+    dataRoot: runtime.dataRoot ?? null,
+    cwd: runtime.cwd ?? null,
+    env: envEntries,
+  });
+}
+
+/**
+ * Brands a configured runtime after a trusted host has strictly decoded its
+ * private bootstrap. Serialized hostContract data alone never creates trust.
+ */
+export function markAgoraRuntimeHostTrusted(
+  runtime: AgoraRuntimeConfig,
+  contract: AgoraHostRuntimeContract,
+): void {
+  if (!runtime || typeof runtime !== 'object' || Array.isArray(runtime)) {
+    throw new Error('Agora trusted host runtime config is invalid');
+  }
+  const parsedContract = parseAgoraHostRuntimeContract(contract);
+  const embeddedContract = parseAgoraHostRuntimeContract(runtime.hostContract);
+  const launchFingerprint = agoraRuntimeLaunchFingerprint(runtime);
+  if (
+    !parsedContract ||
+    !embeddedContract ||
+    !sameAgoraHostRuntimeContract(parsedContract, embeddedContract) ||
+    !launchFingerprint
+  ) {
+    throw new Error('Agora trusted host runtime contract is invalid');
+  }
+  trustedAgoraRuntimes.set(runtime, { contract: parsedContract, launchFingerprint });
+}
+
+function trustedAgoraHostRuntimeContract(
+  runtime: AgoraRuntimeConfig | undefined,
+): Readonly<AgoraHostRuntimeContract> | null {
+  if (!runtime) return null;
+  const brand = trustedAgoraRuntimes.get(runtime);
+  if (!brand || agoraRuntimeLaunchFingerprint(runtime) !== brand.launchFingerprint) return null;
+  const embeddedContract = parseAgoraHostRuntimeContract(runtime.hostContract);
+  if (!embeddedContract || !sameAgoraHostRuntimeContract(brand.contract, embeddedContract)) return null;
+  return brand.contract;
+}
+
+function releaseLockHostContract(lock: Record<string, any>): Readonly<AgoraHostRuntimeContract> | null {
+  return parseAgoraHostRuntimeContract({
+    version: lock.version,
+    hostProtocolMajor: lock.host_protocol_major,
+    nativeCoreAbi: lock.native_core_abi,
+    manifestSha256: lock.manifest_sha256,
+  });
+}
+
+function agoraManifestSha256(command: string): string | null {
+  const commandDir = path.dirname(path.resolve(command));
+  const candidates = [
+    path.join(commandDir, 'upstream-manifest.json'),
+    path.join(commandDir, 'manifest.json'),
+    path.join(path.dirname(commandDir), 'manifest.json'),
+  ];
+  for (const candidate of candidates) {
+    if (!fs.statSync(candidate, { throwIfNoEntry: false })?.isFile()) continue;
+    return sha256File(candidate);
+  }
+  return null;
+}
+
+function verifyAgoraRuntimeContract(
+  expected: AgoraHostRuntimeContract,
+  actual: AgoraRuntimeContract | null,
+  command: ResolvedAgoraCommand,
+): AgoraRuntimeContract {
+  const mismatches: string[] = [];
+  const actualVersion = actual?.runtime_version;
+  const actualProtocolMajor = actual?.host_protocol_major;
+  const actualNativeCoreAbi = actual?.native_core_abi;
+  const reportedManifestSha256 = actual?.manifest_sha256;
+  const inspectedManifestSha256 = agoraManifestSha256(command.command);
+  const actualManifestSha256 = reportedManifestSha256
+    ?? inspectedManifestSha256
+    ?? command.verifiedManifestSha256;
+
+  if (actualVersion !== expected.version) {
+    mismatches.push(`version/runtime_version expected ${expected.version}, got ${String(actualVersion)}`);
+  }
+  if (actualProtocolMajor !== expected.hostProtocolMajor) {
+    mismatches.push(
+      `hostProtocolMajor/host_protocol_major expected ${expected.hostProtocolMajor}, got ${String(actualProtocolMajor)}`,
+    );
+  }
+  if (actualNativeCoreAbi !== expected.nativeCoreAbi) {
+    mismatches.push(`nativeCoreAbi/native_core_abi expected ${expected.nativeCoreAbi}, got ${String(actualNativeCoreAbi)}`);
+  }
+  if (reportedManifestSha256 !== undefined && reportedManifestSha256 !== expected.manifestSha256) {
+    mismatches.push(`manifestSha256/manifest_sha256 expected ${expected.manifestSha256}, got ${reportedManifestSha256}`);
+  }
+  if (inspectedManifestSha256 !== null && inspectedManifestSha256 !== expected.manifestSha256) {
+    mismatches.push(`manifestSha256/file expected ${expected.manifestSha256}, got ${inspectedManifestSha256}`);
+  }
+  if (actualManifestSha256 !== expected.manifestSha256) {
+    mismatches.push(
+      `manifestSha256 expected ${expected.manifestSha256}, got ${String(actualManifestSha256)}`,
+    );
+  }
+  if (mismatches.length > 0) {
+    throw new Error(`Agora runtime contract mismatch: ${mismatches.join('; ')}`);
+  }
+  return { ...actual, manifest_sha256: actualManifestSha256 };
 }
 
 export function parseDeveloperIdSignature(details: string): boolean {
@@ -431,18 +614,15 @@ function resolveInstalledAgoraPackage(): ResolvedAgoraCommand | null {
       !verifyNativeSignature(command) ||
       !verifyNativeSignature(platformCommand)
     ) return null;
+    const expectedContract = releaseLockHostContract(agoraReleaseLock);
+    if (!expectedContract) return null;
     return {
       command,
       args: ['mcp', 'serve'],
       trust: 'verified',
       source: 'npm',
-      lock: {
-        version: expectedVersion,
-        host_protocol_major: agoraReleaseLock.host_protocol_major,
-        native_core_abi: agoraReleaseLock.native_core_abi,
-        manifest_sha256: agoraReleaseLock.manifest_sha256,
-        notarization_id: agoraReleaseLock.notarization_id,
-      },
+      expectedContract,
+      verifiedManifestSha256: agoraReleaseLock.manifest_sha256,
     };
   } catch {
     return null;
@@ -451,7 +631,16 @@ function resolveInstalledAgoraPackage(): ResolvedAgoraCommand | null {
 
 function resolveAgoraCommand(runtime?: AgoraRuntimeConfig): ResolvedAgoraCommand {
   const configured = runtime?.command?.trim();
-  if (configured) return { command: configured, args: runtime?.args ?? ['mcp', 'serve'], trust: 'unverified', source: 'configured' };
+  if (configured) {
+    const expectedContract = trustedAgoraHostRuntimeContract(runtime);
+    return {
+      command: configured,
+      args: runtime?.args ?? ['mcp', 'serve'],
+      trust: expectedContract ? 'verified' : 'unverified',
+      source: 'configured',
+      ...(expectedContract ? { expectedContract } : {}),
+    };
+  }
 
   const envCommand = process.env.MA_AGORA_COMMAND?.trim();
   if (envCommand) return { command: envCommand, args: runtime?.args ?? ['mcp', 'serve'], trust: 'unverified', source: 'override' };
@@ -460,7 +649,16 @@ function resolveAgoraCommand(runtime?: AgoraRuntimeConfig): ResolvedAgoraCommand
     if (!commandExists(candidate)) continue;
     const lock = verifyBundledAgora(candidate);
     if (!lock) throw new Error(`Bundled Agora failed integrity verification: ${candidate}`);
-    return { command: candidate, args: ['mcp', 'serve'], trust: 'verified', source: 'bundled', lock };
+    const expectedContract = releaseLockHostContract(lock);
+    if (!expectedContract) throw new Error(`Bundled Agora has an invalid runtime contract: ${candidate}`);
+    return {
+      command: candidate,
+      args: ['mcp', 'serve'],
+      trust: 'verified',
+      source: 'bundled',
+      expectedContract,
+      verifiedManifestSha256: expectedContract.manifestSha256,
+    };
   }
 
   const installed = resolveInstalledAgoraPackage();
@@ -652,6 +850,8 @@ function sharedAgoraHostKey(
     cwd: runtime?.cwd ? path.resolve(runtime.cwd) : null,
     dataRoot,
     env,
+    trust: command.trust,
+    expectedContract: command.expectedContract ?? null,
     requestTimeoutMs,
   });
 }
@@ -1453,15 +1653,12 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
       this.doctorPayload = snapshot.doctorPayload;
       this.runtimeContract = snapshot.runtimeContract;
       if (command.trust === 'verified') {
-        const expectedVersion = command.lock?.version;
-        const actualVersion = this.runtimeContract?.runtime_version ?? this.doctorPayload.version;
-        const actualMajor = this.runtimeContract?.host_protocol_major;
-        if (actualVersion !== expectedVersion || actualMajor !== command.lock?.host_protocol_major) {
-          throw new Error(
-            `Agora runtime contract mismatch: expected ${expectedVersion}/host-v${command.lock?.host_protocol_major}, ` +
-            `got ${actualVersion}/host-v${actualMajor}`
-          );
-        }
+        if (!command.expectedContract) throw new Error('Verified Agora runtime is missing its expected host contract');
+        this.runtimeContract = verifyAgoraRuntimeContract(
+          command.expectedContract,
+          this.runtimeContract,
+          command,
+        );
       }
       this.modelsPayload = snapshot.modelsPayload;
     } catch (err) {
