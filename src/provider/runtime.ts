@@ -175,6 +175,10 @@ function isRetryableProviderError(err: unknown): boolean {
   if (err instanceof ProviderRequestTimeoutError) return true;
   if (isAbortLike(err)) return false;
 
+  const explicitRetryable = (err as any)?.error?.retryable ?? (err as any)?.retryable;
+  if (explicitRetryable === false) return false;
+  if (explicitRetryable === true) return true;
+
   const status = (err as any)?.status;
   if (
     status === 408 ||

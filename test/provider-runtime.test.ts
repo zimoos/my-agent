@@ -179,6 +179,34 @@ test('provider runtime: does not emit a call id header without an explicit provi
   assert.equal(captured.headers, undefined);
 });
 
+test('provider runtime: honors an explicit non-retryable provider error', async () => {
+  let calls = 0;
+  const runtime = createProviderRuntime(
+    {
+      baseURL: 'http://example.test/v1',
+      model: 'stub',
+      apiKey: 'key',
+      maxRetries: 3,
+    },
+    fakeClient(() => {
+      calls++;
+      const error = new Error('authority unavailable') as Error & {
+        status: number;
+        error: { retryable: boolean };
+      };
+      error.status = 503;
+      error.error = { retryable: false };
+      return Promise.reject(error);
+    })
+  );
+
+  await assert.rejects(
+    () => runtime.createChatCompletion({ model: 'stub', messages: [], stream: false }),
+    /authority unavailable/
+  );
+  assert.equal(calls, 1);
+});
+
 test('provider runtime: stream idle before first chunk is retried', async () => {
   let calls = 0;
   const requestOptions: any[] = [];
