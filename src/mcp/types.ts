@@ -51,6 +51,8 @@ export interface ModelConfig {
   baseURL: string;
   model: string;
   apiKey: string;
+  /** Optional provider-specific header used to correlate one logical call across retries. */
+  callIdHeader?: string;
   secretRef?: string;
   temperature?: number;
   topP?: number;
