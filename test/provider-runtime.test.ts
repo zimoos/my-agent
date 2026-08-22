@@ -127,8 +127,89 @@ test('provider runtime: request timeout is retried', async () => {
   assert.ok(events.some((event) => event.type === 'retry'));
 });
 
+test('provider runtime: reuses one logical call id across retries and rotates it for the next call', async () => {
+  const requestOptions: any[] = [];
+  let attempts = 0;
+  const runtime = createProviderRuntime(
+    {
+      baseURL: 'http://example.test/v1',
+      model: 'stub',
+      apiKey: 'key',
+      callIdHeader: 'X-MTEAM-MA-Call-ID',
+      requestTimeoutMs: 50,
+      maxRetries: 1,
+    },
+    fakeClient((_request, options) => {
+      requestOptions.push(options);
+      attempts++;
+      if (attempts === 1) {
+        const error = new Error('temporary failure') as Error & { status: number };
+        error.status = 503;
+        return Promise.reject(error);
+      }
+      return Promise.resolve({ choices: [{ message: { content: 'ok' } }] });
+    })
+  );
+
+  await runtime.createChatCompletion({ model: 'stub', messages: [], stream: false });
+  await runtime.createChatCompletion({ model: 'stub', messages: [], stream: false });
+
+  const ids = requestOptions.map((options) => options.headers['x-mteam-ma-call-id']);
+  assert.match(ids[0], /^ma_call_[0-9a-f-]{36}$/);
+  assert.equal(ids[1], ids[0]);
+  assert.notEqual(ids[2], ids[0]);
+});
+
+test('provider runtime: does not emit a call id header without an explicit provider opt-in', async () => {
+  let captured: any;
+  const runtime = createProviderRuntime(
+    {
+      baseURL: 'http://example.test/v1',
+      model: 'stub',
+      apiKey: 'key',
+      maxRetries: 0,
+    },
+    fakeClient((_request, options) => {
+      captured = options;
+      return Promise.resolve({ choices: [] });
+    })
+  );
+
+  await runtime.createChatCompletion({ model: 'stub', messages: [], stream: false });
+  assert.equal(captured.headers, undefined);
+});
+
+test('provider runtime: honors an explicit non-retryable provider error', async () => {
+  let calls = 0;
+  const runtime = createProviderRuntime(
+    {
+      baseURL: 'http://example.test/v1',
+      model: 'stub',
+      apiKey: 'key',
+      maxRetries: 3,
+    },
+    fakeClient(() => {
+      calls++;
+      const error = new Error('authority unavailable') as Error & {
+        status: number;
+        error: { retryable: boolean };
+      };
+      error.status = 503;
+      error.error = { retryable: false };
+      return Promise.reject(error);
+    })
+  );
+
+  await assert.rejects(
+    () => runtime.createChatCompletion({ model: 'stub', messages: [], stream: false }),
+    /authority unavailable/
+  );
+  assert.equal(calls, 1);
+});
+
 test('provider runtime: stream idle before first chunk is retried', async () => {
   let calls = 0;
+  const requestOptions: any[] = [];
   const runtime = createProviderRuntime(
     {
       baseURL: 'http://example.test/v1',
@@ -137,8 +218,10 @@ test('provider runtime: stream idle before first chunk is retried', async () => 
       requestTimeoutMs: 20,
       streamIdleTimeoutMs: 5,
       maxRetries: 1,
+      callIdHeader: 'x-mteam-ma-call-id',
     },
-    fakeClient(() => {
+    fakeClient((_request, options) => {
+      requestOptions.push(options);
       calls++;
       if (calls === 1) return Promise.resolve(stallBeforeFirst());
       return Promise.resolve(chunks([
@@ -157,6 +240,10 @@ test('provider runtime: stream idle before first chunk is retried', async () => 
   assert.equal(calls, 2);
   assert.equal(out.length, 1);
   assert.equal(out[0].choices[0].delta.content, 'ok');
+  assert.equal(
+    requestOptions[0].headers['x-mteam-ma-call-id'],
+    requestOptions[1].headers['x-mteam-ma-call-id'],
+  );
   assert.ok(events.some((event) => event.type === 'retry'));
 });
 

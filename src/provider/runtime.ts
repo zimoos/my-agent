@@ -1,4 +1,5 @@
 import OpenAI from 'openai';
+import { randomUUID } from 'node:crypto';
 import type { RequestOptions } from 'openai/core';
 import type {
   ChatCompletion,
@@ -92,6 +93,25 @@ function nonNegativeInt(value: unknown, fallback: number): number {
     : fallback;
 }
 
+function resolveCallIdHeader(value: unknown): string | null {
+  if (value === undefined) return null;
+  if (typeof value !== 'string' || !/^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$/.test(value)) {
+    throw new Error('provider call id header is invalid');
+  }
+  return value.toLowerCase();
+}
+
+function callRequestOptions(
+  signal: AbortSignal | undefined,
+  header: string | null,
+  callId: string | null
+): RequestOptions {
+  return {
+    signal,
+    ...(header && callId ? { headers: { [header]: callId } } : {}),
+  } as RequestOptions;
+}
+
 export function resolveProviderPolicy(model: ModelConfig): ProviderPolicy {
   const requestTimeoutMs = positiveInt(
     model.requestTimeoutMs,
@@ -154,6 +174,10 @@ function isRetryableProviderError(err: unknown): boolean {
   if (err instanceof ProviderStreamIdleTimeoutError) return err.retryable;
   if (err instanceof ProviderRequestTimeoutError) return true;
   if (isAbortLike(err)) return false;
+
+  const explicitRetryable = (err as any)?.error?.retryable ?? (err as any)?.retryable;
+  if (explicitRetryable === false) return false;
+  if (explicitRetryable === true) return true;
 
   const status = (err as any)?.status;
   if (
@@ -294,6 +318,7 @@ export function createProviderRuntime(
   }
   const client = overrideClient ?? createProviderClient(model, policy);
   const maxAttempts = policy.maxRetries + 1;
+  const callIdHeader = resolveCallIdHeader(model.callIdHeader);
 
   async function runWithRetry<T>(
     stream: boolean,
@@ -348,13 +373,14 @@ export function createProviderRuntime(
     client,
     policy,
     createChatCompletion(request, options) {
+      const callId = callIdHeader ? `ma_call_${randomUUID()}` : null;
       return runWithRetry(
         false,
         () =>
           raceWithTimeout(
             client.chat.completions.create(
               { ...request, stream: false },
-              { signal: options?.signal } as RequestOptions
+              callRequestOptions(options?.signal, callIdHeader, callId)
             ) as unknown as Promise<ChatCompletion>,
             policy.requestTimeoutMs,
             options?.signal
@@ -363,14 +389,15 @@ export function createProviderRuntime(
       );
     },
     createStreamingChatCompletion(request, options) {
+      const callId = callIdHeader ? `ma_call_${randomUUID()}` : null;
       return runWithRetry(
         true,
         async () => {
           const start = await openStreamAndReadFirstChunk(
             () =>
               client.chat.completions.create(
-              { ...request, stream: true },
-              { signal: options?.signal } as RequestOptions
+                { ...request, stream: true },
+                callRequestOptions(options?.signal, callIdHeader, callId)
               ) as unknown as Promise<AsyncIterable<ChatCompletionChunk>>,
             policy,
             options?.signal
