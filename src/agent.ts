@@ -9,7 +9,10 @@ import type {
   AgentConfig,
   ArchivedMessage,
   ChatContent,
+  MaReasoningDepth,
   McpConnection,
+  ModelConfig,
+  ToolContentBlock,
 } from './mcp/types.js';
 import { createTaskStack, type Task, type TaskStack } from './task-stack.js';
 import type { AgentEvent } from './agent/events.js';
@@ -60,6 +63,7 @@ import { RuntimeContextSlotStore } from './agent/runtime-context-slots.js';
 import { CompletionObligationAudit } from './agent/completion-obligations.js';
 import { FileReadLedger } from './agent/file-read-ledger.js';
 import { join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
 
 export interface CreateAgentOptions {
   resumeMessages?: ChatCompletionMessageParam[];
@@ -489,6 +493,16 @@ interface BuiltinToolContext {
   currentTask: Task;
   todoList: ReturnType<typeof createTodoList>;
   contextManager: ContextManager;
+  reasoningDepth: MaReasoningDepth;
+  operationId: string;
+  toolCallId: string;
+}
+
+interface BuiltinToolResult {
+  content: string;
+  isError: boolean;
+  contentBlocks?: ToolContentBlock[];
+  structuredContent?: Record<string, unknown>;
 }
 
 interface BuiltinTool {
@@ -496,10 +510,141 @@ interface BuiltinTool {
   handler: (
     args: Record<string, any>,
     ctx: BuiltinToolContext
-  ) => { content: string; isError: boolean } | Promise<{ content: string; isError: boolean }>;
+  ) => BuiltinToolResult | Promise<BuiltinToolResult>;
 }
 
 const builtinTools = new Map<string, BuiltinTool>();
+
+const SAFE_GENERATED_IMAGE_MIME = /^image\/(?:png|jpeg|webp)$/;
+const SAFE_GENERATED_IMAGE_BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
+const MAX_GENERATED_IMAGE_BYTES = 16 * 1024 * 1024;
+
+function correlatedId(prefix: 'stage' | 'call', ...parts: string[]): string {
+  return `${prefix}_${createHash('sha256').update(parts.join('\u0000')).digest('hex').slice(0, 32)}`;
+}
+
+function generatedImageTool(model: ModelConfig): BuiltinTool {
+  return {
+    definition: {
+      type: 'function',
+      function: {
+        name: 'generate_image',
+        description: 'Generate one or more images for the user. The host controls the image provider, price, authorization, persistence, and delivery.',
+        parameters: {
+          type: 'object',
+          properties: {
+            prompt: { type: 'string', description: 'A precise description of the image to generate.' },
+            size: { type: 'string', enum: ['1024x1024'] },
+            quality: { type: 'string', enum: ['low'] },
+            n: { type: 'integer', enum: [1] },
+          },
+          required: ['prompt'],
+          additionalProperties: false,
+        },
+      },
+    },
+    handler: async (args, ctx) => {
+      const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : '';
+      const n = Number.isSafeInteger(args.n) ? args.n : 1;
+      const size = typeof args.size === 'string' ? args.size : '1024x1024';
+      const quality = typeof args.quality === 'string' ? args.quality : 'low';
+      const stageId = correlatedId('stage', ctx.operationId, 'image', ctx.toolCallId);
+      const callId = correlatedId('call', ctx.operationId, stageId, ctx.toolCallId);
+      if (!prompt || prompt.length > 8_000 || n !== 1
+        || size !== '1024x1024' || quality !== 'low') {
+        return { content: 'Error: invalid image generation request', isError: true };
+      }
+      let response: Response;
+      try {
+        response = await fetch(`${model.baseURL.replace(/\/$/, '')}/images/generations`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${model.apiKey}`,
+            'content-type': 'application/json',
+            'idempotency-key': callId,
+          },
+          body: JSON.stringify({
+            model: model.model,
+            prompt,
+            n,
+            size,
+            quality,
+            response_format: 'b64_json',
+            reasoning_depth: ctx.reasoningDepth,
+            mteam_operation: {
+              operation_id: ctx.operationId,
+              stage_id: stageId,
+              call_id: callId,
+            },
+          }),
+          signal: AbortSignal.timeout(model.requestTimeoutMs ?? 180_000),
+        });
+      } catch (error) {
+        return {
+          content: `Error: image generation request failed: ${(error as Error).message}`,
+          isError: true,
+        };
+      }
+      if (!response.ok) {
+        return {
+          content: `Error: image generation failed (${response.status})`,
+          isError: true,
+        };
+      }
+      let body: unknown;
+      try {
+        body = await response.json();
+      } catch {
+        return { content: 'Error: image generation returned invalid JSON', isError: true };
+      }
+      if (!body || typeof body !== 'object' || !Array.isArray((body as { data?: unknown }).data)) {
+        return { content: 'Error: image generation returned no images', isError: true };
+      }
+      const images: ToolContentBlock[] = [];
+      const assetIds: string[] = [];
+      for (const value of (body as { data: unknown[] }).data) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+        const image = value as Record<string, unknown>;
+        if (typeof image.b64_json !== 'string'
+          || typeof image.mime_type !== 'string'
+          || !SAFE_GENERATED_IMAGE_MIME.test(image.mime_type)
+          || image.b64_json.length % 4 !== 0
+          || !SAFE_GENERATED_IMAGE_BASE64.test(image.b64_json)) continue;
+        const bytes = Buffer.from(image.b64_json, 'base64');
+        if (bytes.byteLength === 0
+          || bytes.byteLength > MAX_GENERATED_IMAGE_BYTES
+          || bytes.toString('base64') !== image.b64_json) continue;
+        const sha256 = createHash('sha256').update(bytes).digest('hex');
+        if (typeof image.sha256 === 'string' && image.sha256 !== sha256) continue;
+        const uri = typeof image.asset_id === 'string'
+          ? `mteam-asset://${image.asset_id}`
+          : undefined;
+        images.push({
+          type: 'image',
+          data: image.b64_json,
+          mimeType: image.mime_type,
+          ...(uri ? { uri } : {}),
+        });
+        if (typeof image.asset_id === 'string') assetIds.push(image.asset_id);
+      }
+      if (images.length !== n) {
+        return { content: 'Error: image generation response failed integrity checks', isError: true };
+      }
+      return {
+        content: `Generated and delivered ${images.length} image${images.length === 1 ? '' : 's'}.`,
+        isError: false,
+        contentBlocks: images,
+        structuredContent: {
+          imageCount: images.length,
+          assetIds,
+          operationId: typeof (body as Record<string, unknown>).operation_id === 'string'
+            ? (body as Record<string, unknown>).operation_id
+            : undefined,
+        },
+      };
+    },
+  };
+}
 
 builtinTools.set(CREATE_TASK_TOOL_NAME, {
   definition: CREATE_TASK_TOOL,
@@ -694,6 +839,9 @@ export async function createAgent(
   // Provider control lives in the host UI/commands. It must never be exposed
   // to the conversational model as a prompt instruction or tool schema.
   const activeBuiltinTools = new Map(builtinTools);
+  if (config.model.model === 'ma-text' && process.env.MA_ACP_HOST === 'mteam') {
+    activeBuiltinTools.set('generate_image', generatedImageTool(config.model));
+  }
   const mcpTools = mcpToolsToOpenAI(connections);
   const tools: ChatCompletionTool[] = [
     ...mcpTools,
@@ -987,7 +1135,9 @@ export async function createAgent(
     task: Task,
     rootUserMessage: ChatContent,
     completionAudit: CompletionObligationAudit,
-    signal?: AbortSignal
+    signal: AbortSignal | undefined,
+    reasoningDepth: MaReasoningDepth,
+    operationId: string,
   ): AsyncGenerator<AgentEvent, TaskRunResult, unknown> {
     const errorTracker = new ErrorTracker();
     const effectiveMaxTokens = config.model.maxTokens;
@@ -1159,6 +1309,8 @@ export async function createAgent(
         frequency_penalty: tempOverride !== undefined ? 0 : (config.model.frequencyPenalty ?? 1.1),
         ...(effectiveMaxTokens != null && effectiveMaxTokens > 0 ? { max_tokens: effectiveMaxTokens } : {}),
       };
+      const stageId = correlatedId('stage', operationId, task.id, String(loop));
+      const callId = correlatedId('call', operationId, stageId, 'text');
       const localModelParams: Record<string, unknown> = {};
       if (config.model.topK !== undefined) localModelParams.top_k = config.model.topK;
       if (config.model.minP !== undefined) localModelParams.min_p = config.model.minP;
@@ -1174,7 +1326,15 @@ export async function createAgent(
           tools,
           stream: true,
         }) ?? {},
-        config.model.extraParams ?? {}
+        config.model.extraParams ?? {},
+        {
+          reasoning_depth: reasoningDepth,
+          mteam_operation: {
+            operation_id: operationId,
+            stage_id: stageId,
+            call_id: callId,
+          },
+        },
       );
       if (tools.length > 0) {
         request.tools = tools;
@@ -1483,7 +1643,14 @@ export async function createAgent(
       emptyArgsRetries = 0;
       tempOverride = undefined;
 
-      const toolCtx = { stack, currentTask: task, todoList, contextManager };
+      const toolCtx = {
+        stack,
+        currentTask: task,
+        todoList,
+        contextManager,
+        reasoningDepth,
+        operationId,
+      };
 
       for (const tc of repairedCalls) {
         const fullName = tc.function.name;
@@ -1578,8 +1745,11 @@ export async function createAgent(
 
   async function* chat(
     userMessage: ChatContent,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    chatOptions: { reasoningDepth?: MaReasoningDepth } = {},
   ): AsyncGenerator<AgentEvent, void, unknown> {
+    const reasoningDepth = chatOptions.reasoningDepth ?? 'standard';
+    const operationId = `op_${randomUUID().replaceAll('-', '')}`;
     const rootPromptText =
       typeof userMessage === 'string'
         ? userMessage
@@ -1620,7 +1790,14 @@ export async function createAgent(
       let completionObligationFailure = '';
 
       try {
-        const gen = runTask(task, userMessage, completionAudit, signal);
+        const gen = runTask(
+          task,
+          userMessage,
+          completionAudit,
+          signal,
+          reasoningDepth,
+          operationId,
+        );
         while (true) {
           const { value, done } = await gen.next();
           if (done) {

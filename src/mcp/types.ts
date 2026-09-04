@@ -11,6 +11,12 @@ export interface McpTool {
   inputSchema: Record<string, any>;
 }
 
+export type MaReasoningDepth = 'standard' | 'deep';
+
+export type ToolContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; data: string; mimeType: string; uri?: string };
+
 export interface McpServerConfig {
   command: string;
   args?: string[];
@@ -21,6 +27,7 @@ export interface McpServerConfig {
 export interface McpCallResult {
   content: string;
   isError: boolean;
+  contentBlocks?: ToolContentBlock[];
   structuredContent?: Record<string, unknown>;
   _meta?: Record<string, unknown>;
 }
@@ -175,7 +182,8 @@ export type ChatContent =
 export interface Agent {
   chat(
     userMessage: ChatContent,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    options?: { reasoningDepth?: MaReasoningDepth },
   ): AsyncGenerator<AgentEvent, void, unknown>;
   reset(): void;
   getTaskStack(): TaskStack;

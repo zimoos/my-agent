@@ -1,3 +1,5 @@
+import type { ToolContentBlock } from '../mcp/types.js';
+
 export interface DiffArtifact {
   type: 'diff';
   filePath: string;
@@ -28,6 +30,7 @@ export type AgentEvent =
       type: 'tool:result';
       ok: boolean;
       content: string;
+      contentBlocks?: ToolContentBlock[];
       artifact?: DiffArtifact;
       structuredContent?: Record<string, unknown>;
       _meta?: Record<string, unknown>;

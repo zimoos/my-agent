@@ -7,6 +7,7 @@ import type {
   Agent as MaAgent,
   AgentEvent,
   ChatContent,
+  MaReasoningDepth,
   McpServerConfig,
 } from '../mcp/types.js';
 import { VERSION } from '../version.js';
@@ -16,6 +17,7 @@ interface MaAcpSession {
   pendingPrompt: AbortController | null;
   pendingTool: acp.ToolCall | null;
   failureReason: string | null;
+  reasoningDepth: MaReasoningDepth;
 }
 
 export interface MaAcpServerOptions {
@@ -141,9 +143,26 @@ function planEntries(content: string): acp.PlanEntry[] {
 }
 
 function resultContent(event: Extract<AgentEvent, { type: 'tool:result' }>): acp.ToolCallContent[] {
+  const blocks = event.contentBlocks?.length
+    ? event.contentBlocks
+    : [{ type: 'text' as const, text: event.content }];
+  return blocks.map((content) => ({ type: 'content' as const, content }));
+}
+
+const REASONING_CONFIG_ID = 'reasoning_depth';
+
+function reasoningConfig(depth: MaReasoningDepth): acp.SessionConfigOption[] {
   return [{
-    type: 'content',
-    content: { type: 'text', text: event.content },
+    id: REASONING_CONFIG_ID,
+    name: 'Reasoning depth',
+    description: 'Controls product reasoning depth. The MTEAM service chooses the provider and model.',
+    category: 'thought_level',
+    type: 'select',
+    currentValue: depth,
+    options: [
+      { value: 'standard', name: 'Standard' },
+      { value: 'deep', name: 'Deep' },
+    ],
   }];
 }
 
@@ -190,8 +209,26 @@ export class MaAcpAgent implements acp.Agent {
       pendingPrompt: null,
       pendingTool: null,
       failureReason: null,
+      reasoningDepth: 'standard',
     });
-    return { sessionId: boot.sessionId };
+    return { sessionId: boot.sessionId, configOptions: reasoningConfig('standard') };
+  }
+
+  async setSessionConfigOption(
+    params: acp.SetSessionConfigOptionRequest,
+  ): Promise<acp.SetSessionConfigOptionResponse> {
+    const session = this.requireSession(params.sessionId);
+    if (params.configId !== REASONING_CONFIG_ID
+      || (params.value !== 'standard' && params.value !== 'deep')) {
+      throw acp.RequestError.invalidParams(undefined, 'Unsupported MA session configuration');
+    }
+    session.reasoningDepth = params.value;
+    const configOptions = reasoningConfig(session.reasoningDepth);
+    await this.send(params.sessionId, {
+      sessionUpdate: 'config_option_update',
+      configOptions,
+    });
+    return { configOptions };
   }
 
   async prompt(params: acp.PromptRequest): Promise<acp.PromptResponse> {
@@ -201,8 +238,13 @@ export class MaAcpAgent implements acp.Agent {
     session.pendingPrompt = pending;
     session.pendingTool = null;
     session.failureReason = null;
+    const reasoningDepth = session.reasoningDepth;
     try {
-      for await (const event of session.boot.agent.chat(promptContent(params.prompt), pending.signal)) {
+      for await (const event of session.boot.agent.chat(
+        promptContent(params.prompt),
+        pending.signal,
+        { reasoningDepth },
+      )) {
         await this.forwardEvent(params.sessionId, session, event);
         if (session.failureReason) {
           throw new Error(`MA agent task failed: ${session.failureReason}`);

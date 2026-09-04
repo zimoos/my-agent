@@ -1,7 +1,12 @@
 import type { ChatCompletionMessageToolCall } from 'openai/resources/chat/completions';
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
-import type { AgentConfig, McpConnection } from '../mcp/types.js';
+import type {
+  AgentConfig,
+  MaReasoningDepth,
+  McpConnection,
+  ToolContentBlock,
+} from '../mcp/types.js';
 import type { Task, TaskStack } from '../task-stack.js';
 import type { AgentEvent } from './events.js';
 import { normalizeArguments } from './normalize.js';
@@ -55,6 +60,16 @@ export interface BuiltinToolContext {
   currentTask: Task;
   todoList: ReturnType<typeof createTodoList>;
   contextManager: ContextManager;
+  reasoningDepth: MaReasoningDepth;
+  operationId: string;
+  toolCallId: string;
+}
+
+export interface BuiltinToolResult {
+  content: string;
+  isError: boolean;
+  contentBlocks?: ToolContentBlock[];
+  structuredContent?: Record<string, unknown>;
 }
 
 export interface BuiltinTool {
@@ -62,7 +77,7 @@ export interface BuiltinTool {
   handler: (
     args: Record<string, any>,
     ctx: BuiltinToolContext
-  ) => { content: string; isError: boolean } | Promise<{ content: string; isError: boolean }>;
+  ) => BuiltinToolResult | Promise<BuiltinToolResult>;
 }
 
 export interface ToolExecutionContext {
@@ -71,6 +86,8 @@ export interface ToolExecutionContext {
   todoList: ReturnType<typeof createTodoList>;
   contextManager: ContextManager;
   sessionId?: string;
+  reasoningDepth: MaReasoningDepth;
+  operationId: string;
 }
 
 export interface ConfirmProvider {
@@ -93,6 +110,7 @@ export interface ToolExecutionResult {
   };
   fileReadCoverage?: FileReadCoverage;
   progressSummary?: string;
+  contentBlocks?: ToolContentBlock[];
 }
 
 function requiresStructuredEvidence(
@@ -209,6 +227,7 @@ export class ToolExecutor {
     let structuredContent: Record<string, unknown> | undefined;
     let meta: Record<string, unknown> | undefined;
     let externalTool = false;
+    let contentBlocks: ToolContentBlock[] | undefined;
 
     const webPolicyBlock = this.reserveWebCall(fullName, args);
     if (webPolicyBlock) {
@@ -265,9 +284,11 @@ export class ToolExecutor {
     if (!skipExecute) {
       const builtin = this.builtinTools.get(fullName);
       if (builtin) {
-        const r = await builtin.handler(args, ctx);
+        const r = await builtin.handler(args, { ...ctx, toolCallId: tc.id });
         toolResult = r.content;
         isError = r.isError;
+        contentBlocks = r.contentBlocks;
+        structuredContent = r.structuredContent;
         if (!isError && fullName === 'ask_user') {
           yield {
             type: 'ask_user',
@@ -296,6 +317,7 @@ export class ToolExecutor {
             isError = r.isError;
             structuredContent = r.structuredContent;
             meta = r._meta;
+            contentBlocks = r.contentBlocks;
           } catch (err) {
             toolResult = `Error: ${(err as Error).message}`;
             isError = true;
@@ -356,6 +378,7 @@ export class ToolExecutor {
       type: 'tool:result',
       ok: !isError,
       content: short,
+      ...(contentBlocks ? { contentBlocks } : {}),
       artifact,
     };
     if (structuredContent !== undefined) {
@@ -379,6 +402,7 @@ export class ToolExecutor {
     if (meta !== undefined) executionResult._meta = meta;
     if (readPageRecord) executionResult.fileReadCoverage = this.fileReadLedger.coverage();
     if (readPageRecord) executionResult.progressSummary = readPageUiSummary(readPageRecord);
+    if (contentBlocks) executionResult.contentBlocks = contentBlocks;
     if (requiresEvidence) {
       const hasVerifiedEvidence = !isError &&
         hasVerifiedStructuredEvidence(structuredContent, executedToolName);
