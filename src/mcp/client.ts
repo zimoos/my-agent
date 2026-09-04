@@ -8,6 +8,7 @@ import type {
   McpTool,
   McpCallResult,
   McpProgressEvent,
+  ToolContentBlock,
 } from './types.js';
 
 const signalLimitApplied = new WeakSet<AbortSignal>();
@@ -34,6 +35,28 @@ interface JsonRpcResponse {
 
 const REQUEST_TIMEOUT_MS = 30_000;
 const PROTOCOL_VERSION = '2024-11-05';
+const MAX_TOOL_IMAGE_BASE64_CHARS = 24 * 1024 * 1024;
+const SAFE_IMAGE_MIME = /^image\/(?:png|jpeg|webp)$/;
+
+function toolContentBlock(value: unknown): ToolContentBlock | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const block = value as Record<string, unknown>;
+  if (block.type === 'text' && typeof block.text === 'string') {
+    return { type: 'text', text: block.text };
+  }
+  if (block.type !== 'image'
+    || typeof block.data !== 'string'
+    || block.data.length === 0
+    || block.data.length > MAX_TOOL_IMAGE_BASE64_CHARS
+    || typeof block.mimeType !== 'string'
+    || !SAFE_IMAGE_MIME.test(block.mimeType)) return null;
+  return {
+    type: 'image',
+    data: block.data,
+    mimeType: block.mimeType,
+    ...(typeof block.uri === 'string' ? { uri: block.uri } : {}),
+  };
+}
 
 export function buildMcpEnv(extraEnv: Record<string, string> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, ...extraEnv };
@@ -302,16 +325,21 @@ export class McpClient implements McpConnection {
       onProgress
     );
     const contentArr = Array.isArray(result?.content) ? result.content : [];
+    const contentBlocks = contentArr
+      .map(toolContentBlock)
+      .filter((block: ToolContentBlock | null): block is ToolContentBlock => block !== null);
     const text = contentArr
       .map((c: any) => {
         if (typeof c?.text === 'string') return c.text;
         if (c?.type === 'text') return String(c.text ?? '');
+        if (c?.type === 'image') return `[image:${String(c.mimeType ?? 'unknown')}]`;
         return JSON.stringify(c);
       })
       .join('\n');
     const callResult: McpCallResult = {
       content: text,
       isError: Boolean(result?.isError),
+      ...(contentBlocks.length > 0 ? { contentBlocks } : {}),
     };
     if (Object.prototype.hasOwnProperty.call(result ?? {}, 'structuredContent')) {
       callResult.structuredContent = result.structuredContent;

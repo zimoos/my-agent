@@ -10,7 +10,12 @@ import * as acpRuntime from '@agentclientprotocol/sdk';
 import type * as acp from '@agentclientprotocol/sdk';
 import { MaAcpAgent } from '../src/acp/server.js';
 import type { BootstrapOptions, BootstrapResult } from '../src/index.js';
-import type { Agent, AgentEvent, ChatContent } from '../src/mcp/types.js';
+import type {
+  Agent,
+  AgentEvent,
+  ChatContent,
+  MaReasoningDepth,
+} from '../src/mcp/types.js';
 
 function fakeAgent(confirmations: Array<{ requestId: string; approved: boolean }>): Agent {
   return {
@@ -139,6 +144,11 @@ test('MA ACP exposes a host-owned session, forwards events, permissions, cancell
       _meta: { mteam: { systemPrompt: 'You are the primary MTEAM agent.' } },
     });
     assert.equal(created.sessionId, 'ma-session-1');
+    assert.deepEqual(created.configOptions?.map((option) => ({
+      id: option.id,
+      category: option.category,
+      currentValue: option.type === 'select' ? option.currentValue : undefined,
+    })), [{ id: 'reasoning_depth', category: 'thought_level', currentValue: 'standard' }]);
     assert.equal(bootstrapCalls[0]?.configPath, '/host/ma.json');
     assert.equal(bootstrapCalls[0]?.options?.cwd, cwd);
     assert.equal(bootstrapCalls[0]?.options?.systemPrompt, 'You are the primary MTEAM agent.');
@@ -173,6 +183,78 @@ test('MA ACP exposes a host-owned session, forwards events, permissions, cancell
   } finally {
     await server.shutdown();
     rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('MA ACP acknowledges reasoning depth and freezes it for an in-flight prompt', async () => {
+  const updates: acp.SessionNotification[] = [];
+  const observed: MaReasoningDepth[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const agent: Agent = {
+    ...fakeAgent([]),
+    async *chat(_message, _signal, options): AsyncGenerator<AgentEvent> {
+      observed.push(options?.reasoningDepth ?? 'standard');
+      await gate;
+      yield { type: 'text', content: 'done' };
+    },
+  };
+  const server = new MaAcpAgent(recordingConnection(updates), {
+    bootstrapSession: async () => bootstrapResult(agent, 'ma-reasoning-session'),
+  });
+  try {
+    const created = await server.newSession({ cwd: process.cwd(), mcpServers: [] });
+    await server.setSessionConfigOption({
+      sessionId: created.sessionId,
+      configId: 'reasoning_depth',
+      value: 'deep',
+    });
+    const inFlight = server.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: 'text', text: 'first' }],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await server.setSessionConfigOption({
+      sessionId: created.sessionId,
+      configId: 'reasoning_depth',
+      value: 'standard',
+    });
+    release();
+    await inFlight;
+    assert.deepEqual(observed, ['deep']);
+    assert.equal(updates.filter((item) => item.update.sessionUpdate === 'config_option_update').length, 2);
+  } finally {
+    await server.shutdown();
+  }
+});
+
+test('MA ACP forwards generated images as native ACP tool content', async () => {
+  const updates: acp.SessionNotification[] = [];
+  const server = new MaAcpAgent(recordingConnection(updates), {
+    bootstrapSession: async () => bootstrapResult(eventAgent([
+      { type: 'tool:call', name: 'generate_image', args: { prompt: 'a blue circle' } },
+      {
+        type: 'tool:result',
+        ok: true,
+        content: 'Generated and delivered 1 image.',
+        contentBlocks: [{ type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' }],
+      },
+    ]), 'ma-image-session'),
+  });
+  try {
+    const created = await server.newSession({ cwd: process.cwd(), mcpServers: [] });
+    await server.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: 'text', text: 'generate an image' }],
+    });
+    const update = updates.find((item) => item.update.sessionUpdate === 'tool_call_update');
+    assert.ok(update && update.update.sessionUpdate === 'tool_call_update');
+    assert.deepEqual(update.update.content, [{
+      type: 'content',
+      content: { type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' },
+    }]);
+  } finally {
+    await server.shutdown();
   }
 });
 
