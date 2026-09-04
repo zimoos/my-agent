@@ -61,6 +61,7 @@ export interface BuiltinToolContext {
   todoList: ReturnType<typeof createTodoList>;
   contextManager: ContextManager;
   reasoningDepth: MaReasoningDepth;
+  operationId: string;
   toolCallId: string;
 }
 
@@ -86,6 +87,7 @@ export interface ToolExecutionContext {
   contextManager: ContextManager;
   sessionId?: string;
   reasoningDepth: MaReasoningDepth;
+  operationId: string;
 }
 
 export interface ConfirmProvider {

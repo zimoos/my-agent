@@ -449,6 +449,9 @@ test('messages: initial system prompt is first message with expected content', a
     await drain(agent.chat('hi'));
 
     assert.equal(state.calls.length, 1);
+    assert.match(state.calls[0].body.mteam_operation.operation_id, /^op_[a-f0-9]{32}$/);
+    assert.match(state.calls[0].body.mteam_operation.stage_id, /^stage_[a-f0-9]{32}$/);
+    assert.match(state.calls[0].body.mteam_operation.call_id, /^call_[a-f0-9]{32}$/);
     const first = state.calls[0].messages;
     assertSystemFirst(first);
     const sys = first[0].content as string;
@@ -517,6 +520,16 @@ test('messages: append-only transcript sends paired tool protocol to provider', 
 
     // Second model call must replay the append-only assistant(tool_calls)+tool pair.
     assert.ok(state.calls.length >= 2, 'expected at least 2 model calls');
+    assert.equal(
+      state.calls[0].body.mteam_operation.operation_id,
+      state.calls[1].body.mteam_operation.operation_id,
+      'all provider calls in one user task must share the operation id'
+    );
+    assert.notEqual(
+      state.calls[0].body.mteam_operation.call_id,
+      state.calls[1].body.mteam_operation.call_id,
+      'each paid provider call must have a distinct call id'
+    );
     const round2 = state.calls[1].messages;
 
     assertQwen3Safe(round2);

@@ -63,7 +63,7 @@ import { RuntimeContextSlotStore } from './agent/runtime-context-slots.js';
 import { CompletionObligationAudit } from './agent/completion-obligations.js';
 import { FileReadLedger } from './agent/file-read-ledger.js';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 export interface CreateAgentOptions {
   resumeMessages?: ChatCompletionMessageParam[];
@@ -494,6 +494,7 @@ interface BuiltinToolContext {
   todoList: ReturnType<typeof createTodoList>;
   contextManager: ContextManager;
   reasoningDepth: MaReasoningDepth;
+  operationId: string;
   toolCallId: string;
 }
 
@@ -517,6 +518,10 @@ const builtinTools = new Map<string, BuiltinTool>();
 const SAFE_GENERATED_IMAGE_MIME = /^image\/(?:png|jpeg|webp)$/;
 const SAFE_GENERATED_IMAGE_BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
 const MAX_GENERATED_IMAGE_BYTES = 16 * 1024 * 1024;
+
+function correlatedId(prefix: 'stage' | 'call', ...parts: string[]): string {
+  return `${prefix}_${createHash('sha256').update(parts.join('\u0000')).digest('hex').slice(0, 32)}`;
+}
 
 function generatedImageTool(model: ModelConfig): BuiltinTool {
   return {
@@ -543,6 +548,8 @@ function generatedImageTool(model: ModelConfig): BuiltinTool {
       const n = Number.isSafeInteger(args.n) ? args.n : 1;
       const size = typeof args.size === 'string' ? args.size : '1024x1024';
       const quality = typeof args.quality === 'string' ? args.quality : 'low';
+      const stageId = correlatedId('stage', ctx.operationId, 'image', ctx.toolCallId);
+      const callId = correlatedId('call', ctx.operationId, stageId, ctx.toolCallId);
       if (!prompt || prompt.length > 8_000 || n !== 1
         || size !== '1024x1024' || quality !== 'low') {
         return { content: 'Error: invalid image generation request', isError: true };
@@ -554,7 +561,7 @@ function generatedImageTool(model: ModelConfig): BuiltinTool {
           headers: {
             authorization: `Bearer ${model.apiKey}`,
             'content-type': 'application/json',
-            'idempotency-key': ctx.toolCallId,
+            'idempotency-key': callId,
           },
           body: JSON.stringify({
             model: model.model,
@@ -564,6 +571,11 @@ function generatedImageTool(model: ModelConfig): BuiltinTool {
             quality,
             response_format: 'b64_json',
             reasoning_depth: ctx.reasoningDepth,
+            mteam_operation: {
+              operation_id: ctx.operationId,
+              stage_id: stageId,
+              call_id: callId,
+            },
           }),
           signal: AbortSignal.timeout(model.requestTimeoutMs ?? 180_000),
         });
@@ -1125,6 +1137,7 @@ export async function createAgent(
     completionAudit: CompletionObligationAudit,
     signal: AbortSignal | undefined,
     reasoningDepth: MaReasoningDepth,
+    operationId: string,
   ): AsyncGenerator<AgentEvent, TaskRunResult, unknown> {
     const errorTracker = new ErrorTracker();
     const effectiveMaxTokens = config.model.maxTokens;
@@ -1296,6 +1309,8 @@ export async function createAgent(
         frequency_penalty: tempOverride !== undefined ? 0 : (config.model.frequencyPenalty ?? 1.1),
         ...(effectiveMaxTokens != null && effectiveMaxTokens > 0 ? { max_tokens: effectiveMaxTokens } : {}),
       };
+      const stageId = correlatedId('stage', operationId, task.id, String(loop));
+      const callId = correlatedId('call', operationId, stageId, 'text');
       const localModelParams: Record<string, unknown> = {};
       if (config.model.topK !== undefined) localModelParams.top_k = config.model.topK;
       if (config.model.minP !== undefined) localModelParams.min_p = config.model.minP;
@@ -1312,7 +1327,14 @@ export async function createAgent(
           stream: true,
         }) ?? {},
         config.model.extraParams ?? {},
-        { reasoning_depth: reasoningDepth },
+        {
+          reasoning_depth: reasoningDepth,
+          mteam_operation: {
+            operation_id: operationId,
+            stage_id: stageId,
+            call_id: callId,
+          },
+        },
       );
       if (tools.length > 0) {
         request.tools = tools;
@@ -1627,6 +1649,7 @@ export async function createAgent(
         todoList,
         contextManager,
         reasoningDepth,
+        operationId,
       };
 
       for (const tc of repairedCalls) {
@@ -1726,6 +1749,7 @@ export async function createAgent(
     chatOptions: { reasoningDepth?: MaReasoningDepth } = {},
   ): AsyncGenerator<AgentEvent, void, unknown> {
     const reasoningDepth = chatOptions.reasoningDepth ?? 'standard';
+    const operationId = `op_${randomUUID().replaceAll('-', '')}`;
     const rootPromptText =
       typeof userMessage === 'string'
         ? userMessage
@@ -1766,7 +1790,14 @@ export async function createAgent(
       let completionObligationFailure = '';
 
       try {
-        const gen = runTask(task, userMessage, completionAudit, signal, reasoningDepth);
+        const gen = runTask(
+          task,
+          userMessage,
+          completionAudit,
+          signal,
+          reasoningDepth,
+          operationId,
+        );
         while (true) {
           const { value, done } = await gen.next();
           if (done) {
