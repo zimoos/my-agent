@@ -61,6 +61,7 @@ import {
 } from './agent/context-manager.js';
 import { RuntimeContextSlotStore } from './agent/runtime-context-slots.js';
 import { CompletionObligationAudit } from './agent/completion-obligations.js';
+import { ActionEvidenceAudit, type MissingActionEvidence } from './agent/action-evidence-audit.js';
 import { FileReadLedger } from './agent/file-read-ledger.js';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -120,13 +121,6 @@ interface TaskDiagnostics {
   lastContext?: ContextUsageSnapshot;
 }
 
-interface MissingActionEvidence {
-  tool: string;
-  toolCallId: string;
-  operation: string;
-  status: 'missing' | 'failed';
-}
-
 interface TaskRunResult {
   text: string;
   hitMaxLoops: boolean;
@@ -142,7 +136,7 @@ function buildMissingEvidenceFailure(items: MissingActionEvidence[]): string {
     .join(', ');
   return [
     `missing_evidence: cannot complete this action task because the latest attempt for ${calls} did not produce a successful verified result.`,
-    'Re-run the action with an MCP tool that returns structuredContent["my-agent/evidence"] containing a non-empty operation and status="verified".',
+    'Completion needs an MCP result with structuredContent["my-agent/evidence"] and status="verified". Investigate unresolved actions before retrying; do not automatically repeat external mutations whose effects are unknown.',
   ].join(' ');
 }
 
@@ -1195,14 +1189,14 @@ export async function createAgent(
     let lengthContinuationCount = 0;
     let lastLengthContinuationContent = '';
     let emptyResponseRecoveries = 0;
-    const incompleteActionEvidence = new Map<string, MissingActionEvidence>();
+    const actionEvidenceAudit = new ActionEvidenceAudit();
     lastTaskDiagnostics = { recentTools: [], totalTools: 0 };
 
     const taskResult = (text: string, hitMaxLoops = false): TaskRunResult => ({
       text,
       hitMaxLoops,
-      ...(incompleteActionEvidence.size > 0
-        ? { missingEvidence: [...incompleteActionEvidence.values()] }
+      ...(actionEvidenceAudit.missing().length > 0
+        ? { missingEvidence: actionEvidenceAudit.missing() }
         : {}),
     });
 
@@ -1540,6 +1534,16 @@ export async function createAgent(
           tempOverride = 0.1;
           continue;
         }
+        const actionRecovery = contentBuf.trim().length > 0 ? actionEvidenceAudit.recoveryMessage() : undefined;
+        if (actionRecovery) {
+          await completePendingZimoosOperationSummaries(contentBuf);
+          store.appendAssistant(contentBuf, undefined, { reasoningContent });
+          store.appendUser(actionRecovery);
+          persistPending();
+          yield { type: 'warning', message: actionRecovery };
+          tempOverride = 0.1;
+          continue;
+        }
         if (!task.parentId && contentBuf.trim().length > 0) {
           completionAudit.setFileReadCoverage(fileReadLedger.coverage());
           const completionDecision = completionAudit.inspectFinalAttempt(contentBuf);
@@ -1671,6 +1675,7 @@ export async function createAgent(
           isError,
           runtimeSlotUpdate,
           actionEvidence,
+          structuredContent,
           fileReadCoverage,
           progressSummary,
         } = yield* toolExecutor.execute(
@@ -1685,16 +1690,7 @@ export async function createAgent(
           verifiedAction: actionEvidence?.status === 'verified',
         });
         if (fileReadCoverage) completionAudit.setFileReadCoverage(fileReadCoverage);
-        if (actionEvidence?.status === 'verified') {
-          incompleteActionEvidence.delete(actionEvidence.key);
-        } else if (actionEvidence) {
-          incompleteActionEvidence.set(actionEvidence.key, {
-            tool: fullName,
-            toolCallId: tc.id,
-            operation: actionEvidence.operation,
-            status: actionEvidence.status,
-          });
-        }
+        actionEvidenceAudit.record(fullName, tc.id, args, { actionEvidence, structuredContent });
         if (runtimeSlotUpdate) {
           runtimeSlots.set(runtimeSlotUpdate);
           await appendDebugLog(

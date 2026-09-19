@@ -392,6 +392,75 @@ test('action task: same execute_command retry clears earlier missing evidence wh
   }
 });
 
+test('development validation: real failed pipeline is repaired in foreground before task completion', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'my-agent-validation-recovery-'));
+  const testPath = join(dir, 'scenario.test.cjs');
+  const testSource = (passing: boolean) => `const { test } = require('node:test');\nconst assert = require('node:assert/strict');\ntest('business result', () => assert.equal(${passing}, true));\n`;
+  await writeFile(testPath, testSource(false));
+  // The nested test runner is the command under test, not another child in this
+  // test runner's IPC protocol. Keep that harness-only variable out of its env.
+  const exec = await connectMcpServer('exec', {
+    command: process.execPath,
+    args: ['--import', 'tsx', '--input-type=module', '-e',
+      `delete process.env.NODE_TEST_CONTEXT; await import(${JSON.stringify(join(REPO_ROOT, 'servers/exec-mcp.ts'))});`],
+    cwd: REPO_ROOT,
+  });
+  const fs = await realMcpConnection('fs', 'fs-mcp.ts');
+  const restore = installProviderResponses([
+    toolResponse('masked-test', 'exec__execute_command', { command: 'node --test --test-reporter=tap scenario.test.cjs 2>&1 | tail -8', cwd: dir }),
+    textResponse('The application is complete.'),
+    toolResponse('repair', 'fs__write_file', { path: testPath, content: testSource(true) }),
+    toolResponse('direct-test', 'exec__execute_command', { command: 'node --test --test-reporter=spec scenario.test.cjs', cwd: dir }),
+    textResponse('The business result passed its direct test after repair.'),
+  ]);
+  const agent = await createAgent(config, [exec, fs]);
+  try {
+    const events = await drain(agent.chat('Build the application and run tests.'));
+    const results = events.filter((event) => event.type === 'tool:result');
+    assert.match(results[0].content, /fail 1/);
+    assert.equal(results[0].structuredContent?.exitCode, 0, 'tail really masked the failing test exit');
+    assert.match(results.at(-1)!.content, /pass 1/);
+    assert.equal(results.at(-1)!.structuredContent?.exitCode, 0);
+    assert.equal(events.filter((event) => event.type === 'warning' && /action evidence audit/.test(event.message)).length, 1);
+    assert.equal(events.some((event) => event.type === 'task:failed'), false);
+    assert.ok(events.some((event) => event.type === 'task:done'));
+  } finally {
+    restore();
+    await agent.close();
+    await exec.close();
+    await fs.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('development validation: unrelated passing test cannot hide the failed target after bounded recovery', async () => {
+  const receipt = (ok: boolean) => ({
+    ok, exitCode: ok ? 0 : 1, signal: null, timedOut: false, cancelled: false,
+    cleanup: { scope: 'verified' }, ...(ok ? canonicalEvidence('execute_command') : {}),
+  });
+  const connection = scriptedMcpConnection('exec', 'execute_command', [
+    { content: 'billing tests failed', isError: true, structuredContent: receipt(false) },
+    { content: 'unrelated login tests passed', structuredContent: receipt(true) },
+  ]);
+  const restore = installProviderResponses([
+    toolResponse('failed-billing', 'exec__execute_command', { command: 'pytest tests/billing.py', cwd: '/tmp/app' }),
+    toolResponse('passing-login', 'exec__execute_command', { command: 'pytest tests/login.py', cwd: '/tmp/app' }),
+    textResponse('The application is complete.'),
+    textResponse('The application is complete.'),
+    textResponse('The application is complete.'),
+  ]);
+  const agent = await createAgent(config, [connection]);
+  try {
+    const events = await drain(agent.chat('Build the application and run tests.'));
+    assert.match(taskFailed(events).error, /failed-billing.*final=failed/);
+    assert.equal(events.some((event) => event.type === 'task:done'), false);
+    assert.equal(events.filter((event) => event.type === 'warning' && /action evidence audit/.test(event.message)).length, 2);
+  } finally {
+    restore();
+    await agent.close();
+  }
+});
+
 test('action task: verified execute_command in another cwd cannot clear missing evidence', async () => {
   // The old cwd-changing retry test was wrong: relative commands observe a different workspace.
   const command = 'printf semantic-retry-ok';

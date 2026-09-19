@@ -426,3 +426,17 @@ test('completion obligations: masked test exits cannot satisfy validation', () =
     assert.deepEqual(audit.missing(), []);
   }
 });
+
+test('completion obligations: quoted test-name alternation is data, not an exit-masking pipeline', () => {
+  const audit = new CompletionObligationAudit('Run tests.');
+  audit.recordToolEvidence({
+    toolName: 'exec__execute_command', args: { command: 'vitest run -t "billing|refund"' },
+    succeeded: true, verifiedAction: true,
+  });
+  assert.deepEqual(audit.missing(), []);
+  audit.recordToolEvidence({
+    toolName: 'exec__execute_command', args: { command: 'vitest run -t "billing|refund" | tail -20' },
+    succeeded: true, verifiedAction: true,
+  });
+  assert.deepEqual(audit.missing(), ['test']);
+});

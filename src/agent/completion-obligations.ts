@@ -1,4 +1,5 @@
 import type { FileReadCoverage } from './file-read-ledger.js';
+import { isLiteralForegroundCommand } from './command-verification.js';
 
 export type CompletionObligationKind = 'test' | 'browser' | 'file_read_coverage';
 
@@ -110,7 +111,7 @@ function isExecuteCommand(toolName: string): boolean {
  * establish the validator's exit status. Ask for a direct validation command.
  */
 function preservesValidationExit(command: string): boolean {
-  return !/[|;`\n\r$]/.test(command);
+  return !/[|;`\n\r$]/.test(command) || isLiteralForegroundCommand(command);
 }
 
 export function isSemanticTestCommand(command: string): boolean {
