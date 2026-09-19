@@ -95,3 +95,41 @@ test('bootstrap hydration connects five MCP servers in parallel, preserves confi
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+for (const redirect of [false, true]) test(`authenticated capability discovery ${redirect ? 'rejects redirects without leaking credentials' : 'uses the protected context window'}`, async () => {
+  const { createServer } = await import('node:http');
+  const dir = mkdtempSync(join(tmpdir(), 'ma-model-metadata-'));
+  const requests: string[] = [];
+  let redirectedRequests = 0;
+  const target = createServer((_req, res) => { redirectedRequests++; res.end('{}'); });
+  await new Promise<void>(resolve => target.listen(0, '127.0.0.1', resolve));
+  const targetPort = (target.address() as import('node:net').AddressInfo).port;
+  const server = createServer((req, res) => {
+    requests.push(req.url!);
+    if (req.headers.authorization !== 'Bearer test-capability') { res.writeHead(401); res.end('{}'); return; }
+    if (redirect) { res.writeHead(302, { location: `http://127.0.0.1:${targetPort}/capture` }); res.end(); return; }
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ data: [{ id: 'ma-text', max_context_length: 131072 }] }));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as import('node:net').AddressInfo).port;
+  const sessionStore = createSessionStore(join(dir, 'sessions'));
+  try {
+    const boot = await hydrateBootstrap({
+      config: { model: { provider: 'lmstudio', baseURL: `http://127.0.0.1:${port}/v1`, model: 'ma-text', apiKey: 'test-capability' }, mcpServers: {} },
+      configPath: null, configSources: [], createdDefault: false, sessionStore,
+      sessionId: sessionStore.create({ createdAt: Date.now(), cwd: dir, model: 'ma-text' }),
+      resumed: false, contextWindowConfigured: false, cwd: dir, loadAgentInstructions: false,
+    });
+    try {
+      assert.equal(boot.config.model.contextWindow, redirect ? 32768 : 131072);
+      assert.equal(boot.config.model.contextWindowSource, redirect ? 'default' : 'lmstudio');
+      assert.deepEqual(requests, ['/v1/models', '/api/v0/models']);
+      assert.equal(redirectedRequests, 0);
+    } finally { await shutdown(boot.connections, boot.agent); }
+  } finally {
+    server.closeAllConnections(); target.closeAllConnections();
+    await Promise.all([new Promise<void>(resolve => server.close(() => resolve())), new Promise<void>(resolve => target.close(() => resolve()))]);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -132,8 +132,12 @@ export function prepareBootstrap(
 async function hydrateRemoteModelConfig(config: AgentConfig, detectContextWindow: boolean): Promise<void> {
   if (config.model.provider?.toLowerCase() === 'agora') return;
   let lmStudioContextWindow: number | undefined;
+  const headers = config.model.apiKey ? { authorization: `Bearer ${config.model.apiKey}` } : undefined;
   try {
-    const res = await fetch(`${config.model.baseURL}/models`, { signal: AbortSignal.timeout(300) });
+    const res = await fetch(`${config.model.baseURL}/models`, {
+      headers, redirect: 'error', signal: AbortSignal.timeout(300),
+    });
+    if (!res.ok) throw new Error('Model metadata unavailable');
     const data = await res.json() as { data: Array<{ id: string }> };
     const available = data.data.map((model) => model.id);
     if (available.length > 0 && !available.includes(config.model.model)) {
@@ -145,7 +149,10 @@ async function hydrateRemoteModelConfig(config: AgentConfig, detectContextWindow
   if (detectContextWindow) {
     try {
       const base = config.model.baseURL.replace(/\/v1\/?$/, '');
-      const res = await fetch(`${base}/api/v0/models`, { signal: AbortSignal.timeout(300) });
+      const res = await fetch(`${base}/api/v0/models`, {
+        headers, redirect: 'error', signal: AbortSignal.timeout(300),
+      });
+      if (!res.ok) throw new Error('Context metadata unavailable');
       const data = await res.json() as { data: Array<{ id: string; max_context_length?: number }> };
       lmStudioContextWindow = data.data.find((model) => model.id === config.model.model)?.max_context_length;
     } catch {
