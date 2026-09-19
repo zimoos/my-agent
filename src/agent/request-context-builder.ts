@@ -27,6 +27,7 @@ export interface RequestContextBuildOptions {
   suffix?: string;
   maxTokens: number;
   maxBytes?: number;
+  /** Preferred recent groups. Older complete groups can yield to the budget. */
   recentGroups?: number;
   /** Absolute indexes in sourceMessages that must survive windowing. */
   protectedMessageIndexes?: number[];
@@ -478,18 +479,30 @@ export class RequestContextBuilder {
     const recentGroups = Math.max(0, options.recentGroups ?? DEFAULT_RECENT_GROUPS);
     const latestUser = lastUserGroupIndex(groups);
     const protectedIndexes = new Set<number>();
+    const mandatoryIndexes = new Set<number>();
     const recentStart = Math.max(0, groups.length - recentGroups);
 
     for (let i = recentStart; i < groups.length; i++) protectedIndexes.add(i);
-    if (latestUser >= 0) protectedIndexes.add(latestUser);
+    if (latestUser >= 0) {
+      protectedIndexes.add(latestUser);
+      mandatoryIndexes.add(latestUser);
+    }
     for (const sourceIndex of options.protectedMessageIndexes ?? []) {
       const transcriptIndex = sourceIndex - 1;
       const group = groups.find((item) =>
         transcriptIndex >= item.start &&
         transcriptIndex < item.start + item.messages.length
       );
-      if (group) protectedIndexes.add(group.index);
+      if (group) {
+        protectedIndexes.add(group.index);
+        mandatoryIndexes.add(group.index);
+      }
     }
+    // A count-based recent window is a preference, not a second hard minimum:
+    // eight ordinary file writes can exceed the entire model context. Keep the
+    // current exchange and user anchors mandatory; older complete exchanges
+    // remain immutable in the session transcript and may leave this request.
+    if (recentGroups > 0 && groups.length > 0) mandatoryIndexes.add(groups.length - 1);
 
     const rawMessages = attachRequestOnlyContext([
       system,
@@ -503,7 +516,7 @@ export class RequestContextBuilder {
         historicalImagesSummarized += summarizeGroupHistoricalImages(group);
       }
     }
-    const protectedGroups = groups.filter((group) =>
+    let protectedGroups = groups.filter((group) =>
       protectedIndexes.has(group.index)
     );
     const invalidProtected = protectedGroups.find((group) => !group.valid);
@@ -535,6 +548,17 @@ export class RequestContextBuilder {
       );
       if (!degraded) break;
       currentImagesSummarized += 1;
+      baseMessages = buildProtectedMessages();
+      protectedTokens = estimateTokens(baseMessages);
+      protectedBytes = estimateSerializedBytes(baseMessages);
+    }
+    for (const group of [...protectedGroups]) {
+      if (protectedTokens <= options.maxTokens && protectedBytes <= maxBytes) break;
+      if (mandatoryIndexes.has(group.index)) continue;
+      // Drop the whole assistant-call/result group, never half a tool protocol.
+      protectedIndexes.delete(group.index);
+      protectedGroups = protectedGroups.filter((item) => item.index !== group.index);
+      historicalImagesSummarized += summarizeGroupHistoricalImages(group);
       baseMessages = buildProtectedMessages();
       protectedTokens = estimateTokens(baseMessages);
       protectedBytes = estimateSerializedBytes(baseMessages);
