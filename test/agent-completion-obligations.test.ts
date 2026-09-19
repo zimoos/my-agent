@@ -416,3 +416,13 @@ test('completion obligations: a later failed or unverified validation invalidate
     assert.deepEqual(audit.missing(), []);
   }
 });
+
+test('completion obligations: masked test exits cannot satisfy validation', () => {
+  for (const command of ['npm test | tail -20', 'npm test; echo done', 'npm test || true', 'node --test test/app.test.js\necho finished']) {
+    const audit = new CompletionObligationAudit('运行有意义的自动测试并修复问题。');
+    audit.recordToolEvidence({ toolName: 'exec__execute_command', args: { command }, succeeded: true, verifiedAction: true });
+    assert.deepEqual(audit.missing(), ['test'], command);
+    audit.recordToolEvidence({ toolName: 'exec__execute_command', args: { command: 'npm test > test-output.log 2>&1' }, succeeded: true, verifiedAction: true });
+    assert.deepEqual(audit.missing(), []);
+  }
+});

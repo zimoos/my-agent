@@ -28,7 +28,7 @@ function asksToRunTests(prompt: string): boolean {
     /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test(?:\b|:)/i,
     /\b(?:run|execute)\s+(?:(?:the|all|full|complete|relevant|unit|integration|e2e)\s+)*(?:tests?|test\s+suite)\b/i,
     /\btest\s+(?:it|this|the\s+(?:app|application|game|feature|project|change|fix))\b/i,
-    /(?:请|需要|必须|务必|然后|最后|同时|并且|还要)?\s*(?:运行|执行|跑|做)(?:一下|下)?(?:完整|全部|全量|相关|单元|集成|端到端|e2e)?\s*测试/i,
+    /(?:请|需要|必须|务必|然后|最后|同时|并且|还要)?\s*(?:运行|执行|跑|做)(?:一下|下)?(?:(?:有意义的|完整|全部|全量|相关|自动|自动化|单元|集成|端到端|e2e)\s*)*测试/i,
     /(?:请|需要|必须|务必|然后|最后|同时|并且|还要)\s*(?:进行)?\s*测试/i,
   ].some((pattern) => pattern.test(prompt));
 }
@@ -106,6 +106,13 @@ function isExecuteCommand(toolName: string): boolean {
   return /(?:^|__)execute_command$/i.test(toolName);
 }
 
+/** An exit receipt for a pipeline or an unconditional later command does not
+ * establish the validator's exit status. Ask for a direct validation command.
+ */
+function preservesValidationExit(command: string): boolean {
+  return !/[|;`\n\r$]/.test(command);
+}
+
 export function isSemanticTestCommand(command: string): boolean {
   return [
     /(?:^|[;&|]\s*)(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test(?:\b|:)/i,
@@ -167,7 +174,7 @@ export class CompletionObligationAudit {
       ...(isSemanticTestCommand(command) ? ['test' as const] : []),
       ...(isBrowserVerificationCommand(command) ? ['browser' as const] : []),
     ]) {
-      if (evidence.succeeded && evidence.verifiedAction) this.completed.add(kind);
+      if (evidence.succeeded && evidence.verifiedAction && preservesValidationExit(command)) this.completed.add(kind);
       else this.completed.delete(kind);
     }
   }
@@ -228,6 +235,7 @@ export class CompletionObligationAudit {
       unread,
       '请现在直接调用工具补齐验证。测试必须由成功的测试命令证明；浏览器验证必须由真实浏览器自动化证明；完整读取必须由同一文件 hash 上从 1:0 连续到 EOF 的 read_file receipt 证明。',
       'exec cat/sed/head/tail、web_fetch/HTTP 200、只写验证脚本、以及文字自述都不算对应完成证据。',
+      '验证请使用直接前台命令并保留原始退出状态；管道、无条件后续命令或忽略失败的复合命令不证明测试通过。',
     ].filter(Boolean).join('\n');
   }
 
