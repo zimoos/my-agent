@@ -359,12 +359,12 @@ for (const action of realActionCases) {
   });
 }
 
-test('action task: same execute_command retry clears earlier missing evidence when only timeout changes', async () => {
+test('action task: same execute_command retry clears missing action proof when old process cleanup is known', async () => {
   const command = 'printf semantic-retry-ok';
   const firstArgs = { command, cwd: '/tmp/shared-cwd', timeout: 1000 };
   const retryArgs = { command, cwd: '/tmp/shared-cwd', timeout: 5000 };
   const connection = scriptedMcpConnection('exec-mcp', 'execute_command', [
-    { content: 'execute_command succeeded without structured evidence' },
+    { content: 'execute_command stopped without action evidence', structuredContent: { cleanup: { scope: 'verified' } } },
     {
       content: 'execute_command verified on retry',
       structuredContent: canonicalEvidence('execute_command'),
@@ -519,7 +519,7 @@ for (const scenario of executeCommandLaterFailureCases) {
     const verifiedArgs = { command, cwd: '/tmp/shared-cwd', timeout: 5000 };
     const laterArgs = { command, cwd: '/tmp/shared-cwd', timeout: 9000 };
     const connection = scriptedMcpConnection('exec-mcp', 'execute_command', [
-      { content: 'execute_command first succeeded without structured evidence' },
+      { content: 'execute_command first stopped without action evidence', structuredContent: { cleanup: { scope: 'verified' } } },
       {
         content: 'execute_command verified on recovery',
         structuredContent: canonicalEvidence('execute_command'),

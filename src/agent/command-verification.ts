@@ -155,12 +155,22 @@ function validationWords(words: string[]): string[] | undefined {
   if (normalized[0] === 'node' && normalized.includes('--test')) {
     // Reporting and the runner deadline do not select tests. All other flags,
     // file arguments, name filters, skip filters, and environment remain exact.
-    for (let i = 1; i < normalized.length; i++) {
+    const valueOptions = new Set(['--test-name-pattern', '--test-skip-pattern', '--test-shard', '--test-concurrency', '--test-isolation', '--test-reporter-destination']);
+    const booleanOptions = new Set(['--test-only', '--test-force-exit', '--test-update-snapshots', '--experimental-test-coverage']);
+    for (let i = 2; i < normalized.length; i++) {
+      const value = normalized[i];
+      if (value === '--') break;
+      if (valueOptions.has(value)) {
+        if (normalized[i + 1] === undefined) return undefined;
+        i++;
+        continue;
+      }
+      if ([...valueOptions].some((option) => value.startsWith(`${option}=`)) || booleanOptions.has(value)) continue;
       if (/^--test-reporter=(?:spec|tap|dot|junit|lcov)$/.test(normalized[i]) || /^--test-timeout=\d+$/.test(normalized[i])) normalized.splice(i--, 1);
       else if ((normalized[i] === '--test-reporter' && /^(?:spec|tap|dot|junit|lcov)$/.test(normalized[i + 1] ?? ''))
         || (normalized[i] === '--test-timeout' && /^\d+$/.test(normalized[i + 1] ?? ''))) {
         normalized.splice(i--, 2);
-      }
+      } else break; // Positional/unknown syntax may consume later option-looking values.
     }
   }
   return [...prefix, ...normalized];

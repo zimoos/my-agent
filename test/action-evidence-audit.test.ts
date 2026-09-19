@@ -59,6 +59,10 @@ for (const [failed, successful, failureCwd, successCwd] of [
   ['node --test --test-name-pattern billing test/app.test.js', 'node --test --test-name-pattern login test/app.test.js'],
   ['node --test --test-skip-pattern billing test/app.test.js', 'node --test test/app.test.js'],
   ['node --test --test-reporter=./send-email.js test/app.test.js', 'node --test test/app.test.js'],
+  ['node --test --test-name-pattern --test-reporter=spec test/app.test.js', 'node --test --test-name-pattern --test-reporter=tap test/app.test.js'],
+  ['node --test --test-name-pattern --test-reporter=spec test/app.test.js', 'node --test --test-name-pattern test/app.test.js'],
+  ['node --test -- --test-reporter=spec', 'node --test -- --test-reporter=tap'],
+  ['node --test --unknown-option --test-reporter=spec test/app.test.js', 'node --test --unknown-option --test-reporter=tap test/app.test.js'],
   ['node --test "2"> result.log', 'node --test 2> result.log'],
   ['TEST_DB=production npm test', 'TEST_DB=local npm test'],
   ['npm test', 'npm test', '/workspace/a', '/workspace/b'],
@@ -124,11 +128,48 @@ test('negative search is an observation; unknown hooks, malformed calls and proc
   assert.deepEqual(audit.missing().map((item) => item.toolCallId), ['syntax-error', 'hook', 'timeout']);
 });
 
-test('missing direct action can still be retried exactly, preserving legacy alias and cwd protection', () => {
+test('missing action evidence with known stopped scope can still be retried exactly', () => {
   const audit = new ActionEvidenceAudit();
-  record(audit, 'missing', 'printf proof', 'missing', { cleanup: undefined });
-  record(audit, 'verified', 'printf proof', 'verified', { cleanup: undefined });
+  record(audit, 'missing', 'printf proof', 'missing');
+  record(audit, 'verified', 'printf proof', 'verified');
   assert.deepEqual(audit.missing(), []);
+});
+
+test('unknown external write cannot be erased by a later identical successful command', () => {
+  const audit = new ActionEvidenceAudit();
+  const command = 'curl -X POST https://example.invalid/payments';
+  record(audit, 'unknown-payment', command, 'missing', { cleanup: undefined });
+  record(audit, 'second-payment', command, 'verified');
+  assert.deepEqual(audit.missing().map((item) => item.toolCallId), ['unknown-payment']);
+  assert.equal(audit.recoveryMessage(), undefined);
+});
+
+for (const replacement of ['npm test', 'npm run test']) {
+  test(`another MCP execution source cannot discharge the original via ${replacement}`, () => {
+    const audit = new ActionEvidenceAudit();
+    const receipt = (ok: boolean) => ({ ok, exitCode: ok ? 0 : 1, timedOut: false, signal: null, cleanup: { scope: 'verified' } });
+    audit.record('workspace-a__execute_command', 'original', { command: 'npm test', cwd: '/app' }, {
+      actionEvidence: { key: 'same-executor-key', operation: 'execute_command', status: 'failed' }, structuredContent: receipt(false),
+    });
+    audit.record('workspace-b__execute_command', 'other-source', { command: replacement, cwd: '/app' }, {
+      actionEvidence: { key: 'same-executor-key', operation: 'execute_command', status: 'verified' }, structuredContent: receipt(true),
+    });
+    assert.deepEqual(audit.missing().map((item) => item.toolCallId), ['original']);
+    audit.record('workspace-a__execute_command', 'same-source', { command: replacement, cwd: '/app' }, {
+      actionEvidence: { key: 'different-key-for-semantic-retry', operation: 'execute_command', status: 'verified' }, structuredContent: receipt(true),
+    });
+    assert.deepEqual(audit.missing(), []);
+  });
+}
+
+test('test-prefixed scripts require side-effect review before a retry is suggested', () => {
+  const audit = new ActionEvidenceAudit();
+  record(audit, 'payment-test', 'npm run test:payment', 'failed');
+  const message = audit.recoveryMessage()!;
+  assert.match(message, /inspect the actual scripts, package hooks and effects/);
+  assert.match(message, /termination, not that external side effects were absent/);
+  assert.match(message, /Only after establishing that repetition is safe/);
+  assert.ok(message.indexOf('Before any retry') < message.indexOf('repair the validation'));
 });
 
 test('diagnostic recovery is offered before final failure, but is bounded and not an external-action retry', () => {
