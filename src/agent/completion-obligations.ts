@@ -157,16 +157,19 @@ export class CompletionObligationAudit {
   }
 
   recordToolEvidence(evidence: CompletionToolEvidence): void {
-    if (!evidence.succeeded) return;
-
-    if (isBrowserAutomationTool(evidence.toolName)) {
+    if (evidence.succeeded && isBrowserAutomationTool(evidence.toolName)) {
       this.completed.add('browser');
     }
 
-    if (!isExecuteCommand(evidence.toolName) || !evidence.verifiedAction) return;
+    if (!isExecuteCommand(evidence.toolName)) return;
     const command = commandFromArgs(evidence.args);
-    if (isSemanticTestCommand(command)) this.completed.add('test');
-    if (isBrowserVerificationCommand(command)) this.completed.add('browser');
+    for (const kind of [
+      ...(isSemanticTestCommand(command) ? ['test' as const] : []),
+      ...(isBrowserVerificationCommand(command) ? ['browser' as const] : []),
+    ]) {
+      if (evidence.succeeded && evidence.verifiedAction) this.completed.add(kind);
+      else this.completed.delete(kind);
+    }
   }
 
   setFileReadCoverage(coverage: FileReadCoverage): void {

@@ -402,3 +402,17 @@ test('completion obligations: unrelated partial history does not block named-fil
   });
   assert.deepEqual(audit.missing(), []);
 });
+
+
+test('completion obligations: a later failed or unverified validation invalidates prior success', () => {
+  for (const succeeded of [false, true]) {
+    const audit = new CompletionObligationAudit('Run tests and use a real browser to verify the application.');
+    const args = { command: 'npx playwright test' };
+    audit.recordToolEvidence({ toolName: 'exec__execute_command', args, succeeded: true, verifiedAction: true });
+    assert.deepEqual(audit.missing(), []);
+    audit.recordToolEvidence({ toolName: 'exec__execute_command', args, succeeded, verifiedAction: false });
+    assert.deepEqual(audit.missing(), ['test', 'browser']);
+    audit.recordToolEvidence({ toolName: 'exec__execute_command', args, succeeded: true, verifiedAction: true });
+    assert.deepEqual(audit.missing(), []);
+  }
+});
