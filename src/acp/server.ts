@@ -14,6 +14,7 @@ import { VERSION } from '../version.js';
 
 interface MaAcpSession {
   boot: BootstrapResult;
+  cwd: string;
   pendingPrompt: AbortController | null;
   pendingTool: acp.ToolCall | null;
   failureReason: string | null;
@@ -182,7 +183,7 @@ export class MaAcpAgent implements acp.Agent {
         loadSession: false,
         mcpCapabilities: { http: false, sse: false },
         promptCapabilities: { image: true, embeddedContext: true },
-        sessionCapabilities: { close: {} },
+        sessionCapabilities: { close: {}, ...(this.options.sessionDir ? { resume: {} } : {}) },
       },
     };
   }
@@ -194,24 +195,58 @@ export class MaAcpAgent implements acp.Agent {
   async newSession(params: acp.NewSessionRequest): Promise<acp.NewSessionResponse> {
     if (!isAbsolute(params.cwd)) throw new Error('ACP session cwd must be absolute');
     const cwd = resolve(params.cwd);
-    const boot = await (this.options.bootstrapSession ?? bootstrap)(this.options.configPath, {
+    const boot = await this.bootstrapHostSession(params, cwd);
+    this.registerSession(boot, cwd);
+    return { sessionId: boot.sessionId, configOptions: reasoningConfig('standard') };
+  }
+
+  async resumeSession(params: acp.ResumeSessionRequest): Promise<acp.ResumeSessionResponse> {
+    if (!this.options.sessionDir) throw new Error('Persistent session storage is not configured');
+    if (!isAbsolute(params.cwd)) throw new Error('ACP session cwd must be absolute');
+    if (!/^[A-Za-z0-9_-]{1,160}$/.test(params.sessionId)) throw new Error('Invalid session ID');
+    const cwd = resolve(params.cwd);
+    const existing = this.sessions.get(params.sessionId);
+    if (existing) {
+      if (existing.cwd !== cwd) throw new Error('Session workspace does not match');
+      if (existing.pendingPrompt) throw new Error('Session is already processing a prompt');
+      return { configOptions: reasoningConfig(existing.reasoningDepth) };
+    }
+    const boot = await this.bootstrapHostSession(params, cwd, params.sessionId);
+    if (!boot.resumed || boot.sessionId !== params.sessionId) {
+      await shutdown(boot.connections, boot.agent);
+      throw new Error('Session recovery failed: exact saved session was not restored');
+    }
+    this.registerSession(boot, cwd);
+    return { configOptions: reasoningConfig('standard') };
+  }
+
+  private bootstrapHostSession(
+    params: acp.NewSessionRequest | acp.ResumeSessionRequest,
+    cwd: string,
+    sessionId?: string,
+  ): Promise<BootstrapResult> {
+    return (this.options.bootstrapSession ?? bootstrap)(this.options.configPath, {
       cwd,
-      mcpServers: mcpServersFromAcp(params.mcpServers, cwd),
+      mcpServers: mcpServersFromAcp(params.mcpServers ?? [], cwd),
       systemPrompt: systemPromptFromMeta(params._meta),
       sessionDir: this.options.sessionDir,
+      ...(sessionId ? { resume: sessionId, strictResume: true } : {}),
       confirmationChannel: 'host',
       configMode: 'host-only',
       loadAgentInstructions: false,
       debugLogging: false,
     });
+  }
+
+  private registerSession(boot: BootstrapResult, cwd: string): void {
     this.sessions.set(boot.sessionId, {
       boot,
+      cwd,
       pendingPrompt: null,
       pendingTool: null,
       failureReason: null,
       reasoningDepth: 'standard',
     });
-    return { sessionId: boot.sessionId, configOptions: reasoningConfig('standard') };
   }
 
   async setSessionConfigOption(

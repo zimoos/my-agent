@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -10,6 +10,8 @@ import * as acpRuntime from '@agentclientprotocol/sdk';
 import type * as acp from '@agentclientprotocol/sdk';
 import { MaAcpAgent } from '../src/acp/server.js';
 import type { BootstrapOptions, BootstrapResult } from '../src/index.js';
+import { prepareBootstrap } from '../src/index.js';
+import { createSessionStore } from '../src/session/store.js';
 import type {
   Agent,
   AgentEvent,
@@ -85,6 +87,71 @@ function recordingConnection(updates: acp.SessionNotification[]): acp.AgentSideC
     requestPermission: async () => ({ outcome: { outcome: 'cancelled' } }),
   } as acp.AgentSideConnection;
 }
+
+test('ACP recovery restores the exact persisted session with fresh host tools after restart', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ma-acp-resume-'));
+  const configPath = join(root, 'config.json');
+  const sessionDir = join(root, 'sessions');
+  writeFileSync(configPath, JSON.stringify({ model: { baseURL: 'http://127.0.0.1:1/v1', model: 'test', apiKey: 'test' }, mcpServers: {} }));
+  const preparations: ReturnType<typeof prepareBootstrap>[] = [];
+  const bootstrapSession = async (path?: string, options?: BootstrapOptions): Promise<BootstrapResult> => {
+    const prepared = prepareBootstrap(path, options);
+    preparations.push(prepared);
+    return { ...bootstrapResult(fakeAgent([]), prepared.sessionId), resumed: prepared.resumed };
+  };
+  const options = { configPath, sessionDir, bootstrapSession };
+  const first = new MaAcpAgent(recordingConnection([]), options);
+  let restarted: MaAcpAgent | undefined;
+  try {
+    const created = await first.newSession({ cwd: root, mcpServers: [] });
+    const store = createSessionStore(sessionDir);
+    const history = [
+      { role: 'user', content: 'Build the customer workbench. Preserve its acceptance requirements.' },
+      { role: 'assistant', content: 'The database and customer forms are implemented; browser verification remains.' },
+    ];
+    for (const message of history) store.append(created.sessionId, message);
+    await first.shutdown();
+    const updates: acp.SessionNotification[] = [];
+    restarted = new MaAcpAgent(recordingConnection(updates), options);
+    assert.ok((await restarted.initialize({ protocolVersion: 1 })).agentCapabilities?.sessionCapabilities?.resume);
+    await restarted.resumeSession({ sessionId: created.sessionId, cwd: root, mcpServers: [{ name: 'current-host', command: process.execPath, args: ['bridge.js'], env: [{name: 'GRANT', value: 'fresh-host-grant'}] }], _meta: {mteam: {systemPrompt: 'Current host policy'}} });
+    assert.equal(preparations.at(-1)?.sessionId, created.sessionId);
+    assert.equal(preparations.at(-1)?.resumed, true);
+    assert.deepEqual(preparations.at(-1)?.resumeMessages, history);
+    assert.equal(preparations.at(-1)?.config.systemPrompt, 'Current host policy');
+    assert.deepEqual(Object.keys(preparations.at(-1)!.config.mcpServers), ['current-host']);
+    assert.equal(preparations.at(-1)?.config.mcpServers['current-host'].env?.GRANT, 'fresh-host-grant');
+    assert.equal(updates.length, 0, 'resume must not replay old text as a new answer');
+    assert.equal(store.list().length, 1, 'recovery must not create a replacement session');
+    await assert.rejects(restarted.resumeSession({sessionId:created.sessionId,cwd:join(root,'different'),mcpServers:[]}),/workspace/);
+  } finally {
+    await first.shutdown();
+    await restarted?.shutdown();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('strict host recovery preserves empty sessions and rejects absent, corrupt or foreign history', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ma-strict-resume-'));
+  const configPath = join(root, 'config.json');
+  const sessionDir = join(root, 'sessions');
+  writeFileSync(configPath, JSON.stringify({ model: { baseURL: 'http://127.0.0.1:1/v1', model: 'test', apiKey: 'test' }, mcpServers: {} }));
+  const options: BootstrapOptions = {cwd:root,sessionDir,configMode:'host-only'};
+  try {
+    const first=prepareBootstrap(configPath,options);
+    const restore=(id:string,cwd=root)=>prepareBootstrap(configPath,{...options,cwd,resume:id,strictResume:true});
+    assert.equal(restore(first.sessionId).sessionId,first.sessionId);
+    assert.equal(restore(first.sessionId).resumed,true);
+    assert.throws(()=>restore('../foreign'),/valid session ID/);
+    assert.throws(()=>restore('missing'),/metadata/);
+    assert.throws(()=>restore(first.sessionId,join(root,'different')),/workspace/);
+    writeFileSync(join(sessionDir,first.sessionId+'.jsonl'),'{corrupt');
+    assert.throws(()=>restore(first.sessionId),/corrupt/);
+    rmSync(join(sessionDir,first.sessionId+'.jsonl'));
+    assert.throws(()=>restore(first.sessionId),/transcript is unavailable/);
+    assert.equal(first.sessionStore.list().length,1);
+  } finally { rmSync(root,{recursive:true,force:true}); }
+});
 
 test('MA ACP exposes a host-owned session, forwards events, permissions, cancellation, and close', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'ma-acp-'));

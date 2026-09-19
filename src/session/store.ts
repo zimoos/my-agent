@@ -17,7 +17,7 @@ export interface SessionStore {
   append(sessionId: string, msg: any): void;
   truncate(sessionId: string, keepMessages: number): void;
   updateProviderState(sessionId: string, providerState: ProviderSessionState): void;
-  load(sessionId: string): any[];
+  load(sessionId: string, options?: { strict?: boolean }): any[];
   list(limit?: number): SessionMeta[];
   latest(): string | null;
   prune(keep?: number): number;
@@ -119,9 +119,12 @@ export function createSessionStore(sessionDir?: string): SessionStore {
     writeMeta(metaPath(sessionId), meta);
   }
 
-  function load(sessionId: string): any[] {
+  function load(sessionId: string, options: { strict?: boolean } = {}): any[] {
     const p = jsonlPath(sessionId);
-    if (!fs.existsSync(p)) return [];
+    if (!fs.existsSync(p)) {
+      if (options.strict) throw new Error('Session recovery failed: saved transcript is unavailable');
+      return [];
+    }
     const raw = fs.readFileSync(p, 'utf-8');
     const out: any[] = [];
     for (const line of raw.split('\n')) {
@@ -129,6 +132,7 @@ export function createSessionStore(sessionDir?: string): SessionStore {
       try {
         out.push(JSON.parse(line));
       } catch {
+        if (options.strict) throw new Error('Session recovery failed: saved transcript is corrupt');
         /* skip corrupt line */
       }
     }
