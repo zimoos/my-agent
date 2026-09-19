@@ -2,10 +2,13 @@ import { loadConfigDetailed, loadHostConfigDetailed, resolveConfigPath } from '.
 import { connectMcpServer } from './mcp/client.js';
 import { createSessionStore } from './session/store.js';
 import { resolveModelCapabilities } from './provider/capabilities.js';
+import { resolve } from 'node:path';
 import type { AgentConfig, McpConnection, Agent, McpServerConfig } from './mcp/types.js';
 
 export interface BootstrapOptions {
   resume?: string | true;
+  /** Host recovery must retain the exact session or fail; never silently start over. */
+  strictResume?: boolean;
   cwd?: string;
   mcpServers?: Record<string, McpServerConfig>;
   systemPrompt?: string;
@@ -71,9 +74,19 @@ export function prepareBootstrap(
 
   if (opts.resume !== undefined) {
     const target = typeof opts.resume === 'string' ? opts.resume : sessionStore.latest();
+    if (opts.strictResume) {
+      if (typeof opts.resume !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(opts.resume)) {
+        throw new Error('An explicit valid session ID is required for host recovery');
+      }
+      const meta = sessionStore.list().find(item => item.id === target);
+      if (!meta) throw new Error('Session recovery failed: saved session metadata is unavailable');
+      if (resolve(meta.cwd) !== resolve(cwd)) {
+        throw new Error('Session recovery failed: workspace does not match saved session');
+      }
+    }
     if (target) {
-      const msgs = sessionStore.load(target);
-      if (msgs.length > 0) {
+      const msgs = sessionStore.load(target, { strict: opts.strictResume });
+      if (msgs.length > 0 || opts.strictResume) {
         resumeMessages = msgs;
         sessionId = target;
         resumed = true;
