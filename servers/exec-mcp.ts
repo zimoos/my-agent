@@ -21,6 +21,7 @@ type SpawnedProcess = ChildProcessByStdio<null, Readable, Readable>;
 
 interface JsonRpcRequest { jsonrpc: '2.0'; id?: number | string; method: string; params?: any; }
 interface JsonRpcResponse { jsonrpc: '2.0'; id: number | string; result?: any; error?: { code: number; message: string; data?: any }; }
+const activeRequests = new Map<number | string, { controller: AbortController; done: Promise<void> }>();
 
 const EXECUTE_COMMAND_TOOL = {
   name: 'execute_command',
@@ -315,6 +316,7 @@ interface CommandOutcome {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   timedOut: boolean;
+  cancelled?: boolean;
   stdout: string;
   stderr: string;
   output: string;
@@ -378,7 +380,7 @@ function spawnCommand(command: string, cwd: string, scope: string): SpawnedProce
   });
 }
 
-function runCommand(args: ExecArgs): Promise<CommandOutcome> {
+function runCommand(args: ExecArgs, abortSignal?: AbortSignal): Promise<CommandOutcome> {
   return new Promise((resolve) => {
     const timeout = typeof args.timeout === 'number' && args.timeout > 0 ? args.timeout : DEFAULT_TIMEOUT_MS;
     const cwd = args.cwd || process.cwd();
@@ -387,6 +389,7 @@ function runCommand(args: ExecArgs): Promise<CommandOutcome> {
     let combined = '';
     let truncated = false;
     let timedOut = false;
+    let cancelled = false;
     let forced = false;
     let settled = false;
     let termination: Promise<boolean> | null = null;
@@ -428,15 +431,25 @@ function runCommand(args: ExecArgs): Promise<CommandOutcome> {
 
     const termTimer = setTimeout(() => {
       timedOut = true;
-      termination = terminateGroup(pid, proc).then((wasForced) => {
+      termination ??= terminateGroup(pid, proc).then((wasForced) => {
         forced = wasForced;
         return wasForced;
       });
     }, timeout);
+    const cancel = () => {
+      cancelled = true;
+      termination ??= terminateGroup(pid, proc).then((wasForced) => {
+        forced = wasForced;
+        return wasForced;
+      });
+    };
+    abortSignal?.addEventListener('abort', cancel, { once: true });
+    if (abortSignal?.aborted) cancel();
 
     const settle = async (code: number | null, signal: NodeJS.Signals | null, spawnError?: Error) => {
       if (settled) return;
       settled = true;
+      abortSignal?.removeEventListener('abort', cancel);
       clearTimeout(termTimer);
       if (termination) await termination;
       const scopeCleanup = await terminateScopedProcesses(scope, pid, proc);
@@ -448,6 +461,8 @@ function runCommand(args: ExecArgs): Promise<CommandOutcome> {
       } else if (!scopeCleanup.scopeVerified) {
         const message = `命令执行完成，但进程清理未验证: ${scopeCleanup.error ?? 'scope enumeration failed'}`;
         legacyText = finalCombined.length > 0 ? `${message}\n\n${finalCombined}` : message;
+      } else if (cancelled) {
+        legacyText = `命令已取消\n${finalCombined}`;
       } else if (timedOut) {
         const message = forced
           ? `命令被强制终止（超时 ${timeout}ms 后未响应 SIGTERM）`
@@ -463,10 +478,11 @@ function runCommand(args: ExecArgs): Promise<CommandOutcome> {
       }
       const text = compressOutput(args.command, legacyText);
       resolve({
-        ok: !spawnError && scopeCleanup.scopeVerified && !timedOut && code === 0 && signal === null,
+        ok: !spawnError && scopeCleanup.scopeVerified && !timedOut && !cancelled && code === 0 && signal === null,
         exitCode: code,
         signal,
         timedOut,
+        cancelled,
         stdout,
         stderr,
         output: text,
@@ -643,7 +659,7 @@ function waitForReadiness(
   });
 }
 
-async function startProcess(args: any): Promise<Record<string, unknown>> {
+async function startProcess(args: any, abortSignal?: AbortSignal): Promise<Record<string, unknown>> {
   if (!args.command || typeof args.command !== 'string' || args.command.trim().length === 0) {
     return errorResult('请提供要执行的命令，例如: start_process(command: "npm run dev")');
   }
@@ -724,7 +740,16 @@ async function startProcess(args: any): Promise<Record<string, unknown>> {
     const payload = { ok: true, ...processPayload(record) };
     return toolResult(withEvidence(payload, 'start_process'));
   }
-  const readiness = await waitForReadiness(record, pattern, readyTimeout);
+  const cancel = () => { void stopManagedProcess(record).catch(error => logErr('cancel cleanup failed:', error)); };
+  abortSignal?.addEventListener('abort', cancel, { once: true });
+  if (abortSignal?.aborted) cancel();
+  let readiness: Awaited<ReturnType<typeof waitForReadiness>>;
+  try { readiness = await waitForReadiness(record, pattern, readyTimeout); }
+  finally { abortSignal?.removeEventListener('abort', cancel); }
+  if (abortSignal?.aborted) {
+    const cleanup = await stopManagedProcess(record);
+    return errorResult('process start cancelled', { ...processPayload(record), ...scopeCleanupMetadata(cleanup) });
+  }
   if (readiness.ready) {
     const payload = { ok: true, ...processPayload(record) };
     return toolResult(withEvidence(payload, 'start_process'));
@@ -789,7 +814,8 @@ async function stopProcess(args: any): Promise<Record<string, unknown>> {
   );
 }
 
-async function handleToolsCall(params: any): Promise<any> {
+async function handleToolsCall(params: any, signal?: AbortSignal): Promise<any> {
+  if (signal?.aborted) return errorResult('request cancelled');
   const name = params?.name;
   const args = params?.arguments || {};
   switch (name) {
@@ -801,7 +827,7 @@ async function handleToolsCall(params: any): Promise<any> {
         command: args.command,
         cwd: typeof args.cwd === 'string' ? args.cwd : undefined,
         timeout: typeof args.timeout === 'number' ? args.timeout : undefined,
-      });
+      }, signal);
       const payload = outcome as unknown as Record<string, unknown>;
       return toolResult(
         outcome.ok ? withEvidence(payload, 'execute_command') : payload,
@@ -809,7 +835,7 @@ async function handleToolsCall(params: any): Promise<any> {
         outcome.text,
       );
     }
-    case 'start_process': return startProcess(args);
+    case 'start_process': return startProcess(args, signal);
     case 'get_process': return getProcess(args);
     case 'read_process_logs': return readProcessLogs(args);
     case 'stop_process': return stopProcess(args);
@@ -819,6 +845,13 @@ async function handleToolsCall(params: any): Promise<any> {
 
 async function handleRequest(req: JsonRpcRequest): Promise<void> {
   if (req.method === 'notifications/initialized') return;
+  if (req.method === 'notifications/cancelled') {
+    const requestId = req.params?.requestId;
+    if (typeof requestId === 'string' || typeof requestId === 'number') {
+      activeRequests.get(requestId)?.controller.abort();
+    }
+    return;
+  }
   if (req.id === undefined) return;
   try {
     switch (req.method) {
@@ -831,8 +864,17 @@ async function handleRequest(req: JsonRpcRequest): Promise<void> {
         send({ jsonrpc: '2.0', id: req.id, result: { tools: TOOLS } });
         return;
       case 'tools/call': {
-        const result = await handleToolsCall(req.params);
-        send({ jsonrpc: '2.0', id: req.id, result });
+        const controller = new AbortController();
+        let finish!: () => void;
+        const done = new Promise<void>(resolve => { finish = resolve; });
+        activeRequests.set(req.id, { controller, done });
+        try {
+          const result = await handleToolsCall(req.params, controller.signal);
+          if (!controller.signal.aborted) send({ jsonrpc: '2.0', id: req.id, result });
+        } finally {
+          activeRequests.delete(req.id);
+          finish();
+        }
         return;
       }
       default:
@@ -858,6 +900,9 @@ function main(): void {
 
   const shutdown = (exitCode: number): Promise<never> => {
     shutdownPromise ??= (async () => {
+      const active = [...activeRequests.values()];
+      for (const request of active) request.controller.abort();
+      await Promise.all(active.map(request => request.done));
       await cleanupManagedProcesses();
       process.exit(exitCode);
     })();
@@ -878,7 +923,11 @@ function main(): void {
       .catch((e) => logErr('unhandled error:', e instanceof Error ? e.message : String(e)))
       .finally(() => { pending--; maybeExit(); });
   });
-  rl.on('close', () => { stdinClosed = true; maybeExit(); });
+  rl.on('close', () => {
+    stdinClosed = true;
+    for (const request of activeRequests.values()) request.controller.abort();
+    maybeExit();
+  });
   process.on('SIGTERM', () => { void shutdown(0); });
   process.on('SIGINT', () => { void shutdown(0); });
   process.on('exit', () => {

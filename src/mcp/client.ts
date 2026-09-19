@@ -34,6 +34,8 @@ interface JsonRpcResponse {
 }
 
 const REQUEST_TIMEOUT_MS = 30_000;
+const MAX_EXECUTION_TIMEOUT_MS = 60 * 60 * 1_000;
+const EXECUTION_CLEANUP_GRACE_MS = 15_000;
 const PROTOCOL_VERSION = '2024-11-05';
 const MAX_TOOL_IMAGE_BASE64_CHARS = 24 * 1024 * 1024;
 const SAFE_IMAGE_MIME = /^image\/(?:png|jpeg|webp)$/;
@@ -212,7 +214,8 @@ export class McpClient implements McpConnection {
     method: string,
     params?: any,
     signal?: AbortSignal,
-    onProgress?: (event: McpProgressEvent) => void
+    onProgress?: (event: McpProgressEvent) => void,
+    timeoutMs = this.requestTimeoutMs,
   ): Promise<any> {
     const id = this.nextId++;
     const progressToken = onProgress ? `${this.name}:${method}:${id}` : undefined;
@@ -230,11 +233,12 @@ export class McpClient implements McpConnection {
       }
 
       const timer = setTimeout(() => {
+        this.cancelRequest(id, method, 'Request deadline exceeded');
         this.pending.delete(id);
         if (progressToken !== undefined) this.progressHandlers.delete(progressToken);
         if (signal && onAbort) signal.removeEventListener('abort', onAbort);
-        reject(new Error(`MCP '${this.name}' ${method} timed out after ${this.requestTimeoutMs}ms`));
-      }, this.requestTimeoutMs);
+        reject(new Error(`MCP '${this.name}' ${method} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
 
       const wrappedResolve = (value: any) => {
         if (progressToken !== undefined) this.progressHandlers.delete(progressToken);
@@ -254,6 +258,7 @@ export class McpClient implements McpConnection {
           signalLimitApplied.add(signal);
         }
         onAbort = () => {
+          this.cancelRequest(id, method, 'Aborted by caller');
           clearTimeout(timer);
           this.pending.delete(id);
           if (progressToken !== undefined) this.progressHandlers.delete(progressToken);
@@ -282,6 +287,12 @@ export class McpClient implements McpConnection {
         reject(err as Error);
       }
     });
+  }
+
+  private cancelRequest(requestId: number, method: string, reason: string): void {
+    if (method === 'initialize') return;
+    try { this.notify('notifications/cancelled', { requestId, reason }); }
+    catch { /* Preserve the original abort/timeout when the transport is gone. */ }
   }
 
   notify(method: string, params?: any): void {
@@ -322,7 +333,8 @@ export class McpClient implements McpConnection {
       'tools/call',
       { name: toolName, arguments: args ?? {} },
       signal,
-      onProgress
+      onProgress,
+      executionRequestTimeout(toolName, args ?? {}, this.requestTimeoutMs),
     );
     const contentArr = Array.isArray(result?.content) ? result.content : [];
     const contentBlocks = contentArr
@@ -381,7 +393,7 @@ export class McpClient implements McpConnection {
             /* ignore */
           }
           finish();
-        }, 2000);
+        }, EXECUTION_CLEANUP_GRACE_MS);
         this.process.once('exit', finish);
         try {
           this.process.kill('SIGTERM');
@@ -392,6 +404,17 @@ export class McpClient implements McpConnection {
       });
     }
   }
+}
+
+function executionRequestTimeout(name: string, args: Record<string, unknown>, fallback: number): number {
+  const field = name === 'execute_command' ? 'timeout' : name === 'start_process' ? 'readyTimeout' : null;
+  if (!field) return fallback;
+  const requested = args[field] ?? REQUEST_TIMEOUT_MS;
+  if (typeof requested !== 'number' || !Number.isSafeInteger(requested)
+    || requested <= 0 || requested > MAX_EXECUTION_TIMEOUT_MS) {
+    throw new Error(`${name} ${field} must be an integer from 1 to ${MAX_EXECUTION_TIMEOUT_MS}ms`);
+  }
+  return Math.max(fallback, requested + EXECUTION_CLEANUP_GRACE_MS);
 }
 
 export async function connectMcpServer(
