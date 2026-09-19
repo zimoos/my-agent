@@ -7,7 +7,8 @@ import { McpClient } from '../src/mcp/client.js';
 function fixture(timeout = 25) {
   const proc = Object.assign(new EventEmitter(), {
     stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
-    exitCode: null, signalCode: null, kill: () => true,
+    exitCode: null as number | null, signalCode: null,
+    kill: () => { proc.exitCode=0; proc.emit('exit',0,null); return true; },
   });
   const sent: any[] = [];
   proc.stdin.on('data', (bytes: Buffer) => {
@@ -68,4 +69,42 @@ test('invalid or unbounded execution deadlines fail before sending a command', a
     await assert.rejects(client.call('execute_command',{command:'build',timeout}),/must be an integer/);
   }
   assert.equal(sent.length,0);
+});
+
+test('a negotiated execution cancellation waits for its exact cleanup receipt', async () => {
+  const {client,sent,reply}=fixture(1000);
+  const init=client.initialize();
+  reply(sent[0].id,{capabilities:{experimental:{'my-agent/cancellation-drain':{version:1}}}});
+  await init;
+  const controller=new AbortController();
+  let finished=false;
+  const pending=client.call('execute_command',{command:'long build'},controller.signal);
+  const outcome=pending.catch(error=>{finished=true;return error;});
+  const request=sent.find(item=>item.method==='tools/call');
+  controller.abort();
+  const drain=sent.find(item=>item.method==='my-agent/wait-cancelled');
+  assert.equal(drain.params.requestId,request.id);
+  // An ordinary late response does not prove that cancellation has drained.
+  reply(request.id,{content:[{type:'text',text:'late result'}]});
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(finished,false);
+  reply(drain.id,{requestId:request.id,settled:true});
+  assert.equal((await outcome).name,'AbortError');
+});
+
+test('a wrong or unverified cleanup receipt retires the connection instead of declaring it ready', async () => {
+  for(const receipt of [{requestId:999,settled:true},{requestId:3,settled:false}]) {
+    const {client,sent,reply}=fixture(1000);
+    const init=client.initialize();
+    reply(sent[0].id,{capabilities:{experimental:{'my-agent/cancellation-drain':{version:1}}}});
+    await init;
+    const controller=new AbortController();
+    const pending=client.call('execute_command',{command:'long build'},controller.signal);
+    const outcome=assert.rejects(pending,/cleanup could not be verified; connection retired/);
+    controller.abort();
+    const drain=sent.find(item=>item.method==='my-agent/wait-cancelled');
+    reply(drain.id,{...receipt,...(!receipt.settled ? {requestId:drain.params.requestId} : {})});
+    await outcome;
+    await assert.rejects(client.call('lookup',{}),/stdin is closed/);
+  }
 });

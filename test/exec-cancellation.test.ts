@@ -52,6 +52,7 @@ setInterval(()=>{},1000);
     if (mode === 'close') await client.close();
     else controller.abort();
     await stopped;
+    assert.ok(pids.every(pid=>!alive(pid)), 'cancellation must not return while the old execution scope can still write');
     await until(()=>pids.every(pid=>!alive(pid)),'cancel left an executing child or detached descendant');
     assert.equal(existsSync(lateFile),false);
     if (mode !== 'close') {

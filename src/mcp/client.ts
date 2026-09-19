@@ -110,6 +110,7 @@ export class McpClient implements McpConnection {
   private buffer = '';
   private closed = false;
   private requestTimeoutMs: number;
+  private supportsCancellationDrain = false;
 
   constructor(name: string, proc: ChildProcess, requestTimeoutMs = REQUEST_TIMEOUT_MS) {
     this.name = name;
@@ -232,12 +233,16 @@ export class McpClient implements McpConnection {
         return;
       }
 
-      const timer = setTimeout(() => {
-        this.cancelRequest(id, method, 'Request deadline exceeded');
+      const rejectCancelled = (error: Error) => {
+        this.cancelRequest(id, method, error.name === 'AbortError' ? 'Aborted by caller' : 'Request deadline exceeded');
+        clearTimeout(timer);
         this.pending.delete(id);
         if (progressToken !== undefined) this.progressHandlers.delete(progressToken);
         if (signal && onAbort) signal.removeEventListener('abort', onAbort);
-        reject(new Error(`MCP '${this.name}' ${method} timed out after ${timeoutMs}ms`));
+        void this.drainCancellation(id, method).then(() => reject(error), reject);
+      };
+      const timer = setTimeout(() => {
+        rejectCancelled(new Error(`MCP '${this.name}' ${method} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
 
       const wrappedResolve = (value: any) => {
@@ -258,11 +263,7 @@ export class McpClient implements McpConnection {
           signalLimitApplied.add(signal);
         }
         onAbort = () => {
-          this.cancelRequest(id, method, 'Aborted by caller');
-          clearTimeout(timer);
-          this.pending.delete(id);
-          if (progressToken !== undefined) this.progressHandlers.delete(progressToken);
-          reject(new DOMException('aborted', 'AbortError'));
+          rejectCancelled(new DOMException('aborted', 'AbortError'));
         };
         signal.addEventListener('abort', onAbort, { once: true });
       }
@@ -295,16 +296,30 @@ export class McpClient implements McpConnection {
     catch { /* Preserve the original abort/timeout when the transport is gone. */ }
   }
 
+  private async drainCancellation(requestId: number, method: string): Promise<void> {
+    if (method !== 'tools/call' || !this.supportsCancellationDrain) return;
+    try {
+      const result = await this.request('my-agent/wait-cancelled', { requestId }, undefined, undefined, EXECUTION_CLEANUP_GRACE_MS);
+      if (result?.requestId !== requestId || result?.settled !== true) {
+        throw new Error('invalid cancellation settlement');
+      }
+    } catch {
+      await this.close();
+      throw new Error(`MCP '${this.name}' cancellation cleanup could not be verified; connection retired`);
+    }
+  }
+
   notify(method: string, params?: any): void {
     this.send({ jsonrpc: '2.0', method, params });
   }
 
   async initialize(): Promise<void> {
-    await this.request('initialize', {
+    const result = await this.request('initialize', {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: { tools: {} },
       clientInfo: { name: 'my-agent', version: VERSION },
     });
+    this.supportsCancellationDrain = result?.capabilities?.experimental?.['my-agent/cancellation-drain']?.version === 1;
     try {
       this.notify('notifications/initialized');
     } catch {

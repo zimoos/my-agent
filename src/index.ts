@@ -214,13 +214,9 @@ export async function shutdown(connections: McpConnection[], agent?: Agent): Pro
   } catch {
     /* ignore */
   }
-  for (const conn of connections) {
-    try {
-      await conn.close();
-    } catch {
-      /* ignore */
-    }
-  }
+  // Independent MCP process scopes must drain together. Serial cleanup can
+  // exceed the host's grace window and strand later connections at SIGKILL.
+  await Promise.allSettled(connections.map(conn => conn.close()));
 }
 
 export { loadConfig, loadConfigDetailed, resolveConfigPath } from './config.js';
