@@ -22,6 +22,7 @@ type SpawnedProcess = ChildProcessByStdio<null, Readable, Readable>;
 interface JsonRpcRequest { jsonrpc: '2.0'; id?: number | string; method: string; params?: any; }
 interface JsonRpcResponse { jsonrpc: '2.0'; id: number | string; result?: any; error?: { code: number; message: string; data?: any }; }
 const activeRequests = new Map<number | string, { controller: AbortController; done: Promise<void> }>();
+const settledRequests = new Map<number | string, boolean>();
 
 const EXECUTE_COMMAND_TOOL = {
   name: 'execute_command',
@@ -857,9 +858,30 @@ async function handleRequest(req: JsonRpcRequest): Promise<void> {
     switch (req.method) {
       case 'initialize':
         send({ jsonrpc: '2.0', id: req.id, result: {
-          protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: SERVER_INFO,
+          protocolVersion: PROTOCOL_VERSION,
+          capabilities: { tools: {}, experimental: { 'my-agent/cancellation-drain': { version: 1 } } },
+          serverInfo: SERVER_INFO,
         }});
         return;
+      case 'my-agent/wait-cancelled': {
+        const requestId = req.params?.requestId;
+        if (typeof requestId !== 'string' && typeof requestId !== 'number') {
+          sendError(req.id, -32602, 'requestId is required');
+          return;
+        }
+        const active = activeRequests.get(requestId);
+        if (active && !active.controller.signal.aborted) {
+          sendError(req.id, -32602, 'request has not been cancelled');
+          return;
+        }
+        await active?.done;
+        if (!settledRequests.has(requestId)) {
+          sendError(req.id, -32602, 'request settlement is unavailable');
+          return;
+        }
+        send({ jsonrpc: '2.0', id: req.id, result: { requestId, settled: settledRequests.get(requestId) } });
+        return;
+      }
       case 'tools/list':
         send({ jsonrpc: '2.0', id: req.id, result: { tools: TOOLS } });
         return;
@@ -868,10 +890,15 @@ async function handleRequest(req: JsonRpcRequest): Promise<void> {
         let finish!: () => void;
         const done = new Promise<void>(resolve => { finish = resolve; });
         activeRequests.set(req.id, { controller, done });
+        let settled = false;
         try {
           const result = await handleToolsCall(req.params, controller.signal);
+          settled = !['execute_command', 'start_process', 'stop_process'].includes(req.params?.name)
+            || result?.structuredContent?.cleanup?.scope === 'verified';
           if (!controller.signal.aborted) send({ jsonrpc: '2.0', id: req.id, result });
         } finally {
+          settledRequests.set(req.id, settled);
+          if (settledRequests.size > 128) settledRequests.delete(settledRequests.keys().next().value!);
           activeRequests.delete(req.id);
           finish();
         }
