@@ -224,28 +224,20 @@ test('ToolCallRepair: reports truncation unrecoverable', () => {
   assert.equal(r.report.truncationsUnrecoverable, 1);
 });
 
-test('ToolCallRepair: rewrites simple ls exec calls to list_directory', () => {
-  const repair = new ToolCallRepair({
-    allowedToolNames: new Set(['exec__execute_command', 'fs__list_directory']),
-  });
-  const r = repair.process([
-    tc('exec__execute_command', JSON.stringify({ command: 'ls -la src' })),
-  ], '', '', { userText: '列一下 src 目录' });
-  assert.equal(r.calls[0].function.name, 'fs__list_directory');
-  assert.deepEqual(JSON.parse(r.calls[0].function.arguments), { path: 'src' });
-});
-
-test('ToolCallRepair: rewrites ls command even when model adds shell fallback', () => {
-  const repair = new ToolCallRepair({
-    allowedToolNames: new Set(['exec__execute_command', 'fs__list_directory']),
-  });
-  const r = repair.process([
-    tc('exec__execute_command', JSON.stringify({
-      command: 'ls -la src/ 2>/dev/null || echo "src 目录不存在"',
-    })),
-  ], '', '', { userText: 'src 目录下有几个文件？' });
-  assert.equal(r.calls[0].function.name, 'fs__list_directory');
-  assert.deepEqual(JSON.parse(r.calls[0].function.arguments), { path: 'src/' });
+for (const command of [
+  'ls -la src',
+  'ls -la src/ 2>/dev/null || echo "src 目录不存在"',
+  'grep -n "foo|bar" public/app.js | head -40',
+  'grep -A 6 -n "newCustomer" public/app.js',
+  'rg -F "foo.*bar" public/*.js',
+  'cat source.txt > delivered.txt && wc -c delivered.txt',
+  'ls src && touch completion-marker',
+]) test(`ToolCallRepair: preserves complete shell semantics for ${command}`, () => {
+  const repair = new ToolCallRepair({ allowedToolNames: new Set(['exec__execute_command', 'fs__list_directory', 'fs__read_file', 'grep__grep']) });
+  const call = tc('exec__execute_command', JSON.stringify({ command, cwd: '/tmp/mission-workspace', timeout: 90000 }));
+  const result = repair.process([call], '');
+  assert.deepEqual(result.calls, [call]);
+  assert.deepEqual(result.report.notes, []);
 });
 
 test('ToolCallRepair: preserves ls when user explicitly asks for ls command', () => {
@@ -280,15 +272,15 @@ test('ToolCallRepair: preserves exact backticked shell command with ls flags', (
   assert.equal(JSON.parse(r.calls[0].function.arguments).command, command);
 });
 
-test('ToolCallRepair: rewrites cat exec calls to read_file', () => {
+test('ToolCallRepair: keeps cat execution when a dedicated read tool also exists', () => {
   const repair = new ToolCallRepair({
     allowedToolNames: new Set(['exec__execute_command', 'fs__read_file']),
   });
   const r = repair.process([
     tc('exec__execute_command', JSON.stringify({ command: 'cat src/index.js' })),
   ], '', '', { userText: '读取 src/index.js' });
-  assert.equal(r.calls[0].function.name, 'fs__read_file');
-  assert.deepEqual(JSON.parse(r.calls[0].function.arguments), { path: 'src/index.js' });
+  assert.equal(r.calls[0].function.name, 'exec__execute_command');
+  assert.equal(JSON.parse(r.calls[0].function.arguments).command, 'cat src/index.js');
 });
 
 test('ToolCallRepair: preserves real shell commands such as wc', () => {

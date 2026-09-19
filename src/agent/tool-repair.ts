@@ -71,131 +71,6 @@ function callSignature(tc: ChatCompletionMessageToolCall): string {
   return `${tc.function.name}:${tc.function.arguments}`;
 }
 
-function parseArgs(raw: string): Record<string, any> | null {
-  try {
-    const parsed = JSON.parse(raw || '{}');
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, any>
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function shellWords(command: string): string[] {
-  const words: string[] = [];
-  const re = /"([^"]*)"|'([^']*)'|([^\s]+)/g;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(command)) !== null) {
-    words.push(match[1] ?? match[2] ?? match[3]);
-  }
-  return words;
-}
-
-function leadingSimpleCommand(command: string): string {
-  const match = command.match(/^(.*?)(?:\s+(?:\d?>|[;&|<>])|[;&|<>]|`|\$)/);
-  return (match ? match[1] : command).trim();
-}
-
-function commandText(args: Record<string, any>): string {
-  if (typeof args.command === 'string') return args.command.trim();
-  if (typeof args.cmd === 'string') return args.cmd.trim();
-  return '';
-}
-
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function userExplicitlyRequestedShellCommand(cmd: string, userText: string): boolean {
-  if (!cmd || !userText) return false;
-  const escaped = escapeRegex(cmd);
-  const quotedCmd = `(?:["'\\\`“”])?\\b${escaped}\\b(?:["'\\\`“”])?`;
-  return (
-    new RegExp(`${quotedCmd}\\s*(?:命令|command)`, 'i').test(userText) ||
-    new RegExp(`(?:shell|终端|命令行)\\s*(?:命令)?\\s*${quotedCmd}`, 'i').test(userText) ||
-    new RegExp(`(?:用|使用|执行|运行)\\s*(?:shell|终端|命令行)?\\s*(?:命令)?\\s*${quotedCmd}`, 'i').test(userText)
-  );
-}
-
-function userMentionedExactCommand(command: string, userText: string): boolean {
-  if (!command || !userText) return false;
-  const normalize = (s: string): string =>
-    s.replace(/[`"'“”‘’]/g, '').replace(/\s+/g, ' ').trim();
-  return normalize(userText).includes(normalize(command));
-}
-
-function rewriteExecToDedicatedTool(
-  tc: ChatCompletionMessageToolCall,
-  allowedToolNames: Set<string>,
-  userText = '',
-): ChatCompletionMessageToolCall | null {
-  if (tc.function.name !== 'exec__execute_command' && tc.function.name !== 'exec-mcp__execute_command') {
-    return null;
-  }
-  const args = parseArgs(tc.function.arguments);
-  if (!args) return null;
-  const command = commandText(args);
-  if (!command) return null;
-  const simpleCommand = leadingSimpleCommand(command);
-  if (!simpleCommand) return null;
-  const words = shellWords(simpleCommand);
-  if (words.length === 0) return null;
-
-  const cmd = words[0];
-  if (
-    userMentionedExactCommand(command, userText) ||
-    userExplicitlyRequestedShellCommand(cmd, userText)
-  ) {
-    return null;
-  }
-
-  if (cmd === 'ls' && allowedToolNames.has('fs__list_directory')) {
-    const flags = words.slice(1).filter((w) => w.startsWith('-'));
-    const paths = words.slice(1).filter((w) => !w.startsWith('-'));
-    return {
-      ...tc,
-      function: {
-        name: 'fs__list_directory',
-        arguments: JSON.stringify({
-          path: paths[0] ?? '.',
-          ...(flags.some((f) => f.includes('R')) ? { recursive: true } : {}),
-        }),
-      },
-    };
-  }
-
-  if (cmd === 'cat' && words.length >= 2 && allowedToolNames.has('fs__read_file')) {
-    return {
-      ...tc,
-      function: {
-        name: 'fs__read_file',
-        arguments: JSON.stringify({ path: words[1] }),
-      },
-    };
-  }
-
-  if ((cmd === 'grep' || cmd === 'rg') && allowedToolNames.has('grep__grep')) {
-    const rest = words.slice(1);
-    const nonFlags = rest.filter((w) => !w.startsWith('-') && w !== '--');
-    if (nonFlags.length >= 1) {
-      return {
-        ...tc,
-        function: {
-          name: 'grep__grep',
-          arguments: JSON.stringify({
-            pattern: nonFlags[0],
-            path: nonFlags[1] ?? '.',
-            recursive: true,
-          }),
-        },
-      };
-    }
-  }
-
-  return null;
-}
-
 function rewriteKnownToolAlias(
   tc: ChatCompletionMessageToolCall,
   allowedToolNames: Set<string>,
@@ -215,11 +90,11 @@ function rewriteKnownToolAlias(
 function rewriteToolCall(
   tc: ChatCompletionMessageToolCall,
   allowedToolNames: Set<string>,
-  userText = '',
 ): ChatCompletionMessageToolCall {
-  return rewriteKnownToolAlias(tc, allowedToolNames) ??
-    rewriteExecToDedicatedTool(tc, allowedToolNames, userText) ??
-    tc;
+  // Preserve the requested shell program, including flags, cwd, quoting and
+  // compound operations. Dedicated tools are selected by the agent, not by
+  // guessing an equivalent command after the model has chosen an action.
+  return rewriteKnownToolAlias(tc, allowedToolNames) ?? tc;
 }
 
 // ── stage 1: scavenge ────────────────────────────────────────────────
@@ -488,7 +363,7 @@ export class ToolCallRepair {
     }
 
     merged = merged.map((tc) => {
-      const rewritten = rewriteToolCall(tc, this.allowedToolNames, opts.userText ?? '');
+      const rewritten = rewriteToolCall(tc, this.allowedToolNames);
       if (rewritten !== tc) {
         report.notes.push(
           `工具调用已改用专用工具：${tc.function.name} → ${rewritten.function.name}`
