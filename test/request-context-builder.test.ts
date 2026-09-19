@@ -574,3 +574,65 @@ test('image tool results: valid data URLs are atomic and malformed truncated URL
   assert.match(tool.content, /invalid image data URL omitted/);
   assert.doesNotMatch(JSON.stringify(tool), /"type":"image_url"/);
 });
+
+test('request context: a long coding mission can window large completed file writes', () => {
+  const messages: ChatCompletionMessageParam[] = [
+    { role: 'system', content: 'stable system' },
+    { role: 'user', content: 'Build and verify the complete application; keep my requirements.' },
+  ];
+  const builder = new RequestContextBuilder();
+  for (let round = 0; round < 120; round++) {
+    const pair = toolGroup(round, `Verified file write ${round}`);
+    (pair[0] as any).tool_calls[0].function = {
+      name: 'fs__write_file',
+      arguments: JSON.stringify({ path: `/app/module-${round}.js`, content: 'const value = 123;\n'.repeat(1100) }),
+    };
+    messages.push(...pair);
+    const snapshot = JSON.stringify(messages);
+    const result = builder.build(messages, { maxTokens: 24_576, maxBytes: 240 * 1024, protectedMessageIndexes: [1] });
+    assert.equal(JSON.stringify(messages), snapshot, 'windowing must not rewrite the saved transcript');
+    assert.ok(result.requestTokens <= 24_576);
+    assert.ok(result.requestBytes <= 240 * 1024);
+    assert.equal(result.messages[0].content, 'stable system');
+    assert.ok(result.messages.some(message => message.role === 'user' && message.content === messages[1].content));
+    assert.ok(result.messages.some(message => message.role === 'tool' && message.tool_call_id === `call_${round}`));
+    assertToolPairs(result.messages);
+    if (round >= 8) assert.ok(result.omittedGroups > 0, 'large recent writes must not become an unbounded protected minimum');
+  }
+});
+
+test('request context: byte pressure also windows complete recent text exchanges', () => {
+  const messages: ChatCompletionMessageParam[] = [
+    { role: 'system', content: 'system' },
+    { role: 'user', content: 'root task' },
+    ...toolGroup(0, 'a'.repeat(6000)),
+    ...toolGroup(1, 'b'.repeat(6000)),
+    { role: 'user', content: 'internal continuation' },
+    ...toolGroup(2, 'c'.repeat(6000)),
+  ];
+  const result = new RequestContextBuilder().build(messages, {
+    maxTokens: 100_000, maxBytes: 9000, protectedMessageIndexes: [1],
+  });
+  assert.ok(result.requestBytes <= 9000);
+  assert.equal(result.omittedGroups, 2);
+  assert.ok(result.messages.some(message => message.content === 'root task'));
+  assert.ok(result.messages.some(message => message.content === 'internal continuation'));
+  assert.ok(result.messages.some(message => message.role === 'tool' && message.tool_call_id === 'call_2'));
+  assertToolPairs(result.messages);
+});
+
+test('request context: latest exchange and explicitly protected exchange cannot be silently evicted', () => {
+  const messages: ChatCompletionMessageParam[] = [
+    { role: 'system', content: 'system' },
+    { role: 'user', content: 'root task' },
+    ...toolGroup(0, 'a'.repeat(12_000)),
+    ...toolGroup(1, 'latest small result'),
+  ];
+  const builder = new RequestContextBuilder();
+  assert.throws(() => builder.build(messages, {
+    maxTokens: 100_000, maxBytes: 9000, protectedMessageIndexes: [2],
+  }), /too large/);
+  assert.throws(() => builder.build(messages.slice(0, -2), {
+    maxTokens: 100_000, maxBytes: 9000,
+  }), /too large/);
+});
