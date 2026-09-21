@@ -63,6 +63,7 @@ export interface PiPromptResult {
   engineSessionId: string;
   turn: TurnScope;
   error?: { code: PiSessionErrorCode; message: string };
+  contextUnchanged?: 'already_compacted' | 'session_too_small';
 }
 
 export interface PiCancelResult {
@@ -206,9 +207,12 @@ export async function createPiSessionFacade(options: PiSessionOptions): Promise<
     if (!model || model.provider !== providerId || model.id !== modelId
       || typeof provider?.streamSimple !== 'function') fail('PI_MODEL_UNAVAILABLE');
 
+    const reserveTokens = Math.max(1, Math.min(16384, model.maxTokens, Math.floor(model.contextWindow / 4)));
+    const keepRecentTokens = Math.max(1, Math.min(20000, Math.floor(model.contextWindow / 4)));
     const settings = SettingsManager.inMemory({
       retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } },
-      cacheWarming: 'off', compaction: { enabled: integration?.compaction === true },
+      cacheWarming: 'off', compaction: { enabled: integration?.compaction === true, reserveTokens, keepRecentTokens },
+      branchSummary: { reserveTokens },
       enableAnalytics: false, enableInstallTelemetry: false,
       packages: [], extensions: [], skills: [], prompts: [], themes: [], defaultTools: [],
       enableSkillCommands: false,
@@ -359,7 +363,17 @@ export async function createPiSessionFacade(options: PiSessionOptions): Promise<
     },
     compact(turn, instructions) {
       if (instructions !== undefined && typeof instructions !== 'string') return Promise.reject(new PiSessionError('PI_INVALID_CONFIG'));
-      return contextOperation(turn, async () => { await sdk.compact(instructions); });
+      let contextUnchanged: PiPromptResult['contextUnchanged'];
+      return contextOperation(turn, async () => {
+        try { await sdk.compact(instructions); }
+        catch (error) {
+          // These are the pinned SDK's explicit pre-dispatch no-work outcomes.
+          // Every other error still fails the operation; no summary is invented.
+          if (error instanceof Error && error.message === 'Already compacted') contextUnchanged = 'already_compacted';
+          else if (error instanceof Error && error.message === 'Nothing to compact (session too small)') contextUnchanged = 'session_too_small';
+          else throw error;
+        }
+      }).then(result => ({ ...result, ...(result.status === 'completed' && contextUnchanged ? { contextUnchanged } : {}) }));
     },
     summarizeBranch(turn, targetEntryId, instructions) {
       if (typeof targetEntryId !== 'string' || !targetEntryId || (instructions !== undefined && typeof instructions !== 'string')) {

@@ -207,7 +207,8 @@ export async function openMaSession(options: OpenMaSessionOptions): Promise<MaSe
     } else for (const [name, config] of Object.entries(bootstrap.config.mcpServers)) connections.push(await connectMcpServer(name, config));
     const frame = bootstrap.virtualUi ? createFrameContext(bootstrap.virtualUi) : undefined;
     const registrations = capability.tools ? connections.flatMap(connection => connection.tools
-      .filter(tool => connection.name !== bootstrap.virtualUi?.serverId || Object.values(bootstrap.virtualUi.tools).includes(tool.name))
+      .filter(tool => connection.name !== bootstrap.virtualUi?.serverId || !tool.name.startsWith('zimoos.')
+        || Object.values(bootstrap.virtualUi.tools).includes(tool.name))
       .map(tool => registerMcpTool({
       connection, toolName: tool.name,
       sequential: connection.name === bootstrap.virtualUi?.serverId,
@@ -244,7 +245,7 @@ export async function openMaSession(options: OpenMaSessionOptions): Promise<MaSe
       });
       const end = () => { if (active?.purpose === 'compaction') { active.purpose = undefined; emit('context.compacted', {}, active.turn); } };
       extension.on('session_compact', end);
-      extension.on('session_compact_failed', end);
+      extension.on('session_compact_failed', () => { if (active?.purpose === 'compaction') active.purpose = undefined; });
       extension.on('session_before_tree', event => {
         if (!active || active.purpose !== 'branch_summary' || active.controller.signal.aborted || event.signal.aborted) return { cancel: true };
         emit('context.compacting', { purpose: 'branch_summary' }, active.turn);
@@ -367,8 +368,12 @@ export async function openMaSession(options: OpenMaSessionOptions): Promise<MaSe
             const completion = await gate.complete(run.turn.turnId);
             await host.receiptComplete({ turn: run.turn, localCompletion: completion,
               receiptSetHash: receipts.digest(toolBridge.receiptReferences(run.turn)), ...unresolved() });
-            emit('turn.completed', { journalSeq: completion.journalSeq }, run.turn);
-            return { status: 'completed', engineSessionId, turn: run.turn, completion, ...unresolved() } as TurnOutcome;
+            const notice = result.contextUnchanged ? { code: 'MA_CONTEXT_UNCHANGED' as const,
+              message: result.contextUnchanged === 'already_compacted'
+                ? 'The current context is already compacted. No model request was needed and the saved history is unchanged.'
+                : 'The current context is small enough to keep intact. No model request was needed and the saved history is unchanged.' } : undefined;
+            emit('turn.completed', { journalSeq: completion.journalSeq, ...(notice ? { notice } : {}) }, run.turn);
+            return { status: 'completed', engineSessionId, turn: run.turn, completion, ...unresolved(), ...(notice ? { notice } : {}) } as TurnOutcome;
           } catch (error) {
             if (registered) { await gate.stop(run.turn.turnId).catch(() => {}); await host.revokeTurn(run.turn).catch(() => { run.paused = true; }); }
             const pending = unresolved();

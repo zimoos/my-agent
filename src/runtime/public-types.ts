@@ -201,6 +201,8 @@ export interface TurnOutcome {
   unresolvedCallIds: string[];
   completion?: TurnCompletion;
   error?: MaRuntimeError;
+  /** A successful context action that the SDK explicitly found unnecessary. */
+  notice?: { code: 'MA_CONTEXT_UNCHANGED'; message: string };
 }
 export interface CancelOutcome {
   engineSessionId: string;

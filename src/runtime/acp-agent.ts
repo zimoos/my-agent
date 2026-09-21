@@ -6,7 +6,7 @@ import type { ModelCallContext } from './contracts.js';
 import type { MaSession, OpenMaSessionOptions, RuntimeEvent } from './public-types.js';
 import { openMaSession } from './ma-session.js';
 import { publicRuntimeError } from './errors.js';
-import { cloneRuntimeJson } from './data.js';
+import { cloneRuntimeJson, ownData } from './data.js';
 import type { MaMemoryAction } from './memory-control.js';
 
 export interface MaAcpRuntimeOptions extends OpenMaSessionOptions {
@@ -71,6 +71,9 @@ export function createMaAcpAgent(connection: acp.AgentSideConnection, options: M
         status: event.kind === 'tool.progress' || event.payload.status === 'unknown' ? 'in_progress' : event.payload.status === 'succeeded' ? 'completed' : 'failed',
         ...(content.length ? { content } : {}), _meta: meta });
       if (event.kind === 'tool.completed') tools.delete(event.executionId);
+    } else if (event.kind === 'turn.completed' && ownData(event.payload.notice, 'code') === 'MA_CONTEXT_UNCHANGED'
+      && typeof ownData(event.payload.notice, 'message') === 'string') {
+      send(event.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ownData(event.payload.notice, 'message') as string }, _meta: meta });
     } else if ((event.kind === 'turn.failed' || event.kind === 'turn.paused') && event.payload.error) {
       const error = event.payload.error as { code?: string; message?: string };
       send(event.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text',
