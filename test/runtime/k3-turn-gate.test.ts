@@ -5,9 +5,9 @@ import type { FileHandle } from 'node:fs/promises';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { setImmediate as nextImmediate } from 'node:timers/promises';
-import { createTurnGate, type DispatchPermit } from '../../src/runtime/turn-gate.js';
+import { createTurnGate, type DispatchPermit, type TurnGate } from '../../src/runtime/turn-gate.js';
 import { openExecutionJournal, type ExecutionJournal, type ExecutionJournalInput } from '../../src/runtime/execution-journal.js';
-import type { Invocation, TurnScope, ToolReceipt } from '../../src/runtime/contracts.js';
+import type { Invocation, TurnScope, ToolReceipt, ModelCallBinding } from '../../src/runtime/contracts.js';
 
 // Local, independent vectors: a permit certifies durable intent, never permission or remote stop.
 // I clarified Q3's first-run error ambiguities: a safe but old epoch is a lifecycle
@@ -27,6 +27,19 @@ function invocation(index = 1, turn = turnA): Invocation {
     source: { serverId: 'server-a', toolName: 'tool-a' },
     argsSha256: 'a'.repeat(64), permissionScopeHash: 'b'.repeat(64),
   };
+}
+// R2b adds a real durable model origin prerequisite to these original dispatch
+// positive cases. Keep the original cancellation/duplicate/recovery assertions.
+async function prepareOrigin(gate: TurnGate, call: Invocation, scope = turnA) {
+  const model: ModelCallBinding = {
+    sessionId: call.sessionId, operationId: call.operationId, turnId: call.turnId, epoch: call.epoch,
+    stageId: scope.stageId, logicalCallId: `logical-${call.executionId}-${call.epoch}`,
+    callId: `model-${call.executionId}-${call.epoch}`, providerProfileId: 'fixture-profile', modelId: 'fixture-model',
+    modelPurpose: 'tool_loop', capabilitySnapshotId: 'fixture-capabilities', requestRevision: 1, requestSha256: 'e'.repeat(64),
+  };
+  await gate.prepareModel(model); await gate.markModelDispatching(model.callId);
+  await gate.recordModelReceipt(model.callId, { callId: model.callId, status: 'succeeded' });
+  await gate.bindInvocation(call, { callId: model.callId, logicalCallId: model.logicalCallId });
 }
 function baseEvent(index: number, turn = turnA) {
   return {
@@ -112,15 +125,15 @@ async function failOneSync(directory: string) {
 test('A3 fresh gate awaits a real journal and exposes isolated snapshots', async (t) => {
   assert.equal(process.version, 'v22.23.2');
   const { gate, journal } = await gateFor(t);
-  assert.deepEqual(gate.snapshot(), { sessionId, state: 'ready', currentTurn: null, lastEpoch: 0, inFlightExecutionIds: [] });
+  assert.deepEqual(gate.snapshot(), { sessionId, state: 'ready', currentTurn: null, lastEpoch: 0, inFlightExecutionIds: [], inFlightCallIds: [] });
   await gate.register({ ...turnA });
   const snapshot = gate.snapshot();
-  assert.deepEqual(snapshot, { sessionId, state: 'active', currentTurn: turnA, lastEpoch: 7, inFlightExecutionIds: [] });
+  assert.deepEqual(snapshot, { sessionId, state: 'active', currentTurn: turnA, lastEpoch: 7, inFlightExecutionIds: [], inFlightCallIds: [] });
   snapshot.currentTurn!.operationId = 'caller-mutated';
   snapshot.inFlightExecutionIds.push('caller-invented');
   snapshot.lastEpoch = 1000;
   snapshot.state = 'paused';
-  assert.deepEqual(gate.snapshot(), { sessionId, state: 'active', currentTurn: turnA, lastEpoch: 7, inFlightExecutionIds: [] });
+  assert.deepEqual(gate.snapshot(), { sessionId, state: 'active', currentTurn: turnA, lastEpoch: 7, inFlightExecutionIds: [], inFlightCallIds: [] });
   const records = (await journal.read()).entries;
   assert.equal(records.length, 1);
   assert.equal(records[0]!.kind, 'turn.registered');
@@ -187,6 +200,7 @@ test('A3 permit appears only after real fsync and matches the immutable dispatch
   await gate.register({ ...turnA });
   const call = invocation();
   const before = structuredClone(call);
+  await prepareOrigin(gate, call);
   const barrier = await syncBarrier(directory);
   try {
     let done = false;
@@ -198,8 +212,8 @@ test('A3 permit appears only after real fsync and matches the immutable dispatch
     call.source.serverId = 'mutated-source';
     barrier.release();
     const permit: DispatchPermit = await pending;
-    assert.deepEqual(permit, { sessionId, turnId: 'turn-a', epoch: 7, executionId: 'execution-1', journalSeq: 2 });
-    const record = (await journal.read()).entries[1]!;
+    assert.deepEqual(permit, { sessionId, turnId: 'turn-a', epoch: 7, executionId: 'execution-1', journalSeq: 6 });
+    const record = (await journal.read()).entries[5]!;
     assert.equal(record.kind, 'execution.dispatching');
     if (record.kind === 'execution.dispatching') assert.deepEqual(record.invocation, before);
     assert.deepEqual(gate.snapshot().inFlightExecutionIds, ['execution-1']);
@@ -209,9 +223,11 @@ test('A3 permit appears only after real fsync and matches the immutable dispatch
 test('A3 duplicate execution identity never yields a second permit or dispatch record', async (t) => {
   const { gate, journal } = await gateFor(t);
   await gate.register({ ...turnA });
+  await prepareOrigin(gate, invocation());
   const first = await gate.markDispatching(invocation());
   await assert.rejects(gate.markDispatching(invocation()), hasCode('TURN_DUPLICATE_EXECUTION'));
-  await assert.rejects(gate.markDispatching({ ...invocation(), toolCallId: 'other-pi-id' }), hasCode('TURN_DUPLICATE_EXECUTION'));
+  // R2b's full durable origin identity rejects the altered invocation before ID reuse.
+  await assert.rejects(gate.markDispatching({ ...invocation(), toolCallId: 'other-pi-id' }), hasCode('TURN_ORIGIN_MISMATCH'));
   assert.equal((await journal.read()).entries.filter((entry) => entry.kind === 'execution.dispatching').length, 1);
   assert.deepEqual(gate.snapshot().inFlightExecutionIds, [first.executionId]);
 });
@@ -219,6 +235,7 @@ test('A3 duplicate execution identity never yields a second permit or dispatch r
 test('A3 stop preserves issued in-flight work, is idempotent, and resumes only the same operation budget', async (t) => {
   const { gate, journal } = await gateFor(t);
   await gate.register({ ...turnA });
+  await prepareOrigin(gate, invocation());
   await gate.markDispatching(invocation());
   const stopped = await gate.stop('turn-a');
   assert.deepEqual(stopped, { revokedEpoch: 7, inFlightExecutionIds: ['execution-1'] });
@@ -232,7 +249,8 @@ test('A3 stop preserves issued in-flight work, is idempotent, and resumes only t
   }
   for (const epoch of [6, 7]) await assert.rejects(gate.register({ ...turnB(), epoch }), hasCode('TURN_CONFLICT'));
   await gate.register(turnB());
-  await assert.rejects(gate.markDispatching(invocation(1, turnB())), hasCode('TURN_DUPLICATE_EXECUTION'));
+  await assert.rejects(gate.markDispatching(invocation(1, turnB())), hasCode('TURN_ORIGIN_MISMATCH'));
+  await prepareOrigin(gate, invocation(2, turnB()), turnB());
   const newPermit = await gate.markDispatching(invocation(2, turnB()));
   assert.equal(newPermit.turnId, 'turn-b');
   assert.equal(newPermit.epoch, 8);
@@ -246,6 +264,8 @@ test('A3 stop preserves issued in-flight work, is idempotent, and resumes only t
 test('A3 stop during dispatch fsync denies unsigned and queued permits but retains the entered dispatch', async (t) => {
   const { gate, journal, directory } = await gateFor(t);
   await gate.register({ ...turnA });
+  for (const index of [1, 2, 3]) await prepareOrigin(gate, invocation(index));
+  const prerequisiteKinds = (await journal.read()).entries.map((entry) => entry.kind);
   const barrier = await syncBarrier(directory);
   try {
     const first = settled(gate.markDispatching(invocation(1)));
@@ -263,9 +283,10 @@ test('A3 stop during dispatch fsync denies unsigned and queued permits but retai
     assert.equal(stopResult.ok, true);
     if (stopResult.ok) assert.deepEqual(stopResult.value, { revokedEpoch: 7, inFlightExecutionIds: ['execution-1'] });
     const entries = (await journal.read()).entries;
-    assert.deepEqual(entries.map((entry) => entry.kind), ['turn.registered', 'execution.dispatching', 'turn.revoked']);
+    assert.deepEqual(entries.map((entry) => entry.kind), [...prerequisiteKinds, 'execution.dispatching', 'turn.revoked']);
     assert.deepEqual(gate.snapshot().inFlightExecutionIds, ['execution-1']);
     await gate.register(turnB());
+    await prepareOrigin(gate, invocation(4, turnB()), turnB());
     await gate.markDispatching(invocation(4, turnB()));
     assert.deepEqual(gate.snapshot().inFlightExecutionIds, ['execution-1', 'execution-4']);
   } finally { barrier.restore(); }
@@ -320,6 +341,7 @@ for (const phase of ['register', 'dispatch', 'stop'] as const) {
   test(`A3 ${phase} fsync failure pauses the gate and prevents further registration or permits`, async (t) => {
     const { gate, journal, directory } = await gateFor(t);
     if (phase !== 'register') await gate.register({ ...turnA });
+    if (phase !== 'register') await prepareOrigin(gate, invocation());
     if (phase === 'stop') await gate.markDispatching(invocation());
     const restore = await failOneSync(directory);
     try {
