@@ -26,10 +26,15 @@ export async function persistInitialPiSession(manager: SessionManager, trustedDi
   if (!header || header.id !== manager.getSessionId() || header.cwd !== cwd) throw new Error('MA_PI_HEADER_INVALID');
   const entries = manager.getEntries();
   const records = [header, ...entries];
+  // The SDK's public records may own optional undefined fields (for example
+  // parentSession). Compare the persisted JSON representation after reopening,
+  // not properties that JSON intentionally omits from the actual session file.
+  const serializedRecords = records.map(record => JSON.stringify(record));
+  const persistedRecords: unknown[] = serializedRecords.map(record => JSON.parse(record));
   let handle;
   try {
     handle = await open(file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-    await handle.writeFile(records.map(record => JSON.stringify(record)).join('\n') + '\n', 'utf8');
+    await handle.writeFile(serializedRecords.join('\n') + '\n', 'utf8');
     await handle.sync();
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
@@ -41,14 +46,14 @@ export async function persistInitialPiSession(manager: SessionManager, trustedDi
       const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
       if (!text.endsWith('\n')) throw new Error('MA_PI_HISTORY_INCOMPLETE');
       const found = text.split('\n').slice(0, -1).map(line => JSON.parse(line));
-      if (!isDeepStrictEqual(found, records)) throw new Error('MA_PI_HEADER_CONFLICT');
+      if (!isDeepStrictEqual(found, persistedRecords)) throw new Error('MA_PI_HEADER_CONFLICT');
     } finally { await existing.close(); }
   } finally { await handle?.close(); }
   const parent = await open(directory, constants.O_RDONLY | constants.O_NOFOLLOW);
   try { await parent.sync(); } finally { await parent.close(); }
   const reopened = SessionManager.open(file, directory, cwd);
   if (reopened.getSessionId() !== manager.getSessionId() || reopened.getSessionFile() !== file
-    || !isDeepStrictEqual(reopened.getHeader(), header) || !isDeepStrictEqual(reopened.getEntries(), entries)) {
+    || !isDeepStrictEqual([reopened.getHeader(), ...reopened.getEntries()], persistedRecords)) {
     throw new Error('MA_PI_SESSION_ROUND_TRIP_FAILED');
   }
   return reopened;
