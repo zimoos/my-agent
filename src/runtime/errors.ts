@@ -7,6 +7,7 @@ const messages: Record<string, string> = {
   MA_COMPLETION_EXTRA_CALL_FORBIDDEN: 'The protected closing turn permits only one model request. No additional request was authorized.',
   MA_RESUME_SESSION_NOT_FOUND: 'The requested saved session was not found. Check its identity or explicitly create a new session.',
   MA_PI_SESSION_ROUND_TRIP_FAILED: 'The Pi session could not be saved and reopened consistently. No model request was sent.',
+  MA_BRANCH_TARGET_NOT_FOUND: 'The selected branch entry is not in this saved session. Refresh the session history and select an existing entry; no model request was sent.',
   MA_LEGACY_SESSION_ARCHIVE_ONLY: 'This session belongs to the previous MA engine. Its history is preserved; start a new MA Next session to continue.',
   MA_SESSION_CLOSED: 'This session is closed. Open a new session to continue.',
   MA_BOOTSTRAP_INVALID: 'The MA session configuration is incomplete or inconsistent. Refresh the client configuration.',

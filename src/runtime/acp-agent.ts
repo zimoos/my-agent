@@ -91,6 +91,9 @@ export function createMaAcpAgent(connection: acp.AgentSideConnection, options: M
       opening = openMaSession(options).then(async value => {
         if (closed) { await value.close(); throw new Error('MA_SESSION_CLOSED'); }
         session = value; value.subscribe(project); return value;
+      }).catch(error => {
+        const safe = publicRuntimeError(error);
+        throw acp.RequestError.invalidParams({ ma: safe }, safe.message);
       });
     }
     return opening;

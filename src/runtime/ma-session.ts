@@ -347,6 +347,10 @@ export async function openMaSession(options: OpenMaSessionOptions): Promise<MaSe
                 : true))) throw new Error('MA_INPUT_INVALID');
             const images = content.filter((item): item is ImageContent => item.type === 'image');
             if (images.length && !capability.input.includes('image')) throw new Error('MA_MODEL_IMAGE_UNSUPPORTED');
+            if (operation?.kind === 'branch_summary'
+              && !manager.getEntries().some(entry => entry.id === operation.targetEntryId)) {
+              throw new Error('MA_BRANCH_TARGET_NOT_FOUND');
+            }
             const text = resources.expandPrompt(content.filter(item => item.type === 'text').map(item => item.text).join('\n'));
             const result = operation?.kind === 'completion' ? await sdk.completeProtected(PROTECTED_COMPLETION_PROMPT, run.turn)
               : operation?.kind === 'compaction' ? await sdk.compact(run.turn, operation.instructions)
