@@ -3,7 +3,9 @@ import { constants } from 'node:fs';
 import { lstat, mkdir, open, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
-import type { Invocation, ToolReceipt, TurnScope } from './contracts.js';
+import type {
+  Invocation, InvocationOrigin, ModelCallBinding, ModelCallReceipt, ToolReceipt, TurnScope,
+} from './contracts.js';
 
 interface JournalFields {
   schemaVersion: 1;
@@ -23,6 +25,10 @@ export type ExecutionJournalInput = JournalFields & (
       invocation: Invocation;
     }
   | { kind: 'execution.receipt'; invocation: Invocation; receipt: ToolReceipt }
+  | { kind: 'model.prepared' | 'model.dispatching'; call: ModelCallBinding }
+  | { kind: 'model.receipt'; call: ModelCallBinding; receipt: ModelCallReceipt }
+  | { kind: 'execution.model-bound'; invocation: Invocation; origin: InvocationOrigin }
+  | { kind: 'turn.completed'; turn: TurnScope }
 );
 
 export type ExecutionJournalEntry = ExecutionJournalInput & { seq: number };
@@ -76,8 +82,17 @@ function object(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function keys(value: Record<string, unknown>, allowed: readonly string[]): void {
+function requiredOwn(value: Record<string, unknown>, required: readonly string[]): void {
+  if (required.some(key => !Object.hasOwn(value, key))) invalid();
+}
+
+function keys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  optional: readonly string[] = [],
+): void {
   if (Object.keys(value).some(key => !allowed.includes(key))) invalid();
+  requiredOwn(value, allowed.filter(key => !optional.includes(key)));
 }
 
 function id(value: unknown): string {
@@ -108,7 +123,7 @@ function source(value: unknown): Invocation['source'] {
   return { serverId: id(data.serverId), toolName: id(data.toolName) };
 }
 
-function sameScope(nested: TurnScope | Invocation, outer: JournalFields): void {
+function sameScope(nested: TurnScope | Invocation | ModelCallBinding, outer: JournalFields): void {
   if (nested.sessionId !== outer.sessionId || nested.operationId !== outer.operationId
     || nested.turnId !== outer.turnId || nested.epoch !== outer.epoch) invalid();
 }
@@ -140,7 +155,8 @@ function invocation(value: unknown, outer: JournalFields): Invocation {
 
 function receipt(value: unknown, call: Invocation): ToolReceipt {
   const data = object(value);
-  keys(data, ['executionId', 'source', 'status', 'resultRef', 'stopConfirmed', 'evidenceRef']);
+  keys(data, ['executionId', 'source', 'status', 'resultRef', 'stopConfirmed', 'evidenceRef'],
+    ['resultRef', 'evidenceRef']);
   const statuses = ['succeeded', 'failed', 'denied', 'cancelled_not_sent', 'unknown'];
   if (typeof data.status !== 'string' || !statuses.includes(data.status)
     || typeof data.stopConfirmed !== 'boolean') invalid();
@@ -148,17 +164,58 @@ function receipt(value: unknown, call: Invocation): ToolReceipt {
     executionId: id(data.executionId), source: source(data.source),
     status: data.status as ToolReceipt['status'], stopConfirmed: data.stopConfirmed,
   };
-  if ('resultRef' in data) result.resultRef = id(data.resultRef);
-  if ('evidenceRef' in data) result.evidenceRef = id(data.evidenceRef);
+  if (Object.hasOwn(data, 'resultRef')) result.resultRef = id(data.resultRef);
+  if (Object.hasOwn(data, 'evidenceRef')) result.evidenceRef = id(data.evidenceRef);
   if (result.executionId !== call.executionId || result.source.serverId !== call.source.serverId
     || result.source.toolName !== call.source.toolName) invalid();
   return result;
+}
+
+function modelCall(value: unknown, outer: JournalFields): ModelCallBinding {
+  const data = object(value);
+  keys(data, ['operationId', 'stageId', 'logicalCallId', 'callId', 'missionId', 'turnId',
+    'epoch', 'sessionId', 'providerProfileId', 'modelId', 'modelPurpose',
+    'capabilitySnapshotId', 'requestRevision', 'requestSha256'], ['missionId']);
+  const purposes = ['answer', 'tool_loop', 'compaction', 'branch_summary'];
+  if (typeof data.modelPurpose !== 'string' || !purposes.includes(data.modelPurpose)) invalid();
+  const result: ModelCallBinding = {
+    operationId: id(data.operationId), stageId: id(data.stageId),
+    logicalCallId: id(data.logicalCallId), callId: id(data.callId), turnId: id(data.turnId),
+    epoch: positiveInteger(data.epoch), sessionId: id(data.sessionId),
+    providerProfileId: id(data.providerProfileId), modelId: id(data.modelId),
+    modelPurpose: data.modelPurpose as ModelCallBinding['modelPurpose'],
+    capabilitySnapshotId: id(data.capabilitySnapshotId),
+    requestRevision: positiveInteger(data.requestRevision), requestSha256: hash(data.requestSha256),
+  };
+  if (Object.hasOwn(data, 'missionId')) result.missionId = id(data.missionId);
+  sameScope(result, outer);
+  return result;
+}
+
+function modelReceipt(value: unknown, call: ModelCallBinding): ModelCallReceipt {
+  const data = object(value);
+  keys(data, ['callId', 'status', 'evidenceRef'], ['evidenceRef']);
+  const statuses = ['succeeded', 'failed', 'not_sent', 'unknown'];
+  if (typeof data.status !== 'string' || !statuses.includes(data.status)) invalid();
+  const result: ModelCallReceipt = {
+    callId: id(data.callId), status: data.status as ModelCallReceipt['status'],
+  };
+  if (Object.hasOwn(data, 'evidenceRef')) result.evidenceRef = id(data.evidenceRef);
+  if (result.callId !== call.callId) invalid();
+  return result;
+}
+
+function origin(value: unknown): InvocationOrigin {
+  const data = object(value);
+  keys(data, ['callId', 'logicalCallId']);
+  return { callId: id(data.callId), logicalCallId: id(data.logicalCallId) };
 }
 
 /** Rebuild every nested object before an append can enter the queue. */
 function cloneEvent(value: unknown, sessionId: string, reading = false): ExecutionJournalInput {
   const data = object(value);
   const common = reading ? [...COMMON_KEYS, 'seq'] : COMMON_KEYS;
+  requiredOwn(data, common);
   if (data.schemaVersion !== 1) invalid();
   const fields: JournalFields = {
     schemaVersion: 1, eventId: id(data.eventId), sessionId: id(data.sessionId),
@@ -168,6 +225,7 @@ function cloneEvent(value: unknown, sessionId: string, reading = false): Executi
   if (fields.sessionId !== sessionId) invalid();
   switch (data.kind) {
     case 'turn.registered':
+    case 'turn.completed':
       keys(data, [...common, 'turn']);
       return { ...fields, kind: data.kind, turn: turn(data.turn, fields) };
     case 'turn.revoked':
@@ -183,6 +241,21 @@ function cloneEvent(value: unknown, sessionId: string, reading = false): Executi
       const call = invocation(data.invocation, fields);
       return { ...fields, kind: data.kind, invocation: call, receipt: receipt(data.receipt, call) };
     }
+    case 'model.prepared':
+    case 'model.dispatching':
+      keys(data, [...common, 'call']);
+      return { ...fields, kind: data.kind, call: modelCall(data.call, fields) };
+    case 'model.receipt': {
+      keys(data, [...common, 'call', 'receipt']);
+      const call = modelCall(data.call, fields);
+      return { ...fields, kind: data.kind, call, receipt: modelReceipt(data.receipt, call) };
+    }
+    case 'execution.model-bound':
+      keys(data, [...common, 'invocation', 'origin']);
+      return {
+        ...fields, kind: data.kind, invocation: invocation(data.invocation, fields),
+        origin: origin(data.origin),
+      };
     default:
       return invalid();
   }
@@ -236,11 +309,13 @@ export async function readExecutionJournal(options: {
   directory: string;
   sessionId: string;
 }): Promise<JournalReadResult> {
-  const sessionId = id(options.sessionId);
-  if (typeof options.directory !== 'string' || options.directory.trim().length === 0) invalid();
+  const data = object(options);
+  requiredOwn(data, ['directory', 'sessionId']);
+  const sessionId = id(data.sessionId);
+  if (typeof data.directory !== 'string' || data.directory.trim().length === 0) invalid();
   let handle: FileHandle | undefined;
   try {
-    handle = await open(join(resolve(options.directory), 'execution.jsonl'), constants.O_RDONLY | NOFOLLOW);
+    handle = await open(join(resolve(data.directory), 'execution.jsonl'), constants.O_RDONLY | NOFOLLOW);
     await regularFile(handle);
     return decodeEntries(await handle.readFile(), sessionId);
   } catch (error) {
@@ -255,10 +330,12 @@ export async function openExecutionJournal(options: {
   sessionId: string;
   ownerId: string;
 }): Promise<ExecutionJournal> {
-  const sessionId = id(options.sessionId);
-  const ownerId = id(options.ownerId);
-  if (typeof options.directory !== 'string' || options.directory.trim().length === 0) invalid();
-  const directory = resolve(options.directory);
+  const data = object(options);
+  requiredOwn(data, ['directory', 'sessionId', 'ownerId']);
+  const sessionId = id(data.sessionId);
+  const ownerId = id(data.ownerId);
+  if (typeof data.directory !== 'string' || data.directory.trim().length === 0) invalid();
+  const directory = resolve(data.directory);
   const lockPath = join(directory, '.writer.lock');
   const logPath = join(directory, 'execution.jsonl');
   const instanceId = randomUUID();

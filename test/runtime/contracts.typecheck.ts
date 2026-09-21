@@ -5,6 +5,10 @@ import type {
   Invocation,
   ToolReceiptStatus,
   ToolReceipt,
+  ModelCallBinding,
+  ModelCallReceipt,
+  InvocationOrigin,
+  TurnCompletion,
 } from '../../src/runtime/contracts.js';
 import {
   sessionScopeVector,
@@ -93,3 +97,30 @@ withoutSignal satisfies ModelCallContext;
 ({ ...turnScopeVector, hostIdentity: 'host-b' }) satisfies TurnScope;
 // @ts-expect-error Runtime contract uses a numeric epoch, not an arbitrary string.
 ({ ...turnScopeVector, epoch: '7' }) satisfies TurnScope;
+
+// R2a only adds serializable bindings; runtime value checks belong to the journal.
+type ExpectedModelCallBinding = Omit<ExpectedModelCallContext, 'signal'> & {
+  requestRevision: number; requestSha256: string;
+};
+type ExpectedModelCallReceipt = {
+  callId: string; status: 'succeeded' | 'failed' | 'not_sent' | 'unknown'; evidenceRef?: string;
+};
+export type R2BindingShape = Expect<Equal<ModelCallBinding, ExpectedModelCallBinding>>;
+export type R2ReceiptShape = Expect<Equal<ModelCallReceipt, ExpectedModelCallReceipt>>;
+export type R2OriginShape = Expect<Equal<InvocationOrigin, { callId: string; logicalCallId: string }>>;
+export type R2CompletionShape = Expect<Equal<TurnCompletion, { sessionId: string; turnId: string; epoch: number; journalSeq: number }>>;
+const binding = { ...withoutSignal, requestRevision: 1, requestSha256: 'a'.repeat(64) } satisfies ModelCallBinding;
+const { requestRevision: _revision, ...missingRevision } = binding;
+// @ts-expect-error Rebuilt final requests retain their revision.
+missingRevision satisfies ModelCallBinding;
+// @ts-expect-error AbortSignal is not persisted in a model binding.
+({ ...binding, signal: modelContextVector.signal }) satisfies ModelCallBinding;
+// @ts-expect-error A model result never means Mission acceptance.
+({ callId: binding.callId, status: 'accepted' }) satisfies ModelCallReceipt;
+// @ts-expect-error Tool and model identities remain separate contracts.
+({ executionId: 'execution-a', logicalCallId: 'logical-a' }) satisfies InvocationOrigin;
+// @ts-expect-error Completion must identify its durable journal entry.
+({ sessionId: 'session-a', turnId: 'turn-a', epoch: 1 }) satisfies TurnCompletion;
+for (const status of ['succeeded', 'failed', 'not_sent', 'unknown'] as const) {
+  ({ callId: binding.callId, status, evidenceRef: 'fixture-evidence' }) satisfies ModelCallReceipt;
+}

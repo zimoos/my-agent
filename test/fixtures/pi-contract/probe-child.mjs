@@ -15,7 +15,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 // This process has no inherited supplier credentials, child-process or personal-file permission.
 const scratch = process.env.MA_PI_PROBE_SCRATCH;
 const mode = process.env.MA_PI_PROBE_MODE;
-assert.ok(scratch && ['success', 'error-before-start', 'error-after-output'].includes(mode));
+assert.ok(scratch && ['success', 'error-before-start', 'error-after-output', 'abort-after-delta', 'abort-during-tool'].includes(mode));
 const cwd = path.join(scratch, 'workspace');
 const agentDir = path.join(scratch, 'agent');
 const deniedCanary = process.env.MA_PI_DENIED_CANARY;
@@ -104,7 +104,26 @@ const executed = [];
 const events = [];
 const textDeltas = [];
 const callbackErrors = [];
+const firstDelta = Promise.withResolvers();
+const toolStarted = Promise.withResolvers();
+const toolSignalAborted = Promise.withResolvers();
+const releaseTool = Promise.withResolvers();
+const abortTrace = [];
+const providerSignals = [];
+let providerAbortEvents = 0;
+let providerAbortTerminals = 0;
+let toolAbortEvents = 0;
+let toolCompletionAfterAbort = false;
+let abortEvidence;
 let firstCompleted = false;
+async function bounded(promise, label) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`P05 timed out: ${label}`)), 3000);
+    })]);
+  } finally { clearTimeout(timer); }
+}
 const usageFor = (second = false) => second
   ? { input: 333, output: 444, cacheRead: 0, cacheWrite: 0, totalTokens: 777, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }
   : { input: 111, output: 222, cacheRead: 3, cacheWrite: 4, totalTokens: 340, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
@@ -141,13 +160,35 @@ function emitTool(stream, message, id, name, value) {
 function fixtureStream(model, context, options) {
   const stream = createAssistantMessageEventStream();
   const snapshot = structuredClone(context.messages);
-  calls.push({ messages: snapshot, maxRetries: options?.maxRetries });
+  const callNumber = calls.length + 1;
+  calls.push({ messages: snapshot, maxRetries: options?.maxRetries, startedAborted: options?.signal?.aborted });
+  providerSignals.push(options?.signal);
   queueMicrotask(() => {
     const message = messageFor(model, calls.length > 1);
     try {
       assert.equal(options?.maxRetries, 0);
       assert.ok(!JSON.stringify(snapshot).includes('MA_PI_SENTINEL_'));
-      if (mode !== 'success') {
+      if (mode === 'abort-after-delta' || (mode === 'abort-during-tool' && options?.signal?.aborted)) {
+        assert.ok(options.signal instanceof AbortSignal);
+        const completeAborted = () => {
+          providerAbortEvents++;
+          abortTrace.push(`provider-${callNumber}-signal-abort`);
+          assert.equal(options.signal, providerSignals[callNumber - 1]);
+          message.stopReason = 'aborted';
+          message.errorMessage = 'protocol_fixture observed abort on this request';
+          providerAbortTerminals++;
+          stream.push({ type: 'error', reason: 'aborted', error: message });
+          stream.end();
+        };
+        if (options.signal.aborted) { completeAborted(); return; }
+        options.signal.addEventListener('abort', completeAborted, { once: true });
+        stream.push({ type: 'start', partial: message });
+        message.content.push({ type: 'text', text: 'partial-before-abort' });
+        stream.push({ type: 'text_start', contentIndex: 0, partial: message });
+        stream.push({ type: 'text_delta', contentIndex: 0, delta: 'partial-before-abort', partial: message });
+        return; // Real SDK consumes the stream while the provider awaits its own signal.
+      }
+      if (mode.startsWith('error-')) {
         if (mode === 'error-after-output') {
           stream.push({ type: 'start', partial: message });
           emitText(stream, message, 'partial-before-error');
@@ -211,7 +252,20 @@ const firstTool = defineTool({
     assert.equal(params.value, longValue);
     assert.equal(signal.aborted, false);
     onUpdate?.({ content: [{ type: 'text', text: 'first-progress' }], details: {} });
-    await delay(25);
+    if (mode === 'abort-during-tool') {
+      assert.equal(signal, providerSignals[0], 'provider and tool must receive the same active run signal');
+      signal.addEventListener('abort', () => {
+        toolAbortEvents++;
+        abortTrace.push('tool-signal-abort');
+        toolSignalAborted.resolve();
+      }, { once: true });
+      toolStarted.resolve();
+      await releaseTool.promise; // Models an entered operation whose completion is independently controlled.
+      toolCompletionAfterAbort = signal.aborted;
+      abortTrace.push('tool-late-completion');
+    } else {
+      await delay(25);
+    }
     firstCompleted = true;
     toolOrder.push('first-end');
     executed.push({ toolCallId, bytes: Buffer.byteLength(params.value, 'utf8') });
@@ -255,22 +309,68 @@ const unsubscribe = session.subscribe((event) => {
   events.push(structuredClone(event));
   if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') {
     textDeltas.push(event.assistantMessageEvent.delta);
+    firstDelta.resolve();
   }
 });
 let promptRejected = false;
 try {
   assert.deepEqual(session.getActiveToolNames().sort(), ['fixture_first', 'fixture_second']);
-  try {
-    await session.prompt(mode === 'success' ? 'Run both fixture tools in sequence.' : 'Return the fixture failure.', {
-      expandPromptTemplates: false, images: mode === 'success' ? [image] : undefined,
-    });
-  } catch { promptRejected = true; }
+  if (mode.startsWith('abort-')) {
+    const prompt = session.prompt('Exercise the controlled cancellation protocol.', {
+      expandPromptTemplates: false, images: mode === 'abort-during-tool' ? [image] : undefined,
+    }).catch(() => { promptRejected = true; });
+    await bounded(mode === 'abort-after-delta' ? firstDelta.promise : toolStarted.promise, 'real SDK first observable activity');
+    abortTrace.push(mode === 'abort-after-delta' ? 'delta-observed' : 'tool-entered');
+    assert.equal(session.isIdle, false);
+    let abortSettled = false;
+    let idleSettled = false;
+    abortTrace.push('abort-called');
+    const abort = session.abort().then(() => { abortSettled = true; abortTrace.push('abort-resolved'); });
+    const idle = session.waitForIdle().then(() => { idleSettled = true; abortTrace.push('idle-resolved'); });
+    let blockedUntilToolCompletion;
+    if (mode === 'abort-during-tool') {
+      await bounded(toolSignalAborted.promise, 'same active tool signal');
+      await delay(50);
+      blockedUntilToolCompletion = !abortSettled && !idleSettled && !session.isIdle;
+      assert.equal(blockedUntilToolCompletion, true, 'abort/idle must not report completion while the entered tool is unresolved');
+      assert.equal(firstCompleted, false);
+      assert.equal(calls.length, 1);
+      assert.deepEqual(toolOrder, ['first-start']);
+      abortTrace.push('tool-released');
+      releaseTool.resolve();
+    }
+    await bounded(Promise.all([prompt, abort, idle]), 'prompt + abort + waitForIdle settlement');
+    assert.equal(session.isIdle, true);
+    await session.abort(); // Repeated idle abort must not synthesize another terminal event.
+    await session.waitForIdle();
+    abortEvidence = {
+      isIdle: session.isIdle, abortSettled, idleSettled, providerAbortEvents, providerAbortTerminals,
+      toolAbortEvents, toolCompletionAfterAbort, blockedUntilToolCompletion,
+      remoteStopConfirmed: false, // Neither a local signal nor SDK idle is a remote stop receipt.
+      abortTrace, callbackStartedAborted: calls.map((call) => call.startedAborted),
+    };
+  } else {
+    try {
+      await session.prompt(mode === 'success' ? 'Run both fixture tools in sequence.' : 'Return the fixture failure.', {
+        expandPromptTemplates: false, images: mode === 'success' ? [image] : undefined,
+      });
+    } catch { promptRejected = true; }
+  }
   assert.equal(callbackErrors.length, 0, callbackErrors.map(String).join('\n'));
   const beforeIdle = calls.length;
   await delay(350);
   assert.equal(calls.length, beforeIdle, 'SDK added a hidden retry or cache-warming callback');
   assert.equal(events.some((event) => event.type === 'auto_retry_start'), false);
   const assistantMessages = session.messages.filter((entry) => entry.role === 'assistant');
+  if (mode.startsWith('abort-')) {
+    console.error(JSON.stringify({
+      case: mode, diagnostic: 'public-sdk-cancellation-observation', abortEvidence,
+      providerCallbacks: calls.length, callbackStartedAborted: calls.map((call) => call.startedAborted),
+      assistantMessages: assistantMessages.map((entry) => ({ stopReason: entry.stopReason, errorMessage: entry.errorMessage })),
+      toolOrder, toolResults: session.messages.filter((entry) => entry.role === 'toolResult').map((entry) => ({ toolCallId: entry.toolCallId, toolName: entry.toolName, isError: entry.isError })),
+      eventTypes: events.map((event) => event.type).filter((type) => type !== 'message_update'),
+    }));
+  }
   if (mode === 'success') {
     assert.equal(promptRejected, false);
     assert.equal(calls.length, 2);
@@ -282,12 +382,47 @@ try {
     assert.ok(events.some((event) => event.type === 'tool_execution_update' && event.toolCallId === 'pi-call-first'));
     assert.equal(session.messages.filter((entry) => entry.role === 'toolResult').length, 2);
     assert.ok(sessionManager.getEntries().some((entry) => entry.type === 'message' && entry.message.role === 'toolResult'));
-  } else {
+  } else if (mode.startsWith('error-')) {
     assert.equal(calls.length, 1);
     assert.equal(executed.length, 0);
     assert.equal(assistantMessages.at(-1)?.stopReason, 'error');
     assert.equal(assistantMessages.at(-1)?.errorMessage, '503 fixture unavailable');
     assert.equal(textDeltas.join(''), mode === 'error-after-output' ? 'partial-before-error' : '');
+  } else {
+    assert.equal(events.filter((event) => event.type === 'agent_start').length, 1);
+    assert.equal(events.filter((event) => event.type === 'agent_end').length, 1, 'one SDK run must settle once');
+    assert.equal(session.messages.filter((entry) => entry.role === 'user').length, 1);
+    if (mode === 'abort-after-delta') {
+      assert.equal(assistantMessages.at(-1)?.stopReason, 'aborted');
+      assert.equal(calls.length, 1);
+      assert.equal(providerAbortEvents, 1);
+      assert.equal(providerAbortTerminals, 1);
+      assert.equal(executed.length, 0);
+      assert.equal(textDeltas.join(''), 'partial-before-abort');
+      assert.equal(events.filter((event) => event.type === 'message_end' && event.message.role === 'assistant').length, 1);
+      assert.equal(events.filter((event) => event.type === 'turn_end').length, 1);
+    } else {
+      // I adjudication: Pi enters a second internal loop turn, then the public
+      // ModelRuntime rejects the already-aborted signal before provider dispatch.
+      // Preserve this raw SDK result; MA cancellation must use its recorded Turn
+      // cancellation, never this message text as a remote stop receipt.
+      assert.equal(assistantMessages.at(-1)?.stopReason, 'error');
+      assert.equal(assistantMessages.at(-1)?.errorMessage, 'This operation was aborted');
+      assert.equal(toolAbortEvents, 1);
+      assert.equal(toolCompletionAfterAbort, true);
+      assert.deepEqual(toolOrder, ['first-start', 'first-end']);
+      assert.deepEqual(executed.map((entry) => entry.toolCallId), ['pi-call-first']);
+      const lateResults = session.messages.filter((entry) => entry.role === 'toolResult');
+      assert.equal(lateResults.length, 1);
+      assert.equal(lateResults[0].toolCallId, 'pi-call-first');
+      assert.equal(events.filter((event) => event.type === 'tool_execution_start').length, 1);
+      assert.equal(events.filter((event) => event.type === 'tool_execution_end').length, 1);
+    }
+    abortEvidence.agentEndEvents = events.filter((event) => event.type === 'agent_end').length;
+    abortEvidence.agentSettledEvents = events.filter((event) => event.type === 'agent_settled').length;
+    assert.equal(abortEvidence.agentSettledEvents, 1, 'one SDK run must settle once');
+    abortEvidence.turnEndEvents = events.filter((event) => event.type === 'turn_end').length;
+    abortEvidence.assistantMessageEnds = events.filter((event) => event.type === 'message_end' && event.message.role === 'assistant').length;
   }
   assert.equal(networkAttempts.length, 0, `SDK attempted network access: ${networkAttempts.join(',')}`);
   const sentinelRoots = [
@@ -306,11 +441,14 @@ try {
     toolOrder, executed, text: textDeltas.join(''), assistantUsage: assistantMessages.map((entry) => entry.usage),
     toolResults: session.messages.filter((entry) => entry.role === 'toolResult').length,
     promptRejected, lastStopReason: assistantMessages.at(-1)?.stopReason,
+    lastErrorMessage: assistantMessages.at(-1)?.errorMessage,
     networkAttempts: networkAttempts.length, sentinelReads: sentinelReads.length,
     readObservations: fileReads.length, personalReadDenied: true, subprocessesDenied: true,
-    idleObservationMs: 350, settings: { retry: false, providerMaxRetries: 0, cacheWarming: 'off', analytics: false, installTelemetry: false },
+    idleObservationMs: 350, abortEvidence,
+    settings: { retry: false, providerMaxRetries: 0, cacheWarming: 'off', analytics: false, installTelemetry: false },
   }));
 } finally {
+  releaseTool.resolve();
   unsubscribe();
   await session.abort();
   session.dispose();
