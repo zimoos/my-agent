@@ -52,6 +52,9 @@ async function readManifest(directory: string): Promise<SessionManifest | null> 
     const manifest = JSON.parse(await handle.readFile('utf8')) as SessionManifest;
     requireOwnData(manifest, ['schemaVersion', 'sessionId', 'workspaceId', 'canonicalCwd', 'hostIdentity',
       'providerProfileId', 'engineSessionId', 'engineSessionFile', 'kernelVersion']);
+    const authority = Object.hasOwn(manifest, 'nativeRequestAuthority') ? manifest.nativeRequestAuthority : 'host';
+    if (authority !== 'host' && authority !== 'runtime') throw new Error('MA_SESSION_OWNERSHIP_MISMATCH');
+    Object.defineProperty(manifest, 'nativeRequestAuthority', { value: authority, enumerable: true, writable: false, configurable: false });
     return manifest;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
@@ -73,6 +76,7 @@ async function writeManifest(directory: string, value: SessionManifest): Promise
 export async function openMaSession(options: OpenMaSessionOptions): Promise<MaSession> {
   const bootstrap = parseMaBootstrapV2(options.bootstrap);
   const { scope, capability } = bootstrap;
+  const nativeRequestAuthority = bootstrap.nativeRequestAuthority ?? 'host';
   if (await realpath(scope.canonicalCwd) !== scope.canonicalCwd) throw new Error('MA_WORKSPACE_NOT_CANONICAL');
   const host = options.host;
   for (const method of ['registerTurn', 'revokeTurn', 'prepareModel', 'authorizeTool', 'queryExecution', 'receiptComplete'] as const) {
@@ -119,6 +123,7 @@ export async function openMaSession(options: OpenMaSessionOptions): Promise<MaSe
     if (existing && (existing.schemaVersion !== 2 || existing.kernelVersion !== 'pi-0.86.1' || existing.sessionId !== scope.maSessionId
       || existing.workspaceId !== scope.workspaceId || existing.canonicalCwd !== scope.canonicalCwd
       || existing.hostIdentity !== scope.hostIdentity || existing.providerProfileId !== scope.providerProfileId
+      || (existing.nativeRequestAuthority ?? 'host') !== nativeRequestAuthority
       || relative(piDirectory, existing.engineSessionFile).startsWith('..'))) throw new Error('MA_SESSION_OWNERSHIP_MISMATCH');
     let missingEmptyHistory = false;
     if (existing) {
@@ -144,7 +149,7 @@ export async function openMaSession(options: OpenMaSessionOptions): Promise<MaSe
       schemaVersion: 2, sessionId: scope.maSessionId, workspaceId: scope.workspaceId,
       canonicalCwd: scope.canonicalCwd, hostIdentity: scope.hostIdentity,
       providerProfileId: scope.providerProfileId, engineSessionId, engineSessionFile: sessionFile,
-      kernelVersion: 'pi-0.86.1',
+      kernelVersion: 'pi-0.86.1', nativeRequestAuthority,
     });
     const emit = (kind: RuntimeEventKind, payload: Record<string, unknown>, turn?: Pick<TurnScope, 'operationId' | 'turnId' | 'epoch'>,
       ids: Partial<Pick<RuntimeEvent, 'callId' | 'logicalCallId' | 'executionId' | 'toolCallId'>> = {}): RuntimeEvent => {

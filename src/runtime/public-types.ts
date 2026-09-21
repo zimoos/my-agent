@@ -14,6 +14,8 @@ export interface MaSessionManifest {
   schemaVersion: 2; sessionId: string; workspaceId: string; canonicalCwd: string;
   hostIdentity: string; providerProfileId: string; engineSessionId: string; engineSessionFile: string;
   kernelVersion: 'pi-0.86.1';
+  /** Legacy manifests omit this field and are interpreted as host authority. */
+  nativeRequestAuthority?: 'host' | 'runtime';
 }
 
 export interface ModelCapabilitySnapshot {
@@ -46,6 +48,8 @@ export interface MaBootstrapV2 {
   capability: ModelCapabilitySnapshot;
   resources: MaResourcePolicy;
   hostControl: { transport: 'acp'; protocolVersion: 2 } | { transport: 'local'; protocolVersion: 2 };
+  /** Trusted selection: absent means host; runtime is only for a directly owned native supplier request. */
+  nativeRequestAuthority?: 'host' | 'runtime';
   resumeSessionId?: string;
   virtualUi?: {
     serverId: string;
@@ -140,6 +144,8 @@ export interface HostControlPort {
     context: ModelCallContext;
     requestRevision: number;
     request: ChatCompletionCreateParamsStreaming;
+    /** Present only when this runtime freezes the actual supplier request; never a Cloud proxy-body hash. */
+    supplierRequestSha256?: string;
     /** Quote/earmark only; Host owns its completion stage/IDs. It is never dispatched by this call. */
     completionRequest?: ChatCompletionCreateParamsStreaming;
   }): Promise<PreparedModelRequest>;

@@ -68,7 +68,7 @@ export async function createLocalSessionEnvironment(prepared: BootstrapPreparati
       instructionFiles: prepared.loadAgentInstructions === false ? [] : ['AGENTS.md', 'AGENT.md'].map(name => join(cwd, name)).filter(existsSync).map(path => realpathSync(path)),
       extensions: ['ma-model-purpose', 'ma-resources', ...(connections.some(connection => connection.tools.length > 0) ? ['ma-tools'] : [])],
     },
-    hostControl: { transport: 'local', protocolVersion: 2 },
+    hostControl: { transport: 'local', protocolVersion: 2 }, nativeRequestAuthority: 'host',
     ...(prepared.resumed ? { resumeSessionId: prepared.sessionId } : {}),
   };
   const host: HostControlPort = {

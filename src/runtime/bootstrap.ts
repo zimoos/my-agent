@@ -44,6 +44,9 @@ export function parseMaBootstrapV2(input: unknown): MaBootstrapV2 {
     ...(Object.hasOwn(bootstrap, 'virtualUi') ? ['ma-frame'] : [])];
   if (extensions.length !== new Set(extensions).size || expected.some(name => !extensions.includes(name))
     || extensions.some(name => !expected.includes(name))) throw new Error('MA_BOOTSTRAP_EXTENSIONS');
+  const authority = Object.hasOwn(bootstrap, 'nativeRequestAuthority') ? bootstrap.nativeRequestAuthority : 'host';
+  if (authority !== 'host' && authority !== 'runtime') throw new Error('MA_BOOTSTRAP_MODEL_AUTHORITY');
+  Object.defineProperty(bootstrap, 'nativeRequestAuthority', { value: authority, writable: false, configurable: false, enumerable: true });
   const host = requireOwnData(bootstrap.hostControl, ['transport', 'protocolVersion']);
   if (host.protocolVersion !== 2 || (host.transport !== 'acp' && host.transport !== 'local')) throw new Error('MA_BOOTSTRAP_HOST');
   if (Object.hasOwn(bootstrap, 'resumeSessionId')) id(bootstrap.resumeSessionId);
