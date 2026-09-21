@@ -15,6 +15,7 @@ import type {
 } from 'openai/resources/chat/completions';
 import { AGORA_MCP_API_KEY } from '../config.js';
 import { buildMcpEnv, McpClient } from '../mcp/client.js';
+import type { ModelCallContext } from '../runtime/contracts.js';
 import type {
   AgoraMemoryConfig,
   AgoraRuntimeConfig,
@@ -642,6 +643,7 @@ function providerProgressFromMcp(event: McpProgressEvent): ProviderProgressEvent
 }
 
 export class AgoraProviderRuntime implements AgoraMemoryController {
+  private readonly preparedRequests = new Map<string, { input: string; bytes: string }>();
   readonly client: any = null;
   readonly policy: ProviderPolicy;
 
@@ -1039,6 +1041,16 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
     return this.toChatCompletion(payload);
   }
 
+  discardPreparedModelRequest(callId: string): void { this.preparedRequests.delete(callId); }
+
+  async prepareModelRequest(context: ModelCallContext, request: ChatCompletionCreateParamsStreaming): Promise<string> {
+    await this.ready();
+    if (this.preparedRequests.size >= 256 || this.preparedRequests.has(context.callId)) throw new Error('MA_MODEL_PREPARATION_CONFLICT');
+    const bytes = JSON.stringify(this.chatCompleteArguments(request));
+    this.preparedRequests.set(context.callId, { input: JSON.stringify({ ...request, stream: false }), bytes });
+    return createHash('sha256').update(bytes, 'utf8').digest('hex');
+  }
+
   async createStreamingChatCompletion(
     request: ChatCompletionCreateParamsStreaming,
     options?: ProviderRunOptions
@@ -1365,20 +1377,14 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
   ): Promise<Record<string, any>> {
     await this.ready();
     const rawRequest = request as any;
+    const prepared = options?.modelContext ? this.preparedRequests.get(options.modelContext.callId) : undefined;
+    if (prepared) {
+      this.preparedRequests.delete(options!.modelContext!.callId);
+      if (prepared.input !== JSON.stringify({ ...request, stream: false })) throw new Error('MA_MODEL_PREPARATION_MISMATCH');
+    }
     const payload = await this.callJsonTool(
       'chat_complete',
-      {
-        model: this.model.model,
-        messages: rawRequest.messages ?? [],
-        session_history_mode: 'replace',
-        metadata: this.buildMetadata(rawRequest.metadata, metadataOverride),
-        max_tokens: rawRequest.max_tokens ?? this.model.maxTokens ?? DEFAULT_AGORA_MAX_TOKENS,
-        temperature: rawRequest.temperature ?? this.model.temperature ?? 0.6,
-        timeout_seconds: resolveAgoraTimeoutSeconds(rawRequest.timeout_seconds, this.policy.requestTimeoutMs),
-        ...(rawRequest.stop !== undefined ? { stop: rawRequest.stop } : {}),
-        ...(rawRequest.tools !== undefined ? { tools: rawRequest.tools } : {}),
-        ...(rawRequest.tool_choice !== undefined ? { tool_choice: rawRequest.tool_choice } : {}),
-      },
+      prepared ? JSON.parse(prepared.bytes) : this.chatCompleteArguments(request, metadataOverride),
       options?.signal,
       true,
       options?.onEvent
@@ -1422,6 +1428,18 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
     return payload;
   }
 
+  private chatCompleteArguments(request: ChatCompletionCreateParamsNonStreaming | ChatCompletionCreateParamsStreaming,
+    metadataOverride?: Record<string, any>): Record<string, unknown> {
+    const raw = request as any;
+    return { model: this.model.model, messages: raw.messages ?? [], session_history_mode: 'replace',
+      metadata: this.buildMetadata(raw.metadata, metadataOverride),
+      max_tokens: raw.max_tokens ?? this.model.maxTokens ?? DEFAULT_AGORA_MAX_TOKENS,
+      temperature: raw.temperature ?? this.model.temperature ?? 0.6,
+      timeout_seconds: resolveAgoraTimeoutSeconds(raw.timeout_seconds, this.policy.requestTimeoutMs),
+      ...(raw.stop !== undefined ? { stop: raw.stop } : {}), ...(raw.tools !== undefined ? { tools: raw.tools } : {}),
+      ...(raw.tool_choice !== undefined ? { tool_choice: raw.tool_choice } : {}) };
+  }
+
   private buildMetadata(
     requestMetadata?: unknown,
     override?: Record<string, any>
@@ -1450,11 +1468,23 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
         : typeof payload.output_text === 'string'
           ? payload.output_text
           : '';
+    const rawUsage = payload.usage;
+    const usage = rawUsage && typeof rawUsage === 'object'
+      && ['prompt_tokens', 'completion_tokens', 'total_tokens'].every(key =>
+        typeof rawUsage[key] === 'number' && Number.isSafeInteger(rawUsage[key]) && rawUsage[key] >= 0)
+      ? { prompt_tokens: rawUsage.prompt_tokens, completion_tokens: rawUsage.completion_tokens,
+          total_tokens: rawUsage.total_tokens,
+          ...(rawUsage.prompt_tokens_details && typeof rawUsage.prompt_tokens_details === 'object'
+            ? { prompt_tokens_details: rawUsage.prompt_tokens_details } : {}),
+          ...(rawUsage.completion_tokens_details && typeof rawUsage.completion_tokens_details === 'object'
+            ? { completion_tokens_details: rawUsage.completion_tokens_details } : {}) }
+      : undefined;
     return {
       id: typeof payload.id === 'string' ? payload.id : `chatcmpl_agora_${Date.now()}`,
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
       model: this.model.model,
+      ...(usage ? { usage } : {}),
       choices: [
         {
           index: 0,
@@ -1517,6 +1547,12 @@ export class AgoraProviderRuntime implements AgoraMemoryController {
           model: completion.model,
           choices: [{ index: 0, delta: {}, finish_reason: finishReason as any }],
         } as ChatCompletionChunk;
+        if (completion.usage) {
+          yield {
+            id: completion.id, object: 'chat.completion.chunk', created: completion.created,
+            model: completion.model, choices: [], usage: completion.usage,
+          } as ChatCompletionChunk;
+        }
       },
     };
   }

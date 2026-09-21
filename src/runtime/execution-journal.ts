@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, unlink } from 'node:fs/promises';
+import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import type {
@@ -77,7 +77,7 @@ function object(value: unknown): Record<string, unknown> {
   for (const key of Reflect.ownKeys(value)) {
     if (typeof key !== 'string') invalid();
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) invalid();
+    if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) invalid();
   }
   return value as Record<string, unknown>;
 }
@@ -329,11 +329,13 @@ export async function openExecutionJournal(options: {
   directory: string;
   sessionId: string;
   ownerId: string;
+  hostIdentity?: string;
 }): Promise<ExecutionJournal> {
   const data = object(options);
   requiredOwn(data, ['directory', 'sessionId', 'ownerId']);
   const sessionId = id(data.sessionId);
   const ownerId = id(data.ownerId);
+  const hostIdentity = Object.hasOwn(data, 'hostIdentity') ? id(data.hostIdentity) : undefined;
   if (typeof data.directory !== 'string' || data.directory.trim().length === 0) invalid();
   const directory = resolve(data.directory);
   const lockPath = join(directory, '.writer.lock');
@@ -368,6 +370,8 @@ export async function openExecutionJournal(options: {
   try {
     const firstCreated = await mkdir(directory, { recursive: true, mode: 0o700 });
     directoryHandle = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY | NOFOLLOW);
+    try { await lstat(join(directory, '.recovery.lock')); throw new ExecutionJournalError('JOURNAL_LOCKED', 'Journal recovery owns this session'); }
+    catch (error) { if (!isCode(error, 'ENOENT')) throw error; }
     const ancestor = firstCreated ? dirname(resolve(firstCreated)) : dirname(directory);
     for (let path = dirname(directory); ; path = dirname(path)) {
       const parent = await open(path, constants.O_RDONLY | constants.O_DIRECTORY);
@@ -384,7 +388,8 @@ export async function openExecutionJournal(options: {
     }
     const lockStat = await lockHandle.stat();
     lockIdentity = { dev: lockStat.dev, ino: lockStat.ino };
-    await lockHandle.writeFile(JSON.stringify({ ownerId, sessionId, pid: process.pid, instanceId }) + '\n');
+    await lockHandle.writeFile(JSON.stringify({ ownerId, sessionId, pid: process.pid, instanceId,
+      ...(hostIdentity ? { hostIdentity } : {}) }) + '\n');
     await lockHandle.sync();
     await directoryHandle.sync();
     logHandle = await open(logPath, constants.O_RDWR | constants.O_CREAT | constants.O_APPEND | NOFOLLOW, 0o600);
@@ -470,5 +475,45 @@ export async function openExecutionJournal(options: {
     if (lockHandle) await lockHandle.close().catch(() => undefined);
     if (directoryHandle) await directoryHandle.close().catch(() => undefined);
     throw io(error);
+  }
+}
+
+/** Explicit same-Host takeover after OS evidence that the original writer no longer exists. */
+export async function recoverDeadExecutionWriter(options: {
+  directory: string; sessionId: string; hostIdentity: string;
+}): Promise<void> {
+  const data = object(options); keys(data, ['directory', 'sessionId', 'hostIdentity']);
+  const sessionId = id(data.sessionId); const hostIdentity = id(data.hostIdentity);
+  if (typeof data.directory !== 'string' || !data.directory.trim()) invalid();
+  const directory = resolve(data.directory);
+  const guardPath = join(directory, '.recovery.lock');
+  let guard: FileHandle;
+  try { guard = await open(guardPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | NOFOLLOW, 0o600); }
+  catch (error) { throw isCode(error, 'EEXIST') ? new ExecutionJournalError('JOURNAL_LOCKED', 'Recovery ownership needs verification') : io(error); }
+  let parent: FileHandle | undefined;
+  try {
+    parent = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY | NOFOLLOW);
+    await guard.writeFile(`${JSON.stringify({ pid: process.pid, hostIdentity, sessionId })}\n`); await guard.sync(); await parent.sync();
+    const path = join(directory, '.writer.lock');
+    const lock = await open(path, constants.O_RDONLY | NOFOLLOW);
+    try {
+      await regularFile(lock);
+      const original = await lock.stat();
+      const owner = object(JSON.parse(await lock.readFile('utf8')));
+      if (owner.sessionId !== sessionId || owner.hostIdentity !== hostIdentity
+        || typeof owner.pid !== 'number' || !Number.isSafeInteger(owner.pid) || owner.pid <= 0) {
+        throw new ExecutionJournalError('JOURNAL_LOCKED', 'Writer identity cannot be reconciled');
+      }
+      try { process.kill(owner.pid, 0); throw new ExecutionJournalError('JOURNAL_LOCKED', 'Original writer is still running'); }
+      catch (error) { if (!isCode(error, 'ESRCH')) throw error; }
+      const current = await lstat(path);
+      if (!current.isFile() || current.dev !== original.dev || current.ino !== original.ino) {
+        throw new ExecutionJournalError('JOURNAL_LOCKED', 'Writer ownership changed');
+      }
+      // Preserve the old ownership record. No age threshold, process kill or journal truncation.
+      await rename(path, join(directory, `.dead-writer-${randomUUID()}.json`)); await parent.sync();
+    } finally { await lock.close(); }
+  } finally {
+    try { await guard.close(); await unlink(guardPath); await parent?.sync(); } finally { await parent?.close(); }
   }
 }

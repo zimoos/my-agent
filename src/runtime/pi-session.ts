@@ -8,7 +8,9 @@ import {
   type AgentSession,
   type AgentSessionEvent,
   type ResourceLoader,
+  type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
+import type { ImageContent } from '@earendil-works/pi-ai';
 import type { SessionScope, TurnScope } from './contracts.js';
 
 export type PiSessionErrorCode =
@@ -48,6 +50,12 @@ export interface PiSessionOptions {
   providerId: string;
   modelId: string;
   systemPrompt: string;
+  integration?: {
+    sessionManager: SessionManager;
+    resourceLoader: ResourceLoader;
+    tools: ToolDefinition[];
+    compaction: boolean;
+  };
 }
 
 export interface PiPromptResult {
@@ -71,7 +79,10 @@ export interface PiObservedEvent {
 
 export interface PiSessionFacade {
   readonly engineSessionId: string;
-  prompt(text: string, turn: TurnScope): Promise<PiPromptResult>;
+  prompt(text: string, turn: TurnScope, images?: ImageContent[]): Promise<PiPromptResult>;
+  completeProtected(text: string, turn: TurnScope): Promise<PiPromptResult>;
+  compact(turn: TurnScope, instructions?: string): Promise<PiPromptResult>;
+  summarizeBranch(turn: TurnScope, targetEntryId: string, instructions?: string): Promise<PiPromptResult>;
   abort(turnId: string): Promise<PiCancelResult>;
   subscribe(listener: (event: PiObservedEvent) => void): () => void;
   close(): Promise<void>;
@@ -81,17 +92,17 @@ function fail(code: PiSessionErrorCode): never {
   throw new PiSessionError(code);
 }
 
-function record(value: unknown, keys: readonly string[]): Record<string, unknown> {
+function record(value: unknown, keys: readonly string[], optional: readonly string[] = []): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail('PI_INVALID_CONFIG');
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) fail('PI_INVALID_CONFIG');
   for (const key of keys) {
-    if (!Object.hasOwn(value, key)) fail('PI_INVALID_CONFIG');
+    if (!optional.includes(key) && !Object.hasOwn(value, key)) fail('PI_INVALID_CONFIG');
   }
   for (const key of Reflect.ownKeys(value)) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (typeof key !== 'string' || !keys.includes(key) || !descriptor
-      || !('value' in descriptor) || !descriptor.enumerable) fail('PI_INVALID_CONFIG');
+      || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) fail('PI_INVALID_CONFIG');
   }
   return value as Record<string, unknown>;
 }
@@ -158,6 +169,7 @@ interface PromptRun {
   abortFailed: boolean;
   modelFailed: boolean;
   finalStop?: string;
+  protectedCompletion?: boolean;
   finished: boolean;
   result: Promise<PiPromptResult>;
   cancelResult?: Promise<PiCancelResult>;
@@ -169,8 +181,9 @@ interface PromptRun {
 export async function createPiSessionFacade(options: PiSessionOptions): Promise<PiSessionFacade> {
   let session: AgentSession | undefined;
   let scope: SessionScope;
+  const allowedTools = new Set<string>();
   try {
-    const input = record(options, ['scope', 'agentDir', 'modelRuntime', 'providerId', 'modelId', 'systemPrompt']);
+    const input = record(options, ['scope', 'agentDir', 'modelRuntime', 'providerId', 'modelId', 'systemPrompt', 'integration'], ['integration']);
     scope = copyScope(input.scope);
     const agentDir = absoluteDirectory(input.agentDir);
     const providerId = identity(input.providerId);
@@ -179,6 +192,15 @@ export async function createPiSessionFacade(options: PiSessionOptions): Promise<
       fail('PI_INVALID_CONFIG');
     }
     const modelRuntime = input.modelRuntime;
+    const integration = Object.hasOwn(input, 'integration')
+      ? record(input.integration, ['sessionManager', 'resourceLoader', 'tools', 'compaction']) : undefined;
+    if (integration && (!(integration.sessionManager instanceof SessionManager)
+      || !Array.isArray(integration.tools) || typeof integration.compaction !== 'boolean')) fail('PI_INVALID_CONFIG');
+    const tools = (integration?.tools ?? []) as ToolDefinition[];
+    for (const tool of tools) {
+      if (typeof tool.name !== 'string' || allowedTools.has(tool.name) || typeof tool.execute !== 'function') fail('PI_INVALID_CONFIG');
+      allowedTools.add(tool.name);
+    }
     const model = modelRuntime.getModel(providerId, modelId);
     const provider = modelRuntime.getRegisteredProviderConfig(providerId);
     if (!model || model.provider !== providerId || model.id !== modelId
@@ -186,7 +208,7 @@ export async function createPiSessionFacade(options: PiSessionOptions): Promise<
 
     const settings = SettingsManager.inMemory({
       retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } },
-      cacheWarming: 'off', compaction: { enabled: false },
+      cacheWarming: 'off', compaction: { enabled: integration?.compaction === true },
       enableAnalytics: false, enableInstallTelemetry: false,
       packages: [], extensions: [], skills: [], prompts: [], themes: [], defaultTools: [],
       enableSkillCommands: false,
@@ -195,12 +217,14 @@ export async function createPiSessionFacade(options: PiSessionOptions): Promise<
     const created = await createAgentSession({
       cwd: scope.canonicalCwd, agentDir, modelRuntime, model: structuredClone(model),
       thinkingLevel: 'off', scopedModels: [{ model: structuredClone(model), thinkingLevel: 'off' }],
-      settingsManager: settings, sessionManager: SessionManager.inMemory(scope.canonicalCwd),
-      resourceLoader: emptyResources(input.systemPrompt), noTools: 'all', tools: [], customTools: [],
+      settingsManager: settings, sessionManager: integration?.sessionManager as SessionManager | undefined
+        ?? SessionManager.inMemory(scope.canonicalCwd),
+      resourceLoader: integration?.resourceLoader as ResourceLoader | undefined ?? emptyResources(input.systemPrompt),
+      noTools: 'builtin', tools: [...allowedTools], customTools: tools,
     });
     session = created.session;
     if (created.modelFallbackMessage || session.model?.provider !== providerId
-      || session.model.id !== modelId || session.getActiveToolNames().length !== 0) {
+      || session.model.id !== modelId || session.getActiveToolNames().some(name => !allowedTools.has(name))) {
       fail('PI_CREATE_FAILED');
     }
   } catch (error) {
@@ -243,16 +267,16 @@ export async function createPiSessionFacade(options: PiSessionOptions): Promise<
     if (event.type === 'agent_start' && (run.userCancelled || run.unexpectedTool || state === 'closing')) {
       requestSdkAbort(run);
     }
-    if (event.type === 'tool_execution_start' || event.type === 'tool_execution_update'
-      || event.type === 'tool_execution_end') unexpectedTool(run);
+    if ((event.type === 'tool_execution_start' || event.type === 'tool_execution_update'
+      || event.type === 'tool_execution_end') && (run.protectedCompletion || !allowedTools.has(event.toolName))) unexpectedTool(run);
     if (event.type === 'message_update' && event.assistantMessageEvent.type.startsWith('toolcall_')) {
-      unexpectedTool(run);
+      if (run.protectedCompletion || allowedTools.size === 0) unexpectedTool(run);
     }
     if (event.type === 'message_end' && event.message.role === 'assistant') {
       run.finalStop = event.message.stopReason;
       if (event.message.errorMessage) run.modelFailed = true;
-      if (event.message.stopReason === 'toolUse'
-        || event.message.content.some(block => block.type === 'toolCall')) unexpectedTool(run);
+      if (event.message.content.some(block => block.type === 'toolCall' && (run.protectedCompletion || !allowedTools.has(block.name)))
+        || (event.message.stopReason === 'toolUse' && (run.protectedCompletion || allowedTools.size === 0))) unexpectedTool(run);
     }
     if (event.type === 'auto_retry_start') {
       run.modelFailed = true;
@@ -273,9 +297,17 @@ export async function createPiSessionFacade(options: PiSessionOptions): Promise<
     }
   }
 
-  async function finishPrompt(run: PromptRun, text: string): Promise<PiPromptResult> {
+  async function finishPrompt(run: PromptRun, text: string, images?: ImageContent[], operation?: () => Promise<void>): Promise<PiPromptResult> {
+    const previousTools = sdk.getActiveToolNames();
+    const previousCompaction = sdk.autoCompactionEnabled;
     try {
-      try { await sdk.prompt(text, { expandPromptTemplates: false }); }
+      if (run.protectedCompletion) { sdk.setActiveToolsByName([]); sdk.setAutoCompactionEnabled(false); }
+      try {
+        if (!run.userCancelled) {
+          if (operation) await operation();
+          else await sdk.prompt(text, { expandPromptTemplates: false, images });
+        }
+      }
       catch { run.modelFailed = true; }
       try { await sdk.waitForIdle(); }
       catch { run.abortFailed = true; }
@@ -288,12 +320,13 @@ export async function createPiSessionFacade(options: PiSessionOptions): Promise<
       } else if (run.userCancelled) {
         result.status = 'cancelled';
         recentCancelled = { engineSessionId, turn: { ...run.turn }, localIdle: true };
-      } else if (run.modelFailed || run.finalStop !== 'stop') {
+      } else if (run.modelFailed || ((!operation || run.protectedCompletion) && run.finalStop !== 'stop')) {
         result.status = 'failed';
         result.error = errorResult('PI_MODEL_FAILED');
       }
       return result;
     } finally {
+      if (run.protectedCompletion) { sdk.setActiveToolsByName(previousTools); sdk.setAutoCompactionEnabled(previousCompaction); }
       run.finished = true;
       run.unsubscribe();
       if (active === run) active = undefined;
@@ -301,14 +334,53 @@ export async function createPiSessionFacade(options: PiSessionOptions): Promise<
     }
   }
 
+  function contextOperation(value: TurnScope, operation: () => Promise<void>, protectedCompletion = false): Promise<PiPromptResult> {
+    try {
+      if (state === 'closing' || state === 'closed') fail('PI_SESSION_CLOSED');
+      if (state === 'paused') fail('PI_ABORT_FAILED');
+      if (active) fail('PI_SESSION_BUSY');
+      const turn = copyTurn(value);
+      if (turn.sessionId !== scope.maSessionId || usedTurns.has(turn.turnId) || turn.epoch <= lastEpoch) fail('PI_TURN_MISMATCH');
+      usedTurns.add(turn.turnId); lastEpoch = turn.epoch; recentCancelled = undefined;
+      const run: PromptRun = { turn: Object.freeze(turn), userCancelled: false, unexpectedTool: false, protectedCompletion,
+        abortFailed: false, modelFailed: false, finished: false,
+        result: undefined as unknown as Promise<PiPromptResult>, abortRequests: [], unsubscribe: () => {} };
+      active = run; state = 'active'; run.unsubscribe = sdk.subscribe(event => observe(run, event));
+      run.result = Promise.resolve().then(() => finishPrompt(run, '', undefined, operation));
+      return run.result;
+    } catch (error) { return Promise.reject(error instanceof PiSessionError ? error : new PiSessionError('PI_INVALID_CONFIG')); }
+  }
+
   return {
     engineSessionId,
-    prompt(text, value) {
+    completeProtected(text, turn) {
+      if (typeof text !== 'string' || !text.trim()) return Promise.reject(new PiSessionError('PI_INVALID_CONFIG'));
+      return contextOperation(turn, () => sdk.prompt(text, { expandPromptTemplates: false }), true);
+    },
+    compact(turn, instructions) {
+      if (instructions !== undefined && typeof instructions !== 'string') return Promise.reject(new PiSessionError('PI_INVALID_CONFIG'));
+      return contextOperation(turn, async () => { await sdk.compact(instructions); });
+    },
+    summarizeBranch(turn, targetEntryId, instructions) {
+      if (typeof targetEntryId !== 'string' || !targetEntryId || (instructions !== undefined && typeof instructions !== 'string')) {
+        return Promise.reject(new PiSessionError('PI_INVALID_CONFIG'));
+      }
+      return contextOperation(turn, async () => {
+        const result = await sdk.navigateTree(targetEntryId, { summarize: true, customInstructions: instructions });
+        if (result.cancelled || result.aborted) throw new Error('MA_BRANCH_SUMMARY_CANCELLED');
+      });
+    },
+    prompt(text, value, images) {
       try {
         if (state === 'closing' || state === 'closed') fail('PI_SESSION_CLOSED');
         if (state === 'paused') fail('PI_ABORT_FAILED');
         if (active) fail('PI_SESSION_BUSY');
-        if (typeof text !== 'string' || text.trim().length === 0) fail('PI_INVALID_CONFIG');
+        if (typeof text !== 'string' || (text.trim().length === 0 && !images?.length)) fail('PI_INVALID_CONFIG');
+        const attachments = images?.map(image => {
+          const data = record(image, ['type', 'data', 'mimeType']);
+          if (data.type !== 'image' || typeof data.data !== 'string' || typeof data.mimeType !== 'string') fail('PI_INVALID_CONFIG');
+          return { type: 'image' as const, data: data.data, mimeType: data.mimeType };
+        });
         const turn = copyTurn(value);
         if (turn.sessionId !== scope.maSessionId || usedTurns.has(turn.turnId) || turn.epoch <= lastEpoch) {
           fail('PI_TURN_MISMATCH');
@@ -325,7 +397,7 @@ export async function createPiSessionFacade(options: PiSessionOptions): Promise<
         state = 'active';
         run.unsubscribe = sdk.subscribe(event => observe(run, event));
         // Install the run and its completion promise before any SDK preflight work.
-        run.result = Promise.resolve().then(() => finishPrompt(run, text));
+        run.result = Promise.resolve().then(() => finishPrompt(run, text, attachments));
         return run.result;
       } catch (error) {
         return Promise.reject(error instanceof PiSessionError ? error : new PiSessionError('PI_INVALID_CONFIG'));

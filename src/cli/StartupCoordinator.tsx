@@ -12,7 +12,7 @@ export interface StartupCoordinatorProps {
   debug?: boolean;
   onReady?: (boot: BootstrapResult) => void;
   onSwitchSession?: (sessionId: string) => void;
-  onRestartSession?: (sessionId: string) => void;
+  onRestartSession?: (sessionId?: string) => void;
 }
 
 type StartupState =
@@ -154,7 +154,7 @@ export function StartupCoordinator({
           onCancel={() => setModelChoices(null)}
           onSelect={(choice) => {
             saveDefaultModelChoice(choice);
-            onRestartSession?.(prepared.sessionId);
+            onRestartSession?.();
             app.exit();
           }}
         />

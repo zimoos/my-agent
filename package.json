@@ -4,6 +4,16 @@
   "description": "Local-first multi-model terminal coding agent",
   "homepage": "https://zimoos.github.io/my-agent/",
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    },
+    "./host": {
+      "types": "./dist/src/runtime/index.d.ts",
+      "import": "./dist/src/runtime/index.js"
+    }
+  },
   "engines": {
     "node": ">=22.19.0"
   },
@@ -24,7 +34,7 @@
     "start": "tsx src/cli/index.tsx",
     "verify:pi-dependencies": "node scripts/verify-pi-dependencies.mjs",
     "build": "npm run verify:pi-dependencies && tsc && chmod +x dist/src/cli/index.js bin/ma scripts/package-portable.mjs",
-    "package:portable": "npm run build && node scripts/package-portable.mjs --out release",
+    "package:portable": "node scripts/package-portable.mjs --out release",
     "sync:agora-release": "node scripts/sync-agora-release.mjs",
     "release:check": "npm test && npm run package:portable",
     "dev": "tsx watch src/cli/index.tsx",
@@ -38,7 +48,8 @@
     "visual:server": "tsx test/visual/server.ts",
     "benchmark": "tsx test/benchmark/runner/index.ts",
     "benchmark:L0": "tsx test/benchmark/runner/index.ts --level L0",
-    "benchmark:dry": "tsx test/benchmark/runner/index.ts --dry-run"
+    "benchmark:dry": "tsx test/benchmark/runner/index.ts --dry-run",
+    "export:runtime": "node scripts/export-ma-runtime.mjs"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "0.20.0",
@@ -65,7 +76,8 @@
     "picocolors": "^1.1.1",
     "react": "^19.2.5",
     "string-width": "^8.2.1",
-    "typebox": "1.3.27"
+    "typebox": "1.3.27",
+    "ws": "^8.20.0"
   },
   "optionalDependencies": {
     "@zimoos/agora": "0.2.0"
@@ -79,8 +91,7 @@
     "@types/ws": "^8.18.1",
     "node-pty": "^1.1.0",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2",
-    "ws": "^8.20.0"
+    "typescript": "^5.7.2"
   },
   "license": "MIT"
 }

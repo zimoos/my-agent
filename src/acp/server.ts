@@ -446,29 +446,9 @@ export class MaAcpAgent implements acp.Agent {
   }
 }
 
+/** Compatibility launcher: the historical event adapter above is never used by production startup. */
 export async function runAcpServer(options: MaAcpServerOptions = {}): Promise<void> {
-  const input = Writable.toWeb(process.stdout) as WritableStream<Uint8Array>;
-  const output = Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>;
-  let agent: MaAcpAgent | null = null;
-  const stream = acp.ndJsonStream(input, output);
-  new acp.AgentSideConnection((connection) => {
-    agent = new MaAcpAgent(connection, options);
-    return agent;
-  }, stream);
-
-  let stopping = false;
-  const stop = async (): Promise<void> => {
-    if (stopping) return;
-    stopping = true;
-    await agent?.shutdown();
-  };
-  const onSignal = (): void => {
-    void stop().finally(() => process.exit(0));
-  };
-  process.once('SIGINT', onSignal);
-  process.once('SIGTERM', onSignal);
-  await new Promise<void>((done) => process.stdin.once('end', done));
-  process.off('SIGINT', onSignal);
-  process.off('SIGTERM', onSignal);
-  await stop();
+  if (options.bootstrapSession) throw new Error('Legacy ACP bootstrap injection is not supported by the MA Next production launcher');
+  const { runStandaloneMaAcpServer } = await import('../runtime/local-acp.js');
+  return runStandaloneMaAcpServer(options);
 }

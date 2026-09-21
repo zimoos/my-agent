@@ -1,3 +1,4 @@
+import { buildContextEntries, sessionEntryToContextMessages, type SessionEntry } from '@earendil-works/pi-coding-agent';
 import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as path from 'node:path';
@@ -123,10 +124,64 @@ function pathsFor(sessionDir: string, sid: string): ContextWatchSnapshot['paths'
   };
 }
 
+function piSnapshot(sessionDir: string, sid: string): ContextWatchSnapshot | null {
+  const directory = path.join(sessionDir, sid);
+  const manifestPath = path.join(directory, 'manifest.json');
+  if (!fs.existsSync(manifestPath)) return null;
+  const read = (file: string): string => {
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try { if (!fs.fstatSync(fd).isFile()) throw new Error('Invalid session file'); return fs.readFileSync(fd, 'utf8'); }
+    finally { fs.closeSync(fd); }
+  };
+  const manifest = JSON.parse(read(manifestPath));
+  if (manifest.schemaVersion !== 2 || manifest.sessionId !== sid || typeof manifest.engineSessionFile !== 'string') throw new Error('Invalid MA session manifest');
+  const piRoot = path.join(directory, 'pi');
+  const relative = path.relative(piRoot, manifest.engineSessionFile);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative) || fs.realpathSync(piRoot) !== piRoot) throw new Error('Invalid Pi session path');
+  const text = read(manifest.engineSessionFile);
+  // A live writer may be appending the final line. Only complete JSON records are displayed.
+  const lines = text.slice(0, text.lastIndexOf('\n') + 1).split('\n').filter(Boolean).map(line => JSON.parse(line));
+  const [header, ...records] = lines;
+  if (header?.type !== 'session' || header.id !== manifest.engineSessionId) throw new Error('Invalid Pi session header');
+  const entries = records as SessionEntry[];
+  const activeEntries = buildContextEntries(entries);
+  const activeIds = new Set(activeEntries.map(entry => entry.id));
+  const index = new Map(entries.map((entry, i) => [entry.id, i]));
+  const projected = entries.flatMap(entry => sessionEntryToContextMessages(entry).map(message => ({ entry, message })));
+  const describe = (message: { role: string; content?: unknown }): string => {
+    if (typeof message.content === 'string') return message.content;
+    if (Array.isArray(message.content)) return message.content.map(block => {
+      if (block?.type === 'text') return String(block.text);
+      if (block?.type === 'image') return `[Image: ${String(block.mimeType)}; pixels not rendered in this text view]`;
+      if (block?.type === 'toolCall') return `Tool call ${String(block.name)} (${String(block.id)})`;
+      return JSON.stringify(block);
+    }).join('\n');
+    return JSON.stringify(message);
+  };
+  const role = (message: { role: string }): Role => message.role === 'toolResult' ? 'tool' : roleOf(message.role);
+  return {
+    sid, generatedAt: Date.now(), paths: { manifest: manifestPath, transcript: manifest.engineSessionFile },
+    visible: projected.map(({ entry, message }, seq) => ({ seq, i: index.get(entry.id), role: role(message), text: describe(message),
+      status: activeIds.has(entry.id) ? 'active' : 'moved' })),
+    llm: activeEntries.flatMap(entry => sessionEntryToContextMessages(entry).map(message => ({ i: index.get(entry.id)!, role: role(message),
+      mode: entry.type === 'compaction' || entry.type === 'branch_summary' ? 'summary' as const : 'raw' as const,
+      text: describe(message), changed: entry.type === 'compaction' || entry.type === 'branch_summary',
+      reason: 'Saved Pi context before trusted instruction, skill and current-frame request projection.' }))),
+    pool: projected.filter(({ entry }) => !activeIds.has(entry.id)).map(({ entry, message }) => ({ id: entry.id,
+      i: index.get(entry.id), role: role(message), text: describe(message), label: 'archived Pi branch or compacted history' })),
+    audit: entries.filter(entry => entry.type === 'custom' && entry.customType === 'ma.context_navigation').map(entry => ({
+      id: entry.id, createdAt: Date.parse(entry.timestamp), parseOk: true,
+    })),
+  };
+}
+
 export function buildContextWatchSnapshot(
   sessionDir: string,
   sid: string
 ): ContextWatchSnapshot {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(sid) || sid === '..') throw new Error('Invalid session identity');
+  const current = piSnapshot(sessionDir, sid);
+  if (current) return current;
   const files = pathsFor(sessionDir, sid);
   const transcript = readJsonl<any>(files.transcript);
   const index = readJsonl<TranscriptIndexEntry>(files.index);

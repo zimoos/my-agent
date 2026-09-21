@@ -1,4 +1,5 @@
 import OpenAI from 'openai';
+import { createHash } from 'node:crypto';
 import type { RequestOptions } from 'openai/core';
 import type {
   ChatCompletion,
@@ -9,6 +10,8 @@ import type {
 import pRetry, { AbortError as PRetryAbortError } from 'p-retry';
 import type { ModelConfig, ProviderSessionState } from '../mcp/types.js';
 import { createAgoraProviderRuntime, type AgoraProviderContext, type AgoraMemoryController } from './agora.js';
+import type { ModelCallContext } from '../runtime/contracts.js';
+import { resolveProviderCodec } from './detect.js';
 
 export const DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS = 180_000;
 export const DEFAULT_PROVIDER_MAX_RETRIES = 5;
@@ -54,6 +57,9 @@ export type ProviderRuntimeEvent = ProviderAttemptEvent | ProviderProgressEvent;
 export interface ProviderRunOptions {
   signal?: AbortSignal;
   onEvent?: (event: ProviderRuntimeEvent) => void;
+  /** Trusted per-attempt control-plane metadata; never copied into model messages. */
+  modelContext?: ModelCallContext;
+  headers?: Record<string, string>;
 }
 
 export class ProviderStreamIdleTimeoutError extends Error {
@@ -130,6 +136,9 @@ export interface ProviderRuntime {
   ): Promise<AsyncIterable<ChatCompletionChunk>>;
   getProviderState?(): ProviderSessionState | null;
   getMemoryController?(): AgoraMemoryController | null;
+  /** Local/direct service only: freeze the actual adapter-native payload for this call. */
+  prepareModelRequest?(context: ModelCallContext, request: ChatCompletionCreateParamsStreaming): Promise<string>;
+  discardPreparedModelRequest?(callId: string): void;
   close?(): Promise<void>;
 }
 
@@ -286,7 +295,7 @@ function pRetryAbort(err: unknown): never {
 export function createProviderRuntime(
   model: ModelConfig,
   overrideClient?: OpenAI,
-  context?: AgoraProviderContext
+  context?: AgoraProviderContext & { standalone?: boolean }
 ): ProviderRuntime {
   const policy = resolveProviderPolicy(model);
   if (model.provider?.toLowerCase() === 'agora') {
@@ -344,9 +353,58 @@ export function createProviderRuntime(
     );
   }
 
+  const codec = resolveProviderCodec(model);
+  const buildNativeRequest = (request: ChatCompletionCreateParamsStreaming): ChatCompletionCreateParamsStreaming => {
+    const extras = { ...(model.extraParams ?? {}) };
+    for (const key of ['model', 'messages', 'tools', 'tool_choice', 'stream', 'stream_options', 'max_tokens', 'max_completion_tokens', 'mteam_operation', 'preparedQuote']) {
+      if (Object.hasOwn(extras, key)) throw new Error('MA_MODEL_CONFIG_OVERRIDE_FORBIDDEN');
+    }
+    return {
+      ...(model.temperature !== undefined ? { temperature: model.temperature } : {}),
+      ...(model.topP !== undefined ? { top_p: model.topP } : {}),
+      ...(model.presencePenalty !== undefined ? { presence_penalty: model.presencePenalty } : {}),
+      ...(model.frequencyPenalty !== undefined ? { frequency_penalty: model.frequencyPenalty } : {}),
+      ...(model.topK !== undefined ? { top_k: model.topK } : {}),
+      ...(model.minP !== undefined ? { min_p: model.minP } : {}),
+      ...(model.repeatPenalty !== undefined ? { repeat_penalty: model.repeatPenalty } : {}),
+      ...extras, ...request, messages: codec.encodeMessages(request.messages), stream: true,
+    } as ChatCompletionCreateParamsStreaming;
+  };
+  const directRejection = (error: unknown, options: ProviderRunOptions | undefined, bytes: string): unknown => {
+    const body = error instanceof OpenAI.APIError ? error.error : undefined;
+    const embedded = body && typeof body === 'object' ? body as Record<string, unknown> : undefined;
+    const nested = embedded?.error && typeof embedded.error === 'object' ? embedded.error as Record<string, unknown> : undefined;
+    if (!context?.standalone || !options?.modelContext || !(error instanceof OpenAI.APIError)
+      || ![400, 401, 403, 404, 422].includes(error.status ?? 0) || !embedded || Array.isArray(embedded)
+      || Object.hasOwn(embedded, 'execution') || (nested && Object.hasOwn(nested, 'execution'))
+      || Object.keys(options.headers ?? {}).some(name => name.toLowerCase().startsWith('x-mteam-ma-'))) return error;
+    const code = error.status === 401 ? 'UNAUTHORIZED' : error.status === 403 ? 'FORBIDDEN'
+      : error.status === 404 ? 'MODEL_UNAVAILABLE' : 'MA_MODEL_REQUEST_REJECTED';
+    return Object.assign(new Error(code), { code, cause: error, error: { code, retryable: false,
+      execution: { callId: options.modelContext.callId, dispatchState: 'confirmed', providerAcceptance: 'not_accepted',
+        supplierRequestSha256: createHash('sha256').update(bytes, 'utf8').digest('hex') } } });
+  };
+  const preparedRequests = new Map<string, string>();
+  const nativeRequest = (request: ChatCompletionCreateParamsStreaming, options?: ProviderRunOptions): { params: ChatCompletionCreateParamsStreaming; bytes: string } => {
+    // OpenAI 4.x serializes JSON bodies with a two-space indent in its public client.
+    const bytes = JSON.stringify(options?.modelContext ? buildNativeRequest(request) : { ...request, stream: true }, null, 2);
+    const prepared = options?.modelContext ? preparedRequests.get(options.modelContext.callId) : undefined;
+    if (prepared !== undefined) {
+      preparedRequests.delete(options!.modelContext!.callId);
+      if (prepared !== bytes) throw new Error('MA_MODEL_PREPARATION_MISMATCH');
+    }
+    return { params: JSON.parse(prepared ?? bytes) as ChatCompletionCreateParamsStreaming, bytes: prepared ?? bytes };
+  };
   return {
     client,
     policy,
+    discardPreparedModelRequest(callId) { preparedRequests.delete(callId); },
+    async prepareModelRequest(context, request) {
+      const bytes = JSON.stringify(buildNativeRequest(request), null, 2);
+      if (preparedRequests.size >= 256 || preparedRequests.has(context.callId)) throw new Error('MA_MODEL_PREPARATION_CONFLICT');
+      preparedRequests.set(context.callId, bytes);
+      return createHash('sha256').update(bytes, 'utf8').digest('hex');
+    },
     createChatCompletion(request, options) {
       return runWithRetry(
         false,
@@ -354,7 +412,7 @@ export function createProviderRuntime(
           raceWithTimeout(
             client.chat.completions.create(
               { ...request, stream: false },
-              { signal: options?.signal } as RequestOptions
+              { signal: options?.signal, headers: options?.headers } as RequestOptions
             ) as unknown as Promise<ChatCompletion>,
             policy.requestTimeoutMs,
             options?.signal
@@ -363,14 +421,16 @@ export function createProviderRuntime(
       );
     },
     createStreamingChatCompletion(request, options) {
+      const frozen = nativeRequest(request, options);
       return runWithRetry(
         true,
         async () => {
           const start = await openStreamAndReadFirstChunk(
             () =>
               client.chat.completions.create(
-              { ...request, stream: true },
-              { signal: options?.signal } as RequestOptions
+              frozen.params,
+              // Public RequestOptions.body accepts an ArrayBuffer view. The SDK forwards these exact frozen bytes.
+              { body: Buffer.from(frozen.bytes, 'utf8'), signal: options?.signal, headers: options?.headers } as RequestOptions
               ) as unknown as Promise<AsyncIterable<ChatCompletionChunk>>,
             policy,
             options?.signal
@@ -382,7 +442,7 @@ export function createProviderRuntime(
           );
         },
         options
-      );
+      ).catch(error => { throw directRejection(error, options, frozen.bytes); });
     },
   };
 }

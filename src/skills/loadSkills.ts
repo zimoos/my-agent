@@ -23,6 +23,9 @@ export interface ParsedSkill {
   filePath: string;
 }
 
+// Runtime resource loading reuses parsing/rendering without the legacy auto-create/discovery path.
+export { parseFrontmatter as parseSkillDocument, substituteTemplate as renderSkillTemplate };
+
 function parseFrontmatter(content: string): { frontmatter: SkillFrontmatter; body: string } {
   const frontmatterRegex = /^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/;
   const match = content.match(frontmatterRegex);

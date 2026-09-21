@@ -49,7 +49,7 @@ export interface AppProps {
   currentSessionId: string;
   debug?: boolean;
   onSwitchSession?: (sessionId: string) => void;
-  onRestartSession?: (sessionId: string) => void;
+  onRestartSession?: (sessionId?: string) => void;
   initialPrompt?: string;
   initialDraft?: string;
   startupStatus?: string;
@@ -278,6 +278,10 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
   }, [config, memoryController, store]);
 
   const switchModelChoice = useCallback(async (model: ModelChoice) => {
+    if (store.getState().thinking || pendingConfirm || intakeInFlightRef.current || agent.getTaskStack().current()) {
+      store.pushMessage({ kind: 'system', id: nextSysId(), text: '[请先等待当前任务和记忆操作结束，再选择模型并创建新会话。]' });
+      return;
+    }
     if (model.provider === 'agora' && model.status && model.status !== 'available') {
       if (!memoryController?.getCapabilities().modelDownload) {
         store.pushMessage({ kind: 'system', id: nextSysId(), text: '[Agora runtime 不支持模型下载，请升级 Agora]' });
@@ -294,17 +298,21 @@ export function App({ config, connections, agent, sessionStore, currentSessionId
         return;
       }
     }
+    if (store.getState().thinking || agent.getTaskStack().current()) {
+      store.pushMessage({ kind: 'system', id: nextSysId(), text: '[当前任务仍在执行，模型未切换。]' });
+      return;
+    }
     setModelPickerModels(null);
     saveDefaultModelChoice(model);
     store.pushMessage({
       kind: 'system',
       id: nextSysId(),
-      text: `[已切换默认模型: ${model.label}，正在重启当前会话]`,
+      text: `[已切换默认模型: ${model.label}，正在创建全新会话；旧会话保持原模型并只读保留]`,
     });
     log(`switch model: ${model.id}`);
-    onRestartSession?.(currentSessionId);
+    onRestartSession?.();
     app.exit();
-  }, [app, currentSessionId, log, memoryController, onRestartSession, store]);
+  }, [agent, app, log, memoryController, onRestartSession, pendingConfirm, store]);
 
   const handleSubmit = useCallback(
     (text: string) => {

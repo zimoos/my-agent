@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { runAcpServer } from './server.js';
+import { runStandaloneMaAcpServer as runAcpServer } from '../runtime/local-acp.js';
 
 function optionValue(name: string): string | undefined {
   const index = process.argv.indexOf(name);

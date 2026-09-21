@@ -18,8 +18,7 @@ import { StartupCoordinator } from './StartupCoordinator.js';
 import { VERSION } from './version.js';
 import { assertInteractiveInput, TerminalInputError } from './terminal.js';
 import { runContextWatch } from './watch.js';
-import { createContextManager } from '../agent/context-manager.js';
-import { runAcpServer } from '../acp/server.js';
+import { runStandaloneMaAcpServer as runAcpServer } from '../runtime/local-acp.js';
 
 let activeConnections: McpConnection[] = [];
 let activeAgent: Agent | undefined;
@@ -109,6 +108,7 @@ async function runChat(configPath: string | undefined, runOpts: RunChatOptions):
     }
     let boot: BootstrapResult | undefined;
     let nextSessionId: string | null = null;
+    let restartFresh = false;
 
     const { waitUntilExit } = render(
       <StartupCoordinator
@@ -123,7 +123,8 @@ async function runChat(configPath: string | undefined, runOpts: RunChatOptions):
           nextSessionId = id;
         }}
         onRestartSession={(id) => {
-          nextSessionId = id;
+          if (id === undefined) restartFresh = true;
+          else nextSessionId = id;
         }}
       />,
     );
@@ -145,6 +146,7 @@ async function runChat(configPath: string | undefined, runOpts: RunChatOptions):
       activeAgent = undefined;
     }
 
+    if (restartFresh) { resume = undefined; continue; }
     if (!nextSessionId) break;
     resume = nextSessionId;
   }
@@ -246,7 +248,7 @@ async function main(): Promise<void> {
       await runAcpServer({ configPath: opts.config, sessionDir: opts.sessionDir });
     });
 
-  program
+  const sessionsCommand = program
     .command('sessions')
     .description('List saved sessions')
     .option('--prune', 'delete old sessions, keeping the most recent 20')
@@ -270,6 +272,41 @@ async function main(): Promise<void> {
       }
     });
 
+  const checkedSessionId = (id: string) => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(id) || id === '..') throw new Error('Invalid MA session identity');
+    return id;
+  };
+  sessionsCommand.command('show <sessionId>').description('Read a saved legacy transcript without executing or migrating it')
+    .action((id: string) => {
+      const store = createSessionStore(); checkedSessionId(id);
+      if (fs.existsSync(path.join(store.getSessionDir(), id, 'manifest.json'))) {
+        throw new Error('This is a Pi session. Use ma ctx list --session <id> or resume it with ma chat --resume <id>.');
+      }
+      if (!store.list().some(item => item.id === id)) throw new Error('Saved session not found');
+      console.log(`Read-only legacy archive: ${id}. No execution or recovery is performed.`);
+      for (const message of store.load(id)) console.log(JSON.stringify(message));
+    });
+  sessionsCommand.command('migrate <sessionId>').description('Create a fresh Pi session from an explicitly supplied handoff, preserving the old archive')
+    .requiredOption('--goal <text>', 'goal for the new session')
+    .requiredOption('--artifacts <text>', 'existing artifact paths, or none')
+    .requiredOption('--verification <text>', 'verified results and remaining failures; do not include secrets')
+    .requiredOption('--receipts <text>', 'unresolved receipt references, or explicitly none known')
+    .option('-c, --config <path>', 'selected current model profile configuration')
+    .action(async (id: string, opts: { goal: string; artifacts: string; verification: string; receipts: string; config?: string }) => {
+      const store = createSessionStore(); checkedSessionId(id);
+      const previous = store.list().find(item => item.id === id);
+      if (!previous) throw new Error('Saved session not found');
+      if (fs.existsSync(path.join(store.getSessionDir(), id, 'manifest.json'))) throw new Error('The selected session is already a Pi session');
+      const clean = (text: string) => text.replace(/\bBearer\s+[^\s]+/gi, 'Bearer [redacted]')
+        .replace(/\bsk-[A-Za-z0-9_-]{8,}/g, '[redacted]')
+        .replace(/((?:api[_-]?key|token|secret|password)\s*[:=]\s*)[^\s,;]+/gi, '$1[redacted]');
+      const summary = `User-authorized legacy handoff (archive ${id}). The original transcript is not imported.\nGoal: ${clean(opts.goal)}\nArtifacts: ${clean(opts.artifacts)}\nVerification: ${clean(opts.verification)}\nUnresolved receipt references: ${clean(opts.receipts)}\nMigration does not confirm or repeat any previous external action. Verify unresolved receipts before acting.`;
+      const boot = await bootstrap(opts.config, { cwd: previous.cwd });
+      try { boot.agent.pinContext(summary); await boot.agent.close(); }
+      finally { await shutdown(boot.connections); }
+      console.log(`New Pi session: ${boot.sessionId}\nOld archive retained: ${id}\nNo model request was made. Resume explicitly with ma chat --resume ${boot.sessionId}.`);
+    });
+
   program
     .command('watch')
     .description('Start local context watch UI for a session')
@@ -291,132 +328,39 @@ async function main(): Promise<void> {
       });
     });
 
-  const ctx = program
-    .command('ctx')
-    .description('Inspect MA context index (debug/compat)');
-
-  ctx
-    .command('list')
-    .description('List context sidecar items')
-    .option('--session <id>', 'session id')
-    .action((opts: { session?: string }) => {
-      const sid = opts.session;
-      if (!sid) {
-        console.error(pc.red('--session is required when running outside agent'));
-        process.exit(1);
-      }
-      const store = createSessionStore();
-      const cm = createContextManager(sid, store.getSessionDir());
-      const items = cm.active();
-      if (items.length === 0) {
-        console.log(pc.dim('empty'));
-        return;
-      }
-      for (const item of items) {
-        const summary = (item.content || '').replace(/\s+/g, ' ').slice(0, 100);
-        console.log(`${pc.cyan(`i=${item.i}`)} ${pc.dim(item.role)} ${pc.dim(item.mode)} ${summary}`);
-      }
+  const ctx = program.command('ctx').description('Inspect or edit the active Pi context; saved branches remain archived');
+  const withContext = async <T,>(sessionId: string | undefined, action: (agent: Agent) => T): Promise<T> => {
+    if (!sessionId) throw new Error('--session is required when running outside agent');
+    const boot = await bootstrap(undefined, { resume: sessionId });
+    try { return action(boot.agent); }
+    finally { try { await boot.agent.close(); } finally { await shutdown(boot.connections); } }
+  };
+  ctx.command('list').description('List the active Pi branch').option('--session <id>', 'session id')
+    .action(async (opts: { session?: string }) => {
+      const items = await withContext(opts.session, agent => agent.activeContext());
+      if (!items.length) console.log(pc.dim('empty'));
+      for (const item of items) console.log(`${pc.cyan(`i=${item.i}`)} ${pc.dim(item.role)} ${(item.content ?? '').replace(/\s+/g, ' ').slice(0, 100)}`);
     });
-
-  ctx
-    .command('rm')
-    .description('Move a context sidecar item to pool')
-    .argument('<i>', 'context index')
-    .option('--session <id>', 'session id')
-    .action((i: string, opts: { session?: string }) => {
-      const sid = opts.session;
-      if (!sid) {
-        console.error(pc.red('--session is required when running outside agent'));
-        process.exit(1);
-      }
-      const store = createSessionStore();
-      const cm = createContextManager(sid, store.getSessionDir());
-      const result = cm.drop(Number.parseInt(i, 10));
-      console.log(result);
+  ctx.command('rm').description('Remove the latest user turn from active context, preserving its archived records')
+    .argument('<i>', 'index in the latest user turn').option('--session <id>', 'session id')
+    .action(async (i: string, opts: { session?: string }) => {
+      if (!/^\d+$/.test(i)) throw new Error('Context index must be an integer');
+      console.log(await withContext(opts.session, agent => agent.dropContext(Number(i))));
     });
-
-  ctx
-    .command('search')
-    .description('Search session pool')
-    .argument('<query>', 'search query')
-    .option('--session <id>', 'session id')
-    .action((query: string, opts: { session?: string }) => {
-      const sid = opts.session;
-      if (!sid) {
-        console.error(pc.red('--session is required when running outside agent'));
-        process.exit(1);
-      }
-      const store = createSessionStore();
-      const cm = createContextManager(sid, store.getSessionDir());
-      const results = cm.search(query);
-      if (results.length === 0) {
-        console.log(pc.dim('no results'));
-        return;
-      }
-      for (const entry of results) {
-        const snippet = (entry.summary || entry.text).replace(/\s+/g, ' ').slice(0, 120);
-        console.log(`${pc.cyan(entry.id)} ${pc.dim(`i=${entry.i}`)} ${snippet}`);
-      }
+  ctx.command('search').description('Search the current Pi branch').argument('<query>', 'search query').option('--session <id>', 'session id')
+    .action(async (query: string, opts: { session?: string }) => {
+      const found = await withContext(opts.session, agent => agent.searchContext(query));
+      if (!found.length) console.log(pc.dim('no results'));
+      for (const entry of found) console.log(`${pc.cyan(entry.id)} ${pc.dim(`i=${entry.i}`)} ${entry.text.replace(/\s+/g, ' ').slice(0, 120)}`);
     });
-
-  ctx
-    .command('recall')
-    .description('Recall a pool entry to the context sidecar')
-    .argument('<id>', 'pool entry id or index')
-    .option('--session <id>', 'session id')
-    .action((id: string, opts: { session?: string }) => {
-      const sid = opts.session;
-      if (!sid) {
-        console.error(pc.red('--session is required when running outside agent'));
-        process.exit(1);
-      }
-      const store = createSessionStore();
-      const cm = createContextManager(sid, store.getSessionDir());
-      const result = cm.recall(id);
-      console.log(result);
-    });
-
-  ctx
-    .command('pin')
-    .description('Pin text into the context sidecar')
-    .argument('<text>', 'text to pin')
-    .option('--session <id>', 'session id')
-    .action((text: string, opts: { session?: string }) => {
-      const sid = opts.session;
-      if (!sid) {
-        console.error(pc.red('--session is required when running outside agent'));
-        process.exit(1);
-      }
-      const store = createSessionStore();
-      const cm = createContextManager(sid, store.getSessionDir());
-      const result = cm.pin(text);
-      console.log(result);
-    });
-
-  ctx
-    .command('say')
-    .description('Output text as a message (for parallel tool calls)')
-    .argument('<text>', 'text to output')
-    .option('--session <id>', 'session id')
-    .action((text: string, _opts: { session?: string }) => {
-      console.log(text);
-    });
-
-  ctx
-    .command('clear')
-    .description('Clear context sidecar items')
-    .option('--session <id>', 'session id')
-    .action((opts: { session?: string }) => {
-      const sid = opts.session;
-      if (!sid) {
-        console.error(pc.red('--session is required when running outside agent'));
-        process.exit(1);
-      }
-      const store = createSessionStore();
-      const cm = createContextManager(sid, store.getSessionDir());
-      const result = cm.clearActive();
-      console.log(result);
-    });
+  ctx.command('recall').description('Append a selected prior message as explicit user context').argument('<id>', 'Pi entry id').option('--session <id>', 'session id')
+    .action(async (id: string, opts: { session?: string }) => console.log(await withContext(opts.session, agent => agent.recallContext(id))));
+  ctx.command('pin').description('Append explicit user context to the Pi branch').argument('<text>', 'text to pin').option('--session <id>', 'session id')
+    .action(async (text: string, opts: { session?: string }) => console.log(await withContext(opts.session, agent => agent.pinContext(text))));
+  ctx.command('clear').description('Start an empty context branch without deleting saved executions').option('--session <id>', 'session id')
+    .action(async (opts: { session?: string }) => console.log(await withContext(opts.session, agent => agent.clearActiveContext())));
+  ctx.command('say').description('Output text as a message').argument('<text>', 'text to output').option('--session <id>', 'session id')
+    .action((text: string) => console.log(text));
 
   program
     .command('profiles')

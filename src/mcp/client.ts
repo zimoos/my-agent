@@ -35,6 +35,11 @@ interface JsonRpcResponse {
 
 const REQUEST_TIMEOUT_MS = 30_000;
 const PROTOCOL_VERSION = '2024-11-05';
+export function mcpRequestTimeout(config: McpServerConfig): number {
+  const value = config.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+  if (!Number.isSafeInteger(value) || value < 1000 || value > 3_600_000) throw new Error('MCP timeout must be an integer between 1000 and 3600000 milliseconds');
+  return value;
+}
 const MAX_TOOL_IMAGE_BASE64_CHARS = 24 * 1024 * 1024;
 const SAFE_IMAGE_MIME = /^image\/(?:png|jpeg|webp)$/;
 
@@ -59,7 +64,13 @@ function toolContentBlock(value: unknown): ToolContentBlock | null {
 }
 
 export function buildMcpEnv(extraEnv: Record<string, string> = {}): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, ...extraEnv };
+  // A server receives only its approved environment, never unrelated Host/model credentials.
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of ['PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'LC_CTYPE',
+    'TZ', 'TERM', 'COLORTERM', 'SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS']) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  Object.assign(env, extraEnv);
   const extraCerts = env.NODE_EXTRA_CA_CERTS;
   if (extraCerts) {
     try {
@@ -101,6 +112,7 @@ export class McpClient implements McpConnection {
   name: string;
   process: ChildProcess;
   tools: McpTool[] = [];
+  capabilities: NonNullable<McpConnection['capabilities']> = { transport: 'stdio', cancellation: 'request-only', server: {} };
 
   private nextId = 1;
   private pending = new Map<number, Pending>();
@@ -230,6 +242,7 @@ export class McpClient implements McpConnection {
       }
 
       const timer = setTimeout(() => {
+        try { this.notify('notifications/cancelled', { requestId: id, reason: 'Request deadline reached' }); } catch { /* Still unknown. */ }
         this.pending.delete(id);
         if (progressToken !== undefined) this.progressHandlers.delete(progressToken);
         if (signal && onAbort) signal.removeEventListener('abort', onAbort);
@@ -254,6 +267,7 @@ export class McpClient implements McpConnection {
           signalLimitApplied.add(signal);
         }
         onAbort = () => {
+          try { this.notify('notifications/cancelled', { requestId: id, reason: 'Caller cancelled' }); } catch { /* Outcome remains unknown. */ }
           clearTimeout(timer);
           this.pending.delete(id);
           if (progressToken !== undefined) this.progressHandlers.delete(progressToken);
@@ -289,11 +303,12 @@ export class McpClient implements McpConnection {
   }
 
   async initialize(): Promise<void> {
-    await this.request('initialize', {
+    const initialized = await this.request('initialize', {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: { tools: {} },
       clientInfo: { name: 'my-agent', version: VERSION },
     });
+    this.capabilities.server = initialized?.capabilities ?? {};
     try {
       this.notify('notifications/initialized');
     } catch {
@@ -302,13 +317,7 @@ export class McpClient implements McpConnection {
   }
 
   async listTools(): Promise<McpTool[]> {
-    const result = await this.request('tools/list', {});
-    const raw = Array.isArray(result?.tools) ? result.tools : [];
-    this.tools = raw.map((t: any) => ({
-      name: String(t.name),
-      description: String(t.description ?? ''),
-      inputSchema: t.inputSchema ?? { type: 'object', properties: {} },
-    }));
+    this.tools = await collectMcpTools(params => this.request('tools/list', params));
     return this.tools;
   }
 
@@ -316,14 +325,76 @@ export class McpClient implements McpConnection {
     toolName: string,
     args: Record<string, any>,
     signal?: AbortSignal,
-    onProgress?: (event: McpProgressEvent) => void
+    onProgress?: (event: McpProgressEvent) => void,
+    transportMeta?: Record<string, unknown>
   ): Promise<McpCallResult> {
     const result = await this.request(
       'tools/call',
-      { name: toolName, arguments: args ?? {} },
+      { name: toolName, arguments: args ?? {}, ...(transportMeta ? { _meta: transportMeta } : {}) },
       signal,
       onProgress
     );
+    return normalizeMcpCallResult(result);
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    for (const p of this.pending.values()) {
+      clearTimeout(p.timer);
+      p.reject(new Error(`MCP '${this.name}' connection closing`));
+    }
+    this.pending.clear();
+    this.progressHandlers.clear();
+    try { this.process.stdin?.end(); } catch { /* ignore */ }
+    if (this.process.exitCode === null && this.process.signalCode === null) {
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(t);
+          this.process.off('exit', finish);
+          resolve();
+        };
+        const t = setTimeout(() => {
+          try { this.process.kill('SIGKILL'); } catch { /* ignore */ }
+          finish();
+        }, 2000);
+        this.process.once('exit', finish);
+        try { this.process.kill('SIGTERM'); } catch { finish(); }
+        if (this.process.exitCode !== null || this.process.signalCode !== null) finish();
+      });
+    }
+  }
+}
+
+export async function collectMcpTools(list: (params: { cursor?: string }) => Promise<any>): Promise<McpTool[]> {
+  const tools: McpTool[] = [];
+  const names = new Set<string>();
+  const cursors = new Set<string>();
+  let cursor: string | undefined;
+  for (let page = 0; page < 1024; page++) {
+    const result = await list(cursor ? { cursor } : {});
+    if (!Array.isArray(result?.tools)) throw new Error('MCP tools/list returned an invalid catalog');
+    for (const tool of result.tools) {
+      if (typeof tool?.name !== 'string' || !tool.name || names.has(tool.name)
+        || !tool.inputSchema || typeof tool.inputSchema !== 'object') throw new Error('MCP tool catalog is invalid or ambiguous');
+      names.add(tool.name);
+      tools.push({ name: tool.name, description: typeof tool.description === 'string' ? tool.description : '',
+        inputSchema: tool.inputSchema,
+        ...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
+        ...(tool.annotations ? { annotations: tool.annotations } : {}),
+        ...(tool._meta ? { _meta: tool._meta } : {}) });
+    }
+    if (result.nextCursor === undefined) return tools;
+    if (typeof result.nextCursor !== 'string' || !result.nextCursor || cursors.has(result.nextCursor)) throw new Error('MCP pagination did not advance');
+    cursor = result.nextCursor as string; cursors.add(cursor);
+  }
+  throw new Error('MCP catalog exceeds the supported pagination limit');
+}
+
+export function normalizeMcpCallResult(result: any): McpCallResult {
     const contentArr = Array.isArray(result?.content) ? result.content : [];
     const contentBlocks = contentArr
       .map(toolContentBlock)
@@ -348,63 +419,25 @@ export class McpClient implements McpConnection {
       callResult._meta = result._meta;
     }
     return callResult;
-  }
-
-  async close(): Promise<void> {
-    if (this.closed) return;
-    this.closed = true;
-    for (const p of this.pending.values()) {
-      clearTimeout(p.timer);
-      p.reject(new Error(`MCP '${this.name}' connection closing`));
-    }
-    this.pending.clear();
-    this.progressHandlers.clear();
-    try {
-      this.process.stdin?.end();
-    } catch {
-      /* ignore */
-    }
-    if (this.process.exitCode === null && this.process.signalCode === null) {
-      await new Promise<void>((resolve) => {
-        let settled = false;
-        const finish = () => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(t);
-          this.process.off('exit', finish);
-          resolve();
-        };
-        const t = setTimeout(() => {
-          try {
-            this.process.kill('SIGKILL');
-          } catch {
-            /* ignore */
-          }
-          finish();
-        }, 2000);
-        this.process.once('exit', finish);
-        try {
-          this.process.kill('SIGTERM');
-        } catch {
-          finish();
-        }
-        if (this.process.exitCode !== null || this.process.signalCode !== null) finish();
-      });
-    }
-  }
 }
 
 export async function connectMcpServer(
   name: string,
   config: McpServerConfig
 ): Promise<McpConnection> {
+  if (config.transport === 'http' || config.url) {
+    const { connectHttpMcpServer } = await import('./http-client.js');
+    return connectHttpMcpServer(name, config);
+  }
+  if (typeof config.command !== 'string' || !config.command) throw new Error('MCP stdio command is required');
+  mcpRequestTimeout(config);
   const child = spawn(config.command, config.args ?? [], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: buildMcpEnv(config.env),
     cwd: config.cwd,
   });
 
-  const client = new McpClient(name, child);
+  const client = new McpClient(name, child, mcpRequestTimeout(config));
 
   try {
     await client.initialize();

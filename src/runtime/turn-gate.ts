@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { indexExecutionHistory } from './recovery-index.js';
 import type {
   Invocation, InvocationOrigin, ModelCallBinding, ModelCallReceipt, ToolReceipt,
   TurnCompletion, TurnScope,
@@ -37,6 +38,8 @@ export interface TurnGate {
   complete(turnId: string): Promise<TurnCompletion>;
   stop(turnId: string): Promise<{ revokedEpoch: number; inFlightExecutionIds: string[] }>;
   snapshot(): TurnGateSnapshot;
+  /** Explicit reconciliation of durable facts; it grants no new Turn or budget. */
+  recover(): Promise<TurnGateSnapshot>;
 }
 
 type TurnErrorCode =
@@ -100,7 +103,7 @@ function object(
   for (const key of Reflect.ownKeys(value)) {
     if (typeof key !== 'string' || !allowed.includes(key)) invalid();
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) invalid();
+    if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) invalid();
   }
   return value as Record<string, unknown>;
 }
@@ -395,6 +398,48 @@ async function initializeTurnGate(options: {
   }
 
   return {
+    recover() {
+      return enqueue(async () => {
+        if (currentTurn || registration || [...models.values()].some(model => model.pendingReceipt)
+          || [...bindings.values()].some(binding => binding.pendingReceipt)) throw new TurnGateError('TURN_CONFLICT');
+        if (pauseCode && pauseCode !== 'TURN_RECOVERY_REQUIRED') throw new TurnGateError(pauseCode);
+        const history = await journal.read();
+        if (history.incompleteTail) throw new TurnGateError('TURN_RECOVERY_REQUIRED');
+        let recovered;
+        try { recovered = indexExecutionHistory(history.entries); }
+        catch { pause('TURN_RECOVERY_REQUIRED'); throw new TurnGateError('TURN_RECOVERY_REQUIRED'); }
+        models.clear(); bindings.clear(); inFlight.clear(); inFlightModels.clear(); toolIdentities.clear(); executions.clear();
+        revoked.clear(); completions.clear(); stopping.clear();
+        for (const [callId, model] of recovered.models) {
+          models.set(callId, { call: copyModel(model.call), prepared: true, dispatchRequested: model.dispatched,
+            dispatching: model.dispatched, unknownPending: false, ...(model.receipt ? { receipt: copyModelReceipt(model.receipt) } : {}) });
+          if (!model.receipt || model.receipt.status === 'unknown') inFlightModels.set(callId, copyModel(model.call));
+        }
+        for (const [executionId, tool] of recovered.tools) {
+          bindings.set(executionId, { invocation: copyInvocation(tool.invocation), origin: copyOrigin(tool.origin), bound: true,
+            binding: Promise.resolve(), ...(tool.receipt ? { receipt: copyReceipt(tool.receipt) } : {}) });
+          toolIdentities.set(JSON.stringify([sessionId, tool.invocation.epoch, tool.origin.callId, tool.invocation.toolCallId]), executionId);
+          if (tool.dispatched) executions.add(executionId);
+          if (!tool.receipt || tool.receipt.status === 'unknown') inFlight.set(executionId, copyInvocation(tool.invocation));
+        }
+        for (const turnId of recovered.revoked) revoked.add(turnId);
+        for (const [turnId, journalSeq] of recovered.completed) {
+          const turn = recovered.turns.get(turnId)!;
+          completions.set(turnId, Promise.resolve({ sessionId, turnId, epoch: turn.epoch, journalSeq }));
+        }
+        lastEpoch = recovered.lastEpoch; boundOperation = recovered.boundOperation; boundBudget = recovered.boundBudget;
+        if (recovered.current) {
+          // An interrupted Turn stays revoked; a later Host must issue a strictly newer epoch.
+          await append({ ...eventFields(recovered.current), kind: 'turn.revoked' });
+          revoked.add(recovered.current.turnId);
+        }
+        currentTurn = null; registration = undefined;
+        if (unresolved()) pause('TURN_RECOVERY_REQUIRED');
+        else { pauseCode = undefined; state = 'ready'; }
+        return { sessionId, state, currentTurn: null, lastEpoch,
+          inFlightExecutionIds: [...inFlight.keys()], inFlightCallIds: [...inFlightModels.keys()] };
+      });
+    },
     register(value) {
       try {
         usable();
