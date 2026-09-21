@@ -422,6 +422,10 @@ export function createProviderRuntime(
     },
     createStreamingChatCompletion(request, options) {
       const frozen = nativeRequest(request, options);
+      const bytes = Buffer.from(frozen.bytes, 'utf8');
+      // OpenAI 4.x preserves DataView ranges, but widens other ArrayBuffer views
+      // to their entire backing buffer. A small Node Buffer may share a pool.
+      const body = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
       return runWithRetry(
         true,
         async () => {
@@ -429,8 +433,8 @@ export function createProviderRuntime(
             () =>
               client.chat.completions.create(
               frozen.params,
-              // Public RequestOptions.body accepts an ArrayBuffer view. The SDK forwards these exact frozen bytes.
-              { body: Buffer.from(frozen.bytes, 'utf8'), signal: options?.signal, headers: options?.headers } as RequestOptions
+              // This public override sends exactly the bytes approved by the native hash.
+              { body, signal: options?.signal, headers: options?.headers } as RequestOptions
               ) as unknown as Promise<AsyncIterable<ChatCompletionChunk>>,
             policy,
             options?.signal
