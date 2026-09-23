@@ -14,6 +14,7 @@ import type { ModelCallContext, TurnScope } from './contracts.js';
 import type { MaSession, MaSessionManifest, OpenMaSessionOptions, RuntimeEvent, RuntimeEventKind, TurnOutcome, MaPromptInput, RecoveryOutcome } from './public-types.js';
 import { parseMaBootstrapV2 } from './bootstrap.js';
 import { cloneRuntimeJson, ownData, requireOwnData } from './data.js';
+import { projectPiHistory } from './pi-history-projection.js';
 import { openExecutionJournal, recoverDeadExecutionWriter } from './execution-journal.js';
 import type { ExecutionJournal } from './execution-journal.js';
 import { createTurnGate } from './turn-gate.js';
@@ -393,7 +394,7 @@ export async function openMaSession(options: OpenMaSessionOptions): Promise<MaSe
     };
     const session: MaSession = {
       sessionId: scope.maSessionId, engineSessionId,
-      inspectHistory: input => cloneRuntimeJson(input?.all ? manager.getEntries() : manager.getBranch()) as unknown as ReadonlyArray<Record<string, unknown>>,
+      inspectHistory: input => projectPiHistory(input?.all ? manager.getEntries() : manager.getBranch()),
       providerState: () => provider?.getProviderState?.() ?? null,
       inspectModelExecution,
       prompt: (input, turn) => performTurn(input, turn),
