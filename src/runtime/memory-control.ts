@@ -1,7 +1,7 @@
 import type { AgoraMemory, AgoraMemoryController, AgoraMemoryPatch } from '../provider/agora.js';
 import type { AgentConfig, ProviderSessionState } from '../mcp/types.js';
 import type { ProviderRuntime } from '../provider/runtime.js';
-import { cloneRuntimeJson } from './data.js';
+import { cloneRuntimeJson, requireOwnData } from './data.js';
 import { constants } from 'node:fs';
 import { open, rename } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -80,6 +80,64 @@ export type MaMemoryAction =
   | { action: 'internalize'; sessionId: string; moduleIds: string[]; scope: 'conversation' | 'project' }
   | { action: 'rollback'; sessionId: string; moduleId: string; version: number };
 
+interface SavedMemoryControl {
+  schemaVersion: 1;
+  sessionId: string;
+  profileId: string;
+  pending: PendingMemoryVerification | null;
+  uncertain: boolean;
+}
+
+function invalidMemoryState(): Error {
+  return new Error('MA_MEMORY_STATE_INVALID');
+}
+
+function savedRecord(value: unknown, keys: readonly string[]): Record<string, unknown> {
+  const record = requireOwnData(value, keys);
+  if (!exactKeys(record, keys)) throw invalidMemoryState();
+  return record;
+}
+
+function savedPatchIds(value: unknown): string[] {
+  if (!Array.isArray(value)) throw invalidMemoryState();
+  const ids = value.map(id => boundedId(id, 'patchId'));
+  if (new Set(ids).size !== ids.length) throw invalidMemoryState();
+  return ids;
+}
+
+/** Persist verification facts only. Provider reports may contain conversation text. */
+function parseSavedMemoryControl(value: unknown): SavedMemoryControl {
+  const saved = savedRecord(value, ['schemaVersion', 'sessionId', 'profileId', 'pending', 'uncertain']);
+  if (saved.schemaVersion !== 1 || typeof saved.uncertain !== 'boolean'
+    || typeof saved.sessionId !== 'string' || !saved.sessionId.trim() || saved.sessionId.length > 128
+    || typeof saved.profileId !== 'string' || !saved.profileId.trim() || saved.profileId.length > 128) {
+    throw invalidMemoryState();
+  }
+  let pending: PendingMemoryVerification | null = null;
+  if (saved.pending !== null) {
+    const record = savedRecord(saved.pending, ['operation', 'requiresVerification', 'baselineRevision',
+      'baselineVerifiedAt', 'baselineActivePatchIds', 'expectedActivePatchIds', 'report']);
+    if (typeof record.operation !== 'string' || !['mount', 'unmount', 'internalize', 'rollback'].includes(record.operation)
+      || typeof record.requiresVerification !== 'boolean' || record.report !== null
+      || (record.baselineRevision !== null && !boundedInteger(record.baselineRevision, 0, Number.MAX_SAFE_INTEGER))) {
+      throw invalidMemoryState();
+    }
+    const verifiedAt = record.baselineVerifiedAt;
+    if (verifiedAt !== null && (typeof verifiedAt !== 'string'
+      || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(verifiedAt)
+      || !Number.isFinite(Date.parse(verifiedAt)) || new Date(verifiedAt).toISOString() !== verifiedAt)) {
+      throw invalidMemoryState();
+    }
+    pending = {
+      operation: record.operation as MemoryOperation, requiresVerification: record.requiresVerification,
+      baselineRevision: record.baselineRevision as number | null, baselineVerifiedAt: verifiedAt as string | null,
+      baselineActivePatchIds: savedPatchIds(record.baselineActivePatchIds),
+      expectedActivePatchIds: savedPatchIds(record.expectedActivePatchIds), report: null,
+    };
+  }
+  return { schemaVersion: 1, sessionId: saved.sessionId, profileId: saved.profileId, pending, uncertain: saved.uncertain };
+}
+
 /** Provider control only. These operations never enter Pi's prompt/tool loop. */
 export async function createMemoryControl(input: {
   sessionId: string; directory: string; profileId: string; config: AgentConfig; provider: ProviderRuntime;
@@ -90,17 +148,27 @@ export async function createMemoryControl(input: {
   let uncertain = false;
   let handle;
   try {
-    handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
-    const saved = cloneRuntimeJson(JSON.parse(await handle.readFile('utf8')));
+    // O_NONBLOCK prevents a substituted FIFO from hanging before fstat can reject it.
+    handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const stat = await handle.stat();
+    if (!stat.isFile() || (stat.mode & 0o7777) !== 0o600 || stat.size > 1024 * 1024) throw invalidMemoryState();
+    const saved = parseSavedMemoryControl(cloneRuntimeJson(JSON.parse(await handle.readFile('utf8'))));
     if (saved.sessionId !== input.sessionId || saved.profileId !== input.profileId) throw new Error('MA_MEMORY_IDENTITY_MISMATCH');
-    pending = saved.pending; uncertain = saved.uncertain === true;
-  } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    pending = saved.pending; uncertain = saved.uncertain;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      if (error instanceof Error && error.message === 'MA_MEMORY_IDENTITY_MISMATCH') throw error;
+      throw invalidMemoryState();
+    }
+  }
   finally { await handle?.close(); }
   const save = async () => {
+    const saved = parseSavedMemoryControl({ schemaVersion: 1, sessionId: input.sessionId, profileId: input.profileId,
+      pending: pending ? { ...pending, report: null } : null, uncertain });
     const temporary = `${file}.${randomUUID()}.pending`;
     const output = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
     try {
-      await output.writeFile(`${JSON.stringify({ schemaVersion: 1, sessionId: input.sessionId, profileId: input.profileId, pending, uncertain })}\n`);
+      await output.writeFile(`${JSON.stringify(saved)}\n`);
       await output.sync();
     } finally { await output.close(); }
     await rename(temporary, file);
