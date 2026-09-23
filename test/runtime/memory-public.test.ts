@@ -26,7 +26,9 @@ after(async () => { if (build) await rm(build, { recursive: true, force: true })
 for (const mode of ['valid', 'private-report', 'permissions', 'special-permissions', 'schema-version', 'extra-record-field',
   'missing-record-field', 'extra-pending-field', 'missing-pending-field', 'invalid-pending', 'invalid-operation',
   'invalid-boolean', 'invalid-revision', 'invalid-timestamp', 'invalid-patch-ids', 'non-null-report',
-  'wrong-session', 'wrong-profile', 'malformed-json', 'symlink', 'directory', 'fifo', 'uncertain']) {
+  'wrong-session', 'wrong-profile', 'malformed-json', 'symlink', 'directory', 'fifo', 'uncertain',
+  'model-drift', 'data-root-drift', 'equivalent-path', 'equivalent-symlink', 'created-data-root',
+  'credential-rotation', 'legacy-unbound', 'invalid-provider-digest']) {
   test(`public MaSession memory ${mode} preserves private, identity-bound recovery with zero model calls`, async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), 'ma public memory ')));
     try {

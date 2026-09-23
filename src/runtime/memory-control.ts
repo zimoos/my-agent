@@ -1,11 +1,12 @@
 import type { AgoraMemory, AgoraMemoryController, AgoraMemoryPatch } from '../provider/agora.js';
+import { resolveAgoraDataRoot } from '../provider/agora.js';
 import type { AgentConfig, ProviderSessionState } from '../mcp/types.js';
 import type { ProviderRuntime } from '../provider/runtime.js';
 import { cloneRuntimeJson, requireOwnData } from './data.js';
 import { constants } from 'node:fs';
-import { open, rename } from 'node:fs/promises';
-import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { open, realpath, rename } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
 interface MemoryContext { config: AgentConfig; sessionId: string; agent: Pick<ProviderRuntime, 'getProviderState'> }
 function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
   const keys = Object.keys(value); return keys.length === expected.length && keys.every(key => expected.includes(key));
@@ -81,11 +82,38 @@ export type MaMemoryAction =
   | { action: 'rollback'; sessionId: string; moduleId: string; version: number };
 
 interface SavedMemoryControl {
-  schemaVersion: 1;
+  schemaVersion: 2;
   sessionId: string;
   profileId: string;
+  providerIdentitySha256: string;
   pending: PendingMemoryVerification | null;
   uncertain: boolean;
+}
+
+async function memoryProviderIdentity(config: AgentConfig): Promise<string> {
+  let dataRoot: string | null = null;
+  if (config.model.provider === 'agora') {
+    let ancestor = resolveAgoraDataRoot(config.model.agoraRuntime);
+    const missing: string[] = [];
+    // Resolve existing aliases without creating or reading the provider's data.
+    // A not-yet-created suffix retains the same identity once Agora creates it.
+    for (;;) {
+      try { dataRoot = join(await realpath(ancestor), ...missing); break; }
+      catch (error) {
+        const parent = dirname(ancestor);
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || parent === ancestor) {
+          throw new Error('MA_MEMORY_PROVIDER_IDENTITY_UNAVAILABLE');
+        }
+        missing.unshift(basename(ancestor)); ancestor = parent;
+      }
+    }
+  }
+  const memory = config.model.agoraMemory;
+  return createHash('sha256').update(JSON.stringify({
+    domain: 'ma.memory.provider-identity.v1', provider: config.model.provider ?? null, model: config.model.model,
+    dataRoot, userId: memory?.userId ?? null, projectId: memory?.projectId ?? null,
+    conversationId: memory?.conversationId ?? null, memoryProfile: memory?.memoryProfile ?? null,
+  }), 'utf8').digest('hex');
 }
 
 function invalidMemoryState(): Error {
@@ -107,8 +135,9 @@ function savedPatchIds(value: unknown): string[] {
 
 /** Persist verification facts only. Provider reports may contain conversation text. */
 function parseSavedMemoryControl(value: unknown): SavedMemoryControl {
-  const saved = savedRecord(value, ['schemaVersion', 'sessionId', 'profileId', 'pending', 'uncertain']);
-  if (saved.schemaVersion !== 1 || typeof saved.uncertain !== 'boolean'
+  const saved = savedRecord(value, ['schemaVersion', 'sessionId', 'profileId', 'providerIdentitySha256', 'pending', 'uncertain']);
+  if (saved.schemaVersion !== 2 || typeof saved.uncertain !== 'boolean'
+    || typeof saved.providerIdentitySha256 !== 'string' || !/^[a-f0-9]{64}$/.test(saved.providerIdentitySha256)
     || typeof saved.sessionId !== 'string' || !saved.sessionId.trim() || saved.sessionId.length > 128
     || typeof saved.profileId !== 'string' || !saved.profileId.trim() || saved.profileId.length > 128) {
     throw invalidMemoryState();
@@ -135,7 +164,8 @@ function parseSavedMemoryControl(value: unknown): SavedMemoryControl {
       expectedActivePatchIds: savedPatchIds(record.expectedActivePatchIds), report: null,
     };
   }
-  return { schemaVersion: 1, sessionId: saved.sessionId, profileId: saved.profileId, pending, uncertain: saved.uncertain };
+  return { schemaVersion: 2, sessionId: saved.sessionId, profileId: saved.profileId,
+    providerIdentitySha256: saved.providerIdentitySha256, pending, uncertain: saved.uncertain };
 }
 
 /** Provider control only. These operations never enter Pi's prompt/tool loop. */
@@ -144,6 +174,7 @@ export async function createMemoryControl(input: {
 }): Promise<(params: MaMemoryAction) => Promise<MaMemoryState>> {
   const boot: MemoryContext = { config: input.config, sessionId: input.sessionId, agent: input.provider };
   const file = join(input.directory, 'memory-control.json');
+  const providerIdentitySha256 = await memoryProviderIdentity(input.config);
   let pending: PendingMemoryVerification | null = null;
   let uncertain = false;
   let handle;
@@ -154,16 +185,17 @@ export async function createMemoryControl(input: {
     if (!stat.isFile() || (stat.mode & 0o7777) !== 0o600 || stat.size > 1024 * 1024) throw invalidMemoryState();
     const saved = parseSavedMemoryControl(cloneRuntimeJson(JSON.parse(await handle.readFile('utf8'))));
     if (saved.sessionId !== input.sessionId || saved.profileId !== input.profileId) throw new Error('MA_MEMORY_IDENTITY_MISMATCH');
+    if (saved.providerIdentitySha256 !== providerIdentitySha256) throw new Error('MA_MEMORY_PROVIDER_IDENTITY_MISMATCH');
     pending = saved.pending; uncertain = saved.uncertain;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      if (error instanceof Error && error.message === 'MA_MEMORY_IDENTITY_MISMATCH') throw error;
+      if (error instanceof Error && ['MA_MEMORY_IDENTITY_MISMATCH', 'MA_MEMORY_PROVIDER_IDENTITY_MISMATCH'].includes(error.message)) throw error;
       throw invalidMemoryState();
     }
   }
   finally { await handle?.close(); }
   const save = async () => {
-    const saved = parseSavedMemoryControl({ schemaVersion: 1, sessionId: input.sessionId, profileId: input.profileId,
+    const saved = parseSavedMemoryControl({ schemaVersion: 2, sessionId: input.sessionId, profileId: input.profileId, providerIdentitySha256,
       pending: pending ? { ...pending, report: null } : null, uncertain });
     const temporary = `${file}.${randomUUID()}.pending`;
     const output = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);

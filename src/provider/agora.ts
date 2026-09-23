@@ -413,7 +413,8 @@ function resolveAgoraCommand(runtime?: AgoraRuntimeConfig): ResolvedAgoraCommand
   );
 }
 
-function resolveAgoraDataRoot(runtime?: AgoraRuntimeConfig): string {
+/** Shared resolution for provider startup and identity-bound memory recovery. */
+export function resolveAgoraDataRoot(runtime?: AgoraRuntimeConfig): string {
   return path.resolve(
     runtime?.dataRoot?.trim() ||
       process.env.MA_AGORA_DATA_ROOT?.trim() ||

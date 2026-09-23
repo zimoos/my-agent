@@ -10,6 +10,7 @@ const filename = join(directory, 'memory-control.json');
 let modelCalls = 0;
 let networkCalls = 0;
 let mutations = 0;
+let providerReadyCalls = 0;
 globalThis.fetch = async () => { networkCalls++; throw new Error('NETWORK_FORBIDDEN'); };
 const privateBody = 'PRIVATE_CONVERSATION_BODY_7a933b_DO_NOT_PERSIST';
 const state = { memory: { profile_id: 'memory-profile', patchset_revision: 1,
@@ -31,7 +32,7 @@ const controller = {
 };
 const providerRuntime = {
   client: {}, policy: { requestTimeoutMs: 1000, streamIdleTimeoutMs: 1000, maxRetries: 0 },
-  ready: async () => {}, getProviderState: () => state, getMemoryController: () => controller,
+  ready: async () => { providerReadyCalls++; }, getProviderState: () => state, getMemoryController: () => controller,
   createChatCompletion: async () => { modelCalls++; throw new Error('MODEL_FORBIDDEN'); },
   createStreamingChatCompletion: async () => { modelCalls++; throw new Error('MODEL_FORBIDDEN'); },
 };
@@ -42,7 +43,7 @@ const bootstrap = {
   scope: { maSessionId: 'session-one', workspaceId: 'workspace-one', canonicalCwd: root, hostIdentity: 'host-one', providerProfileId: 'profile-one' },
   sessionDirectory: directory, agentDirectory: join(root, 'agent'),
   config: { model: { provider: 'agora', model: 'fixture-model', baseURL: 'http://127.0.0.1:1/v1', apiKey: 'fixture-not-a-secret',
-    agoraMemory: { memoryProfile: 'memory-profile' } }, mcpServers: {} },
+    agoraMemory: { memoryProfile: 'memory-profile' }, agoraRuntime: { dataRoot: join(root, 'agora-data') } }, mcpServers: {} },
   capability: { id: 'cap-one', providerProfileId: 'profile-one', providerId: 'fixture-provider', modelId: 'fixture-model',
     input: ['text'], tools: false, reasoning: false, contextWindow: 8192, maxOutputTokens: 1024, cancellation: 'local' },
   resources: { skillDirectories: [], instructionFiles: [], extensions: ['ma-model-purpose', 'ma-resources'] },
@@ -62,15 +63,30 @@ try {
   const record = JSON.parse(original);
   assert.equal((await lstat(filename)).mode & 0o7777, 0o600);
   assert.equal(record.pending.report, null);
+  assert.equal(record.schemaVersion, 2);
+  assert.match(record.providerIdentitySha256, /^[a-f0-9]{64}$/);
   assert.equal(original.includes(privateBody), false);
+  assert.equal(original.includes(bootstrap.config.model.agoraRuntime.dataRoot), false);
+  assert.equal(original.includes(bootstrap.config.model.apiKey), false);
+  assert.equal(original.includes(bootstrap.config.model.model), false);
   const beforeMutations = mutations;
-  if (mode === 'valid' || mode === 'private-report') {
+  const beforeReadyCalls = providerReadyCalls;
+  if (mode === 'equivalent-path') bootstrap.config.model.agoraRuntime.dataRoot = `${root}/unused/../agora-data/.`;
+  if (mode === 'equivalent-symlink') {
+    await mkdir(join(root, 'agora-data'));
+    await symlink(join(root, 'agora-data'), join(root, 'data-alias'));
+    bootstrap.config.model.agoraRuntime.dataRoot = join(root, 'data-alias');
+  }
+  if (mode === 'created-data-root') await mkdir(join(root, 'agora-data'));
+  if (mode === 'credential-rotation') bootstrap.config.model.apiKey = 'rotated-fixture-secret';
+  if (['valid', 'private-report', 'equivalent-path', 'equivalent-symlink', 'created-data-root', 'credential-rotation'].includes(mode)) {
     session = await open(true);
     const recovered = await session.memory({ action: 'state', sessionId: 'session-one' });
     assert.equal(recovered.state, 'pending-verification');
     assert.equal(recovered.operationReport, null);
     assert.equal(recovered.pendingOperation, mode === 'private-report' ? 'internalize' : 'mount');
     assert.equal(mutations, beforeMutations);
+    assert.equal(JSON.parse(await readFile(filename, 'utf8')).providerIdentitySha256, record.providerIdentitySha256);
     state.memory.patchset_revision = 2;
     state.memory.last_verified_at = '2026-08-06T08:00:01.000Z';
     state.memory.active_memory_patch_ids = ['patch-one-v2'];
@@ -96,6 +112,8 @@ try {
       'non-null-report': () => { record.pending.report = { message: privateBody }; },
       'wrong-session': () => { record.sessionId = 'session-other'; },
       'wrong-profile': () => { record.profileId = 'profile-other'; },
+      'legacy-unbound': () => { record.schemaVersion = 1; delete record.providerIdentitySha256; },
+      'invalid-provider-digest': () => { record.providerIdentitySha256 = 'not-a-digest'; },
     };
     if (edits[mode]) { edits[mode](); await writeFile(filename, JSON.stringify(record)); }
     if (mode === 'permissions') await chmod(filename, 0o644);
@@ -104,6 +122,8 @@ try {
     if (mode === 'symlink') { await rename(filename, `${filename}.original`); await symlink(`${filename}.original`, filename); }
     if (mode === 'directory') { await rename(filename, `${filename}.original`); await mkdir(filename, { mode: 0o700 }); }
     if (mode === 'fifo') { await rename(filename, `${filename}.original`); await rename(join(root, 'fixture.fifo'), filename); }
+    if (mode === 'model-drift') { bootstrap.config.model.model = 'another-model'; bootstrap.capability.modelId = 'another-model'; }
+    if (mode === 'data-root-drift') bootstrap.config.model.agoraRuntime.dataRoot = join(root, 'another-data-root');
     if (mode === 'uncertain') {
       record.uncertain = true;
       await writeFile(filename, JSON.stringify(record));
@@ -113,8 +133,11 @@ try {
     } else {
       let accepted = false;
       await assert.rejects(async () => { session = await open(true); accepted = true; },
-        { message: ['wrong-session', 'wrong-profile'].includes(mode) ? 'MA_MEMORY_IDENTITY_MISMATCH' : 'MA_MEMORY_STATE_INVALID' });
+        { message: ['wrong-session', 'wrong-profile'].includes(mode) ? 'MA_MEMORY_IDENTITY_MISMATCH'
+          : ['model-drift', 'data-root-drift'].includes(mode) ? 'MA_MEMORY_PROVIDER_IDENTITY_MISMATCH' : 'MA_MEMORY_STATE_INVALID' });
       assert.equal(accepted, false);
+      assert.equal(providerReadyCalls, beforeReadyCalls);
+      if (['model-drift', 'data-root-drift'].includes(mode)) assert.equal(await readFile(filename, 'utf8'), original);
     }
     assert.equal(mutations, beforeMutations);
   }

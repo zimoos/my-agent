@@ -4,6 +4,8 @@ import type { MaRequestBudget, MaRuntimeError } from './public-types.js';
 const messages: Record<string, string> = {
   MA_MEMORY_STATE_INVALID: 'The saved memory verification record is invalid or has unsafe file permissions. Inspect the existing record before continuing; no memory operation was replayed.',
   MA_MEMORY_IDENTITY_MISMATCH: 'The saved memory verification belongs to a different session or provider profile. Reopen its original session; no memory operation was replayed.',
+  MA_MEMORY_PROVIDER_IDENTITY_MISMATCH: 'The model or Agora memory store changed since this memory operation. Restore its original provider configuration before resuming; no memory operation was replayed.',
+  MA_MEMORY_PROVIDER_IDENTITY_UNAVAILABLE: 'The Agora memory store identity could not be established. Check the configured data directory before resuming; no memory operation was replayed.',
   MA_COMPLETION_CONTEXT_INVALID: 'The saved tool exchange is inconsistent. Reconcile the saved session before requesting a closing summary.',
   MA_COMPLETION_TOOL_FORBIDDEN: 'The closing response attempted new work. No new tool execution was authorized.',
   MA_COMPLETION_EXTRA_CALL_FORBIDDEN: 'The protected closing turn permits only one model request. No additional request was authorized.',
