@@ -1,3 +1,5 @@
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { loadConfigDetailed, loadHostConfigDetailed, resolveConfigPath } from './config.js';
 import { connectMcpServer } from './mcp/client.js';
 import { createSessionStore } from './session/store.js';
@@ -72,17 +74,15 @@ export function prepareBootstrap(
   if (opts.resume !== undefined) {
     const target = typeof opts.resume === 'string' ? opts.resume : sessionStore.latest();
     if (target) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(target) || target === '..') throw new Error('Invalid MA session identity');
       const msgs = sessionStore.load(target);
-      if (msgs.length > 0) {
+      if (msgs.length > 0 || sessionStore.list().some(item => item.id === target)
+        || existsSync(join(sessionStore.getSessionDir(), target, 'manifest.json'))) {
         resumeMessages = msgs;
         sessionId = target;
         resumed = true;
       } else {
-        sessionId = sessionStore.create({
-          createdAt: Date.now(),
-          cwd,
-          model: config.model.model,
-        });
+        throw new Error('MA_RESUME_SESSION_NOT_FOUND');
       }
     } else {
       sessionId = sessionStore.create({
@@ -119,16 +119,6 @@ export function prepareBootstrap(
 async function hydrateRemoteModelConfig(config: AgentConfig, detectContextWindow: boolean): Promise<void> {
   if (config.model.provider?.toLowerCase() === 'agora') return;
   let lmStudioContextWindow: number | undefined;
-  try {
-    const res = await fetch(`${config.model.baseURL}/models`, { signal: AbortSignal.timeout(300) });
-    const data = await res.json() as { data: Array<{ id: string }> };
-    const available = data.data.map((model) => model.id);
-    if (available.length > 0 && !available.includes(config.model.model)) {
-      config.model.model = available[0];
-    }
-  } catch {
-    // Provider availability is resolved by the first chat request.
-  }
   if (detectContextWindow) {
     try {
       const base = config.model.baseURL.replace(/\/v1\/?$/, '');
@@ -161,16 +151,8 @@ export async function hydrateBootstrap(prepared: BootstrapPreparation): Promise<
     else connectionFailures.push({ name, error: result.reason instanceof Error ? result.reason.message : String(result.reason) });
   });
   try {
-    const { createAgent } = await import('./agent.js');
-    const agent = await createAgent(prepared.config, connections, {
-      resumeMessages: prepared.resumeMessages,
-      sessionStore: prepared.sessionStore,
-      sessionId: prepared.sessionId,
-      cwd: prepared.cwd,
-      confirmationChannel: prepared.confirmationChannel,
-      loadAgentInstructions: prepared.loadAgentInstructions,
-      debugLogging: prepared.debugLogging,
-    });
+    const { createMaAgentCompatibility } = await import('./runtime/agent-compat.js');
+    const agent = await createMaAgentCompatibility(prepared, connections);
     return {
       config: prepared.config,
       configPath: prepared.configPath,
@@ -211,3 +193,6 @@ export async function shutdown(connections: McpConnection[], agent?: Agent): Pro
 }
 
 export { loadConfig, loadConfigDetailed, resolveConfigPath } from './config.js';
+
+export { openMaSession, createMaAcpAgent, runMaAcpServer } from './runtime/index.js';
+export type { MaSession, MaBootstrapV2, HostControlPort, RuntimeEvent, OpenMaSessionOptions } from './runtime/index.js';

@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { readPiSessionMessages } from './pi-reader.js';
 import type { ProviderSessionState } from '../mcp/types.js';
 
 export interface SessionMeta {
@@ -82,6 +83,7 @@ export function createSessionStore(sessionDir?: string): SessionStore {
   }
 
   function append(sessionId: string, msg: any): void {
+    if (fs.existsSync(path.join(dir, sessionId, 'manifest.json'))) throw new Error('MA_PI_SESSION_READ_ONLY');
     const line = JSON.stringify(msg) + '\n';
     fs.appendFileSync(jsonlPath(sessionId), line, 'utf-8');
     const meta = readMeta(metaPath(sessionId));
@@ -92,6 +94,7 @@ export function createSessionStore(sessionDir?: string): SessionStore {
   }
 
   function truncate(sessionId: string, keepMessages: number): void {
+    if (fs.existsSync(path.join(dir, sessionId, 'manifest.json'))) throw new Error('MA_PI_SESSION_READ_ONLY');
     const kept = Math.max(0, keepMessages);
     const messages = load(sessionId).slice(0, kept);
     fs.writeFileSync(
@@ -120,6 +123,8 @@ export function createSessionStore(sessionDir?: string): SessionStore {
   }
 
   function load(sessionId: string): any[] {
+    const piMessages = readPiSessionMessages(dir, sessionId);
+    if (piMessages !== null) return piMessages;
     const p = jsonlPath(sessionId);
     if (!fs.existsSync(p)) return [];
     const raw = fs.readFileSync(p, 'utf-8');
@@ -142,7 +147,11 @@ export function createSessionStore(sessionDir?: string): SessionStore {
     for (const name of entries) {
       if (!name.endsWith('.meta.json')) continue;
       const m = readMeta(path.join(dir, name));
-      if (m) metas.push(m);
+      if (m) {
+        try { const messages = readPiSessionMessages(dir, m.id); if (messages !== null) m.messageCount = messages.length; }
+        catch { /* A corrupt saved session remains listed; opening it surfaces its recovery error. */ }
+        metas.push(m);
+      }
     }
     metas.sort((a, b) => b.createdAt - a.createdAt);
     return typeof limit === 'number' ? metas.slice(0, limit) : metas;
@@ -159,6 +168,8 @@ export function createSessionStore(sessionDir?: string): SessionStore {
     const toDelete = all.slice(keep);
     let removed = 0;
     for (const meta of toDelete) {
+      // MA Next execution evidence is not covered by the legacy age-based prune command.
+      if (fs.existsSync(path.join(dir, meta.id, 'manifest.json'))) continue;
       try {
         fs.rmSync(jsonlPath(meta.id), { force: true });
         fs.rmSync(metaPath(meta.id), { force: true });

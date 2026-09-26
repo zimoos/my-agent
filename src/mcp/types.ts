@@ -9,6 +9,9 @@ export interface McpTool {
   name: string;
   description: string;
   inputSchema: Record<string, any>;
+  outputSchema?: Record<string, unknown>;
+  annotations?: Record<string, unknown>;
+  _meta?: Record<string, unknown>;
 }
 
 export type MaReasoningDepth = 'standard' | 'deep';
@@ -18,7 +21,12 @@ export type ToolContentBlock =
   | { type: 'image'; data: string; mimeType: string; uri?: string };
 
 export interface McpServerConfig {
-  command: string;
+  command?: string;
+  transport?: 'stdio' | 'http';
+  /** Trusted transport deadline, not a model-controlled argument. */
+  requestTimeoutMs?: number;
+  url?: string;
+  headers?: Record<string, string>;
   args?: string[];
   env?: Record<string, string>;
   cwd?: string;
@@ -42,18 +50,22 @@ export interface McpProgressEvent {
 
 export interface McpConnection {
   name: string;
-  process: ChildProcess;
+  process?: ChildProcess;
+  /** Cancellation is a request; it does not prove remote side effects stopped. */
+  capabilities?: { transport: 'stdio' | 'http'; cancellation: 'request-only'; server: Record<string, unknown> };
   tools: McpTool[];
   call(
     toolName: string,
     args: Record<string, any>,
     signal?: AbortSignal,
-    onProgress?: (event: McpProgressEvent) => void
+    onProgress?: (event: McpProgressEvent) => void,
+    transportMeta?: Record<string, unknown>
   ): Promise<McpCallResult>;
   close(): Promise<void>;
 }
 
 export interface ModelConfig {
+  inputModalities?: Array<'text' | 'image'>;
   provider?: string;
   baseURL: string;
   model: string;
