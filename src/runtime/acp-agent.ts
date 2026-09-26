@@ -117,9 +117,11 @@ export function createMaAcpAgent(connection: acp.AgentSideConnection, options: M
     },
     async loadSession(params) {
       const value = await openSession(params.cwd, params.sessionId);
-      const outcome = await value.recover();
-      if (outcome.status !== 'ready') throw acp.RequestError.invalidParams(undefined, 'Saved MA execution requires reconciliation');
-      return {};
+      // Loading a paused session must keep the ACP control channel alive so the
+      // trusted Host can invoke the explicit recovery extension. The session
+      // itself continues to fence prompts while recovery evidence is unresolved.
+      const recovery = await value.recover();
+      return { _meta: { ma: { recovery: cloneRuntimeJson(recovery) } } };
     },
     async prompt(params: acp.PromptRequest) {
       const value = requireSession(params.sessionId);
