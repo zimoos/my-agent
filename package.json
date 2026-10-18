@@ -57,7 +57,7 @@
     "string-width": "^8.2.1"
   },
   "optionalDependencies": {
-    "@zimoos/agora": "0.2.0"
+    "@zimoos/agora": "0.2.1"
   },
   "devDependencies": {
     "@playwright/test": "^1.59.1",
