@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://zimoos.github.io/my-agent/sitemap.xml
