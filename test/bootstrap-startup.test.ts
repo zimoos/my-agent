@@ -77,7 +77,12 @@ test('bootstrap hydration connects five MCP servers in parallel, preserves confi
     const boot = await hydrateBootstrap(prepared);
     const elapsed = performance.now() - started;
     try {
-      assert.ok(elapsed < 700, `parallel hydration took ${elapsed.toFixed(1)}ms`);
+      // Each healthy server delays initialize and tools/list by 140ms. A
+      // sequential implementation therefore needs at least 5 * 2 * 140ms,
+      // while the parallel contract stays below this bound even when the full
+      // test suite is competing for CPU. First-frame latency has a separate
+      // real PTY gate and is intentionally not inferred from this unit test.
+      assert.ok(elapsed < 1_200, `parallel hydration took ${elapsed.toFixed(1)}ms`);
       assert.deepEqual(boot.connections.map((connection) => connection.name), ['alpha', 'beta', 'gamma', 'delta', 'omega']);
       assert.equal(boot.connectionFailures.length, 1);
       assert.equal(boot.connectionFailures[0]?.name, 'broken');

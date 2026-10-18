@@ -11,6 +11,8 @@ const AGORA_DEV_ROOT = process.env.MA_TEST_AGORA_ROOT || '';
 const AGORA_DEV_COMMAND = process.env.MA_TEST_AGORA_COMMAND || '';
 const AGORA_DEV_PYTHON = process.env.MA_TEST_AGORA_PYTHON || '';
 const AGORA_REAL_MODELS = process.env.MA_TEST_AGORA_REAL_MODELS || '';
+const AGORA_REAL_MODEL_ID = process.env.MA_TEST_AGORA_REAL_MODEL_ID || 'qwen2.5-7b-fp16';
+const AGORA_REAL_IMAGE = process.env.MA_TEST_AGORA_REAL_IMAGE || '';
 
 const MEMORY_TOOLS = [
   'doctor',
@@ -484,6 +486,29 @@ test('agora provider runtime wraps non-streaming chat_complete as streaming chun
   assert.equal(runtime.getProviderState()?.memory?.runtime_message_count, 1);
 });
 
+test('agora provider runtime preserves OpenAI image content parts for MCP chat_complete', async () => {
+  const calls: Array<{ name: string; args: Record<string, any> }> = [];
+  const runtime = runtimeWithFakeCalls(calls);
+  const image = 'data:image/png;base64,iVBORw0KGgo=';
+
+  await runtime.createChatCompletion({
+    model: 'base-a',
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'inspect this image' },
+        { type: 'image_url', image_url: { url: image } },
+      ],
+    }],
+    stream: false,
+  });
+
+  assert.deepEqual(calls[0].args.messages[0].content, [
+    { type: 'text', text: 'inspect this image' },
+    { type: 'image_url', image_url: { url: image } },
+  ]);
+});
+
 test('agora provider runtime exposes granular capability gaps without disabling chat', async () => {
   const runtime = runtimeWithFakeCalls([], ['doctor', 'models_list', 'chat_complete']);
   assert.ok(runtime.getMemoryController());
@@ -658,7 +683,7 @@ agoraPackagedE2eTest('packaged Agora serves a real whitelist model over MCP stdi
         provider: 'agora',
         baseURL: 'mcp-stdio://agora',
         apiKey: 'agora-mcp',
-        model: 'qwen2.5-7b-fp16',
+        model: AGORA_REAL_MODEL_ID,
         agoraRuntime: {
           command: AGORA_DEV_COMMAND,
           args: ['mcp', 'serve'],
@@ -671,14 +696,16 @@ agoraPackagedE2eTest('packaged Agora serves a real whitelist model over MCP stdi
           conversationId: 'conv-packaged-e2e',
         },
       },
-      { requestTimeoutMs: 30000, streamIdleTimeoutMs: 30000, maxRetries: 0 },
+      { requestTimeoutMs: 300000, streamIdleTimeoutMs: 300000, maxRetries: 0 },
       { sessionId: 'ma-packaged-e2e-session', cwd: tmp }
     );
     await runtime.ready();
-    assert.ok((await runtime.listModels()).some((item) => item.id === 'qwen2.5-7b-fp16'));
+    const models = await runtime.listModels();
+    const selectedModel = models.find((item) => item.id === AGORA_REAL_MODEL_ID);
+    assert.ok(selectedModel, `packaged Agora must list ${AGORA_REAL_MODEL_ID}`);
     assert.equal(runtime.getCapabilities().memoryV2, true);
     const before = await (runtime as any).chatCompletePayload({
-      model: 'qwen2.5-7b-fp16',
+      model: AGORA_REAL_MODEL_ID,
       messages: [{ role: 'user', content: '利博是我的同事，请记住。' }],
       stream: false,
       max_tokens: 2,
@@ -701,7 +728,7 @@ agoraPackagedE2eTest('packaged Agora serves a real whitelist model over MCP stdi
     assert.ok(memory);
     await controller.mountMemories('profile-packaged-e2e', [memory.id]);
     const after = await (runtime as any).chatCompletePayload({
-      model: 'qwen2.5-7b-fp16',
+      model: AGORA_REAL_MODEL_ID,
       messages: [{ role: 'user', content: '我的同事是谁？' }],
       stream: false,
       max_tokens: 8,
@@ -710,6 +737,27 @@ agoraPackagedE2eTest('packaged Agora serves a real whitelist model over MCP stdi
     assert.deepEqual(runtime.getProviderState()?.memory?.active_memory_patch_ids, [memory.head_patch_id]);
     assert.equal(after.metadata?.memory_runtime?.base_model_object_id, before.metadata?.memory_runtime?.base_model_object_id);
     assert.equal(after.metadata?.memory_runtime?.model_load_count, before.metadata?.memory_runtime?.model_load_count);
+    if (AGORA_REAL_IMAGE) {
+      assert.equal(selectedModel.capabilities?.vision, 'supported');
+      const imageDataUrl = `data:image/${path.extname(AGORA_REAL_IMAGE).slice(1) || 'png'};base64,${fs.readFileSync(AGORA_REAL_IMAGE).toString('base64')}`;
+      const imageResult = await (runtime as any).chatCompletePayload({
+        model: AGORA_REAL_MODEL_ID,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Briefly describe this image.' },
+            { type: 'image_url', image_url: { url: imageDataUrl } },
+          ],
+        }],
+        stream: false,
+        max_tokens: 2,
+        temperature: 0,
+      } as any);
+      assert.deepEqual(imageResult.active_memory_patch_ids, [memory.head_patch_id]);
+      assert.equal(imageResult.metadata?.memory_runtime?.worker_provider, 'mlx_vlm');
+      assert.equal(imageResult.metadata?.memory_runtime?.base_model_object_id, before.metadata?.memory_runtime?.base_model_object_id);
+      assert.equal(imageResult.metadata?.memory_runtime?.model_load_count, before.metadata?.memory_runtime?.model_load_count);
+    }
   } finally {
     await runtime?.close();
     fs.rmSync(tmp, { recursive: true, force: true });

@@ -15,9 +15,28 @@ const DEFAULT_ARGS = [path.join(PROJECT_ROOT, 'dist', 'src', 'cli', 'index.js')]
 const SHELL_CMD = process.env.VISUAL_CMD ?? DEFAULT_CMD;
 const SHELL_ARGS = process.env.VISUAL_ARGS
   ? process.env.VISUAL_ARGS.split(' ')
-  : process.env.VISUAL_CMD ? [] : DEFAULT_ARGS;
+  : process.env.VISUAL_ARGS_JSON
+    ? JSON.parse(process.env.VISUAL_ARGS_JSON)
+    : process.env.VISUAL_CMD ? [] : DEFAULT_ARGS;
+
+const staticAssets = new Map([
+  ['/xterm.css', { file: path.join(PROJECT_ROOT, 'node_modules', '@xterm', 'xterm', 'css', 'xterm.css'), type: 'text/css; charset=utf-8' }],
+  ['/xterm.js', { file: path.join(PROJECT_ROOT, 'node_modules', '@xterm', 'xterm', 'lib', 'xterm.js'), type: 'text/javascript; charset=utf-8' }],
+  ['/addon-fit.js', { file: path.join(PROJECT_ROOT, 'node_modules', '@xterm', 'addon-fit', 'lib', 'addon-fit.js'), type: 'text/javascript; charset=utf-8' }],
+]);
 
 const server = http.createServer((req, res) => {
+  const asset = staticAssets.get(req.url ?? '');
+  if (asset) {
+    if (!fs.existsSync(asset.file)) {
+      res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(`missing local visual dependency: ${path.basename(asset.file)}`);
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': asset.type });
+    fs.createReadStream(asset.file).pipe(res);
+    return;
+  }
   if (req.url === '/' || req.url === '/index.html') {
     const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf-8');
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });

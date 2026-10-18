@@ -29,3 +29,24 @@ test('Agora manifest verifies every packaged runtime file and rejects tampering'
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('Agora runtime resolution delegates the full artifact scan to the signed launcher', () => {
+  const source = fs.readFileSync(path.join(process.cwd(), 'src', 'provider', 'agora.ts'), 'utf8');
+  const bundled = source.slice(
+    source.indexOf('function verifyBundledAgora'),
+    source.indexOf('function resolveInstalledAgoraPackage'),
+  );
+  const installed = source.slice(
+    source.indexOf('function resolveInstalledAgoraPackage'),
+    source.indexOf('function resolveAgoraCommand'),
+  );
+  assert.doesNotMatch(bundled, /verifyAgoraManifestFiles\(/);
+  assert.doesNotMatch(installed, /verifyAgoraManifestFiles\(/);
+  assert.match(bundled, /verifyNativeSignature\(command\)/);
+  assert.match(bundled, /verifyNativeSignature\(platformCommand\)/);
+
+  const packager = fs.readFileSync(path.join(process.cwd(), 'scripts', 'package-portable.mjs'), 'utf8');
+  assert.match(packager, /resources', 'agora-darwin-arm64/);
+  assert.match(packager, /launcher_package_integrity/);
+  assert.match(packager, /platform_package_integrity/);
+});

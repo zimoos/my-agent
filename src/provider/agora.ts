@@ -299,22 +299,27 @@ export function verifyAgoraManifestFiles(root: string, manifest: Record<string, 
 }
 
 function verifyBundledAgora(command: string): Record<string, any> | null {
-  const root = path.dirname(path.dirname(command));
-  const manifestPath = path.join(root, 'manifest.json');
-  const lockPath = path.join(root, 'runtime-lock.json');
-  if (!fs.existsSync(manifestPath) || !fs.existsSync(lockPath)) return null;
+  const launcherRoot = path.dirname(path.dirname(command));
+  const platformRoot = path.join(path.dirname(launcherRoot), 'agora-darwin-arm64');
+  const platformCommand = path.join(platformRoot, 'bin', 'agora');
+  const manifestPath = path.join(platformRoot, 'manifest.json');
+  const lockPath = path.join(launcherRoot, 'runtime-lock.json');
+  if (!fs.existsSync(manifestPath) || !fs.existsSync(lockPath) || !commandExists(platformCommand)) return null;
   try {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
     if (agoraReleaseLock.published !== true || lock.published !== true) return null;
-    if (!verifyAgoraManifestFiles(root, manifest)) return null;
     if (manifest.version !== lock.version || manifest.host_protocol_major !== lock.host_protocol_major) return null;
     if (lock.native_core_abi !== undefined && manifest.native_core_abi !== lock.native_core_abi) return null;
     if (lock.manifest_sha256 && sha256File(manifestPath) !== lock.manifest_sha256) return null;
     if (lock.manifest_sha256 !== agoraReleaseLock.manifest_sha256) return null;
-    if (lock.package_integrity !== agoraReleaseLock.packages['@zimoos/agora-darwin-arm64'].integrity) return null;
+    if (lock.launcher_package_integrity !== agoraReleaseLock.packages['@zimoos/agora'].integrity) return null;
+    if (lock.platform_package_integrity !== agoraReleaseLock.packages['@zimoos/agora-darwin-arm64'].integrity) return null;
     if (lock.notarization_id !== agoraReleaseLock.notarization_id) return null;
-    if (!verifyNativeSignature(command)) return null;
+    // The signed launcher anchors the manifest hash and verifies every
+    // platform file in its child process. Repeating the 300MB+ file scan on
+    // Node's TUI thread would freeze startup input for several seconds.
+    if (!verifyNativeSignature(command) || !verifyNativeSignature(platformCommand)) return null;
     return lock;
   } catch {
     return null;
@@ -347,7 +352,6 @@ function resolveInstalledAgoraPackage(): ResolvedAgoraCommand | null {
       manifest.runtime_layout !== agoraReleaseLock.runtime_layout ||
       !requiredCapabilities.every((capability) => manifest.capabilities?.includes(capability)) ||
       sha256File(manifestPath) !== agoraReleaseLock.manifest_sha256 ||
-      !verifyAgoraManifestFiles(platformRoot, manifest) ||
       !commandExists(command) ||
       !commandExists(platformCommand) ||
       !verifyNativeSignature(command) ||

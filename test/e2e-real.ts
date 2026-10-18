@@ -76,15 +76,8 @@ test('real ma run smoke: tool call path lists project files', { timeout: 360000 
   assert.ok(!hasLlmError(combined), `unexpected LLM error. Tail: ${combined.slice(-1000)}`);
 });
 
-test('real remote provider: bounded read receipts complete two large files without duplicate pages', { timeout: 420000 }, async (t) => {
-  const baseConfigPath = requireConfig(t);
-  if (!baseConfigPath) return;
+async function runReadReceiptScenario(baseConfigPath: string): Promise<void> {
   const baseConfig = JSON.parse(fs.readFileSync(baseConfigPath, 'utf8'));
-  if (String(baseConfig.model?.provider ?? '').toLowerCase() === 'agora') {
-    t.skip('requires a real remote OpenAI-compatible provider config');
-    return;
-  }
-
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ma-issue42-remote-read-'));
   const configPath = path.join(tmp, 'config.json');
   try {
@@ -116,7 +109,11 @@ test('real remote provider: bounded read receipts complete two large files witho
       { cwd: tmp, configPath, timeout: 360000 },
     );
     const reads = result.toolCalls.filter((call) => call.name === 'fs__read_file' && call.ok);
-    assert.ok(reads.length >= 4, `expected paginated reads, got ${JSON.stringify(reads)}`);
+    assert.ok(
+      reads.length >= 4,
+      `expected paginated reads, got ${JSON.stringify(reads)}; final=${JSON.stringify(result.finalText)}; ` +
+        `events=${JSON.stringify(result.events.slice(-12))}`,
+    );
     const cursors = new Set<string>();
     for (const read of reads) {
       const file = path.resolve(tmp, String(read.args.path));
@@ -132,6 +129,28 @@ test('real remote provider: bounded read receipts complete two large files witho
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+}
+
+test('real remote provider: bounded read receipts complete two large files without duplicate pages', { timeout: 420000 }, async (t) => {
+  const baseConfigPath = requireConfig(t);
+  if (!baseConfigPath) return;
+  const baseConfig = JSON.parse(fs.readFileSync(baseConfigPath, 'utf8'));
+  if (String(baseConfig.model?.provider ?? '').toLowerCase() === 'agora') {
+    t.skip('requires a real remote OpenAI-compatible provider config');
+    return;
+  }
+  await runReadReceiptScenario(baseConfigPath);
+});
+
+test('real packaged Agora: bounded read receipts complete two large files without duplicate pages', { timeout: 600000 }, async (t) => {
+  const baseConfigPath = requireConfig(t);
+  if (!baseConfigPath) return;
+  const baseConfig = JSON.parse(fs.readFileSync(baseConfigPath, 'utf8'));
+  if (String(baseConfig.model?.provider ?? '').toLowerCase() !== 'agora') {
+    t.skip('requires a real packaged Agora provider config');
+    return;
+  }
+  await runReadReceiptScenario(baseConfigPath);
 });
 
 test('real TUI PTY smoke: starts, accepts input, completes, exits', { timeout: 360000 }, async (t) => {

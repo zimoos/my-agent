@@ -35,17 +35,33 @@ function sha256(file) {
 
 function copyAgoraRuntime(appDir, target) {
   if (target !== 'macos-arm64') return;
-  const source = process.env.MA_AGORA_ARTIFACT_DIR
+  const platformSource = process.env.MA_AGORA_ARTIFACT_DIR
     ? path.resolve(process.env.MA_AGORA_ARTIFACT_DIR)
-    : path.join(root, 'resources', 'agora');
-  const manifestPath = path.join(source, 'manifest.json');
-  const binaryPath = path.join(source, 'bin', 'agora');
+    : path.join(root, 'node_modules', '@zimoos', 'agora-darwin-arm64');
+  const launcherSource = process.env.MA_AGORA_LAUNCHER_DIR
+    ? path.resolve(process.env.MA_AGORA_LAUNCHER_DIR)
+    : path.join(root, 'node_modules', '@zimoos', 'agora');
+  const manifestPath = path.join(platformSource, 'manifest.json');
+  const binaryPath = path.join(platformSource, 'bin', 'agora');
+  const launcherBinaryPath = path.join(launcherSource, 'bin', 'agora');
+  const launcherPackagePath = path.join(launcherSource, 'package.json');
   if (!fs.existsSync(manifestPath) || !fs.existsSync(binaryPath)) {
     throw new Error(`macos-arm64 portable release requires MA_AGORA_ARTIFACT_DIR with Agora ${agoraLock.version} native artifact`);
   }
+  if (!fs.existsSync(launcherBinaryPath) || !fs.existsSync(launcherPackagePath)) {
+    throw new Error(`macos-arm64 portable release requires MA_AGORA_LAUNCHER_DIR with Agora ${agoraLock.version} launcher package`);
+  }
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const launcherPackage = JSON.parse(fs.readFileSync(launcherPackagePath, 'utf8'));
   if (agoraLock.published !== true) {
     throw new Error('macos-arm64 portable release requires a published, notarized Agora release lock');
+  }
+  if (
+    launcherPackage.name !== '@zimoos/agora' ||
+    launcherPackage.version !== agoraLock.version ||
+    launcherPackage.dependencies?.['@zimoos/agora-darwin-arm64'] !== agoraLock.version
+  ) {
+    throw new Error(`unexpected Agora launcher contract: ${launcherPackage.name}@${launcherPackage.version}`);
   }
   if (
     manifest.version !== agoraLock.version ||
@@ -60,36 +76,41 @@ function copyAgoraRuntime(appDir, target) {
     throw new Error('Agora artifact is missing required Memory v2 capabilities');
   }
   for (const [relative, expected] of Object.entries(manifest.files ?? {})) {
-    const target = path.resolve(source, relative);
-    if (!target.startsWith(`${source}${path.sep}`) || !fs.existsSync(target) || sha256(target) !== expected) {
+    const target = path.resolve(platformSource, relative);
+    if (!target.startsWith(`${platformSource}${path.sep}`) || !fs.existsSync(target) || sha256(target) !== expected) {
       throw new Error(`Agora artifact integrity mismatch: ${relative}`);
     }
   }
   const sourceLike = [];
-  const visit = (directory) => {
+  const visit = (directory, packageRoot) => {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const target = path.join(directory, entry.name);
-      if (entry.isDirectory()) visit(target);
-      else if (/\.(py|pyc|js|map)$/i.test(entry.name)) sourceLike.push(path.relative(source, target));
+      if (entry.isDirectory()) visit(target, packageRoot);
+      else if (/\.(py|pyc|js|map)$/i.test(entry.name)) sourceLike.push(path.relative(packageRoot, target));
     }
   };
-  visit(source);
+  visit(platformSource, platformSource);
+  visit(launcherSource, launcherSource);
   if (sourceLike.length > 0) {
     throw new Error(`Agora user artifact contains source-like files: ${sourceLike.join(', ')}`);
   }
-  const packageIntegrity = process.env.MA_AGORA_PACKAGE_INTEGRITY?.trim();
-  const expectedIntegrity = agoraLock.packages?.['@zimoos/agora-darwin-arm64']?.integrity;
-  if (packageIntegrity !== expectedIntegrity) {
-    throw new Error('macos-arm64 portable release package integrity does not match the pinned Agora release');
+  const launcherIntegrity = process.env.MA_AGORA_LAUNCHER_INTEGRITY?.trim();
+  const platformIntegrity = process.env.MA_AGORA_PACKAGE_INTEGRITY?.trim();
+  const expectedLauncherIntegrity = agoraLock.packages?.['@zimoos/agora']?.integrity;
+  const expectedPlatformIntegrity = agoraLock.packages?.['@zimoos/agora-darwin-arm64']?.integrity;
+  if (launcherIntegrity !== expectedLauncherIntegrity || platformIntegrity !== expectedPlatformIntegrity) {
+    throw new Error('macos-arm64 portable release package integrities do not match the pinned Agora release');
   }
   const manifestSha = sha256(manifestPath);
   if (manifestSha !== agoraLock.manifest_sha256) {
     throw new Error('macos-arm64 portable release manifest SHA does not match the pinned Agora release');
   }
-  const destination = path.join(appDir, 'resources', 'agora');
-  copyRequired(source, destination);
+  const launcherDestination = path.join(appDir, 'resources', 'agora');
+  const platformDestination = path.join(appDir, 'resources', 'agora-darwin-arm64');
+  copyRequired(launcherSource, launcherDestination);
+  copyRequired(platformSource, platformDestination);
   fs.writeFileSync(
-    path.join(destination, 'runtime-lock.json'),
+    path.join(launcherDestination, 'runtime-lock.json'),
     JSON.stringify({
       version: agoraLock.version,
       package: '@zimoos/agora-darwin-arm64',
@@ -98,7 +119,8 @@ function copyAgoraRuntime(appDir, target) {
       native_core_abi: 1,
       published: true,
       notarization_id: agoraLock.notarization_id,
-      package_integrity: packageIntegrity,
+      launcher_package_integrity: launcherIntegrity,
+      platform_package_integrity: platformIntegrity,
       manifest_sha256: manifestSha,
     }, null, 2) + '\n',
     'utf8'

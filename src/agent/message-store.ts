@@ -8,6 +8,25 @@ import {
   sanitizeZimoosToolResultForHistory,
 } from './runtime-context-slots.js';
 
+function collapseRequestSystems(
+  messages: ChatCompletionMessageParam[],
+  suffix: string,
+): ChatCompletionMessageParam[] {
+  const first = messages[0];
+  if (!first || first.role !== 'system') return [...messages];
+  const systemText = [
+    typeof first.content === 'string' ? first.content.trim() : '',
+    ...messages.slice(1)
+      .filter((message) => message.role === 'system')
+      .map((message) => typeof message.content === 'string' ? message.content.trim() : ''),
+    suffix.trim(),
+  ].filter(Boolean).join('\n\n');
+  return [
+    { ...(first as any), content: systemText } as ChatCompletionMessageParam,
+    ...messages.slice(1).filter((message) => message.role !== 'system'),
+  ];
+}
+
 /**
  * Centralized, encapsulated store for the agent's conversation messages.
  *
@@ -227,16 +246,11 @@ export class MessageStore {
   /**
    * Build the messages array to send to the LLM.
    *
-   * The system prompt at position [0] is kept immutable so that the
-   * prefix stays cache-stable across turns. Dynamic content (stack state,
-   * loop warnings) is appended as a separate system message at the tail.
+   * Provider requests contain exactly one system message at index 0. This is
+   * required by strict Qwen-compatible chat templates.
    */
   buildRequestMessages(suffix: string): ChatCompletionMessageParam[] {
-    if (!suffix) return [...this.messages];
-    return [
-      ...this.messages,
-      { role: 'system', content: suffix },
-    ];
+    return collapseRequestSystems(this.messages, suffix);
   }
 
   buildContextRequestMessages(
@@ -245,11 +259,7 @@ export class MessageStore {
   ): ChatCompletionMessageParam[] {
     const system = this.messages[0];
     const base = [system, ...body];
-    if (!suffix) return base;
-    return [
-      ...base,
-      { role: 'system', content: suffix },
-    ];
+    return collapseRequestSystems(base, suffix);
   }
 
   /** Get messages that have not yet been persisted (system excluded). */

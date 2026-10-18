@@ -157,6 +157,27 @@ function assertOnlyLatestMessageHasZimoos(messages: any[]): string {
   return messageText(messages[messages.length - 1]);
 }
 
+test('request context keeps one leading system message for strict Qwen templates', () => {
+  const result = new RequestContextBuilder().build([
+    { role: 'system', content: 'stable system' },
+    { role: 'user', content: 'root request' },
+    { role: 'system', content: '[folded task summary]' },
+  ], {
+    maxTokens: 10000,
+    suffix: '[dynamic stack state]',
+    protectedMessageIndexes: [1],
+  });
+
+  assert.equal(result.messages[0]?.role, 'system');
+  assert.equal(result.messages.filter((message) => message.role === 'system').length, 1);
+  assert.match(messageText(result.messages[0]), /stable system/);
+  assert.match(messageText(result.messages[0]), /folded task summary/);
+  assert.match(messageText(result.messages[0]), /dynamic stack state/);
+  assert.ok(result.messages.some((message: any) =>
+    message.role === 'user' && message.content === 'root request'
+  ));
+});
+
 function makeStore(): MessageStore {
   const store = new MessageStore();
   store.init('stable system prompt');

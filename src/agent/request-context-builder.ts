@@ -386,9 +386,27 @@ function lastUserGroupIndex(groups: TranscriptGroup[]): number {
   return -1;
 }
 
-function buildSuffixGroup(suffix?: string): ChatCompletionMessageParam[] {
-  const text = suffix?.trim();
-  return text ? [{ role: 'system', content: text }] : [];
+function systemContentText(message: ChatCompletionMessageParam): string {
+  const content = (message as any).content;
+  if (typeof content === 'string') return content.trim();
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((part) => typeof part?.text === 'string' ? part.text.trim() : '')
+    .filter(Boolean)
+    .join('\n');
+}
+
+function mergeSystemContext(
+  stableSystem: ChatCompletionMessageParam,
+  trailingSystems: ChatCompletionMessageParam[],
+  suffix?: string,
+): ChatCompletionMessageParam {
+  const content = [
+    systemContentText(stableSystem),
+    ...trailingSystems.map(systemContentText),
+    suffix?.trim() ?? '',
+  ].filter(Boolean).join('\n\n');
+  return { ...(stableSystem as any), content } as ChatCompletionMessageParam;
 }
 
 function requestOnlyAttachmentText(options: RequestContextBuildOptions): string {
@@ -458,15 +476,29 @@ export class RequestContextBuilder {
       throw new Error(`invalid request context byte limit: ${maxBytes}`);
     }
 
-    const system = sanitizeTranscriptMessage(sourceMessages[0]);
-    const suffixMessages = buildSuffixGroup(options.suffix);
+    const stableSystem = sanitizeTranscriptMessage(sourceMessages[0]);
+    const trailingSystems: ChatCompletionMessageParam[] = [];
+    const transcript: ChatCompletionMessageParam[] = [];
+    const sourceIndexToTranscriptIndex = new Map<number, number>();
+    for (let sourceIndex = 1; sourceIndex < sourceMessages.length; sourceIndex++) {
+      const message = sourceMessages[sourceIndex];
+      if (message.role === 'system') {
+        trailingSystems.push(sanitizeTranscriptMessage(message));
+        continue;
+      }
+      sourceIndexToTranscriptIndex.set(sourceIndex, transcript.length);
+      transcript.push(message);
+    }
+    // Qwen and several OpenAI-compatible templates accept exactly one system
+    // message at index 0. Folded summaries and dynamic stack state stay
+    // request-only, but are merged into that leading message.
+    const system = mergeSystemContext(stableSystem, trailingSystems, options.suffix);
     const requestOnlyAttachment = requestOnlyAttachmentText(options);
-    const transcript = sourceMessages.slice(1);
     const latestUserMessage = lastUserMessageIndex(transcript);
     const explicitlyProtectedTranscriptIndexes = new Set(
       (options.protectedMessageIndexes ?? [])
-        .map((sourceIndex) => sourceIndex - 1)
-        .filter((index) => index >= 0)
+        .map((sourceIndex) => sourceIndexToTranscriptIndex.get(sourceIndex))
+        .filter((index): index is number => index !== undefined)
     );
     const grouped = groupTranscript(
       transcript,
@@ -483,7 +515,8 @@ export class RequestContextBuilder {
     for (let i = recentStart; i < groups.length; i++) protectedIndexes.add(i);
     if (latestUser >= 0) protectedIndexes.add(latestUser);
     for (const sourceIndex of options.protectedMessageIndexes ?? []) {
-      const transcriptIndex = sourceIndex - 1;
+      const transcriptIndex = sourceIndexToTranscriptIndex.get(sourceIndex);
+      if (transcriptIndex === undefined) continue;
       const group = groups.find((item) =>
         transcriptIndex >= item.start &&
         transcriptIndex < item.start + item.messages.length
@@ -494,7 +527,6 @@ export class RequestContextBuilder {
     const rawMessages = attachRequestOnlyContext([
       system,
       ...groups.flatMap((group) => group.messages),
-      ...suffixMessages,
     ], requestOnlyAttachment);
     const rawTokens = estimateTokens(rawMessages);
     const rawBytes = estimateSerializedBytes(rawMessages);
@@ -510,7 +542,6 @@ export class RequestContextBuilder {
     const buildProtectedMessages = () => attachRequestOnlyContext([
       system,
       ...protectedGroups.flatMap((group) => group.messages),
-      ...suffixMessages,
     ], requestOnlyAttachment);
     let baseMessages = buildProtectedMessages();
     let protectedTokens = estimateTokens(baseMessages);
@@ -566,7 +597,6 @@ export class RequestContextBuilder {
         ...groups
           .filter((item) => candidate.has(item.index))
           .flatMap((item) => item.messages),
-        ...suffixMessages,
       ], requestOnlyAttachment);
       if (estimateSerializedBytes(candidateMessages) > maxBytes) continue;
       selected.add(group.index);
@@ -577,7 +607,6 @@ export class RequestContextBuilder {
     const requestMessages = attachRequestOnlyContext([
       system,
       ...selectedGroups.flatMap((group) => group.messages),
-      ...suffixMessages,
     ], requestOnlyAttachment);
     const requestTokens = estimateTokens(requestMessages);
     const requestBytes = estimateSerializedBytes(requestMessages);
